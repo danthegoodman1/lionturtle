@@ -3,6 +3,7 @@
 
 pub mod rng;
 pub mod storage;
+pub mod perf;
 pub mod vopr;
 
 pub use rng::Rng;

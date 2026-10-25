@@ -37,6 +37,9 @@ pub enum MemTableKind {
     BBTree,
     /// std's `BTreeMap` behind a reader-writer lock.
     BTree,
+    /// congee's adaptive radix tree with optimistic lock coupling (ART-OLC),
+    /// the index design C++ TurtleKV uses. Keys must be exactly 8 bytes.
+    Art8,
 }
 
 impl std::str::FromStr for MemTableKind {
@@ -46,6 +49,7 @@ impl std::str::FromStr for MemTableKind {
             "skiplist" => Ok(Self::SkipList),
             "bbtree" => Ok(Self::BBTree),
             "btree" => Ok(Self::BTree),
+            "art" => Ok(Self::Art8),
             _ => Err(format!("unknown memtable kind {s}")),
         }
     }
@@ -56,6 +60,7 @@ pub fn new_memtable(kind: MemTableKind) -> Box<dyn MemTable> {
         MemTableKind::SkipList => Box::new(SkipListTable::default()),
         MemTableKind::BBTree => Box::new(BBTreeTable::default()),
         MemTableKind::BTree => Box::new(BTreeTable::default()),
+        MemTableKind::Art8 => Box::new(ArtTable::default()),
     }
 }
 
@@ -194,28 +199,111 @@ impl MemTable for BTreeTable {
     }
 }
 
+/// An ART over 8-byte keys. The tree maps each key to an index into an
+/// append-only arena of entries, so readers never see a freed entry; an
+/// overwritten entry stays in the arena until the memtable drops.
+#[derive(Default)]
+pub struct ArtTable {
+    art: congee::Congee<usize, usize>,
+    arena: boxcar::Vec<MemEntry>,
+}
+
+fn art_key(key: &[u8]) -> usize {
+    u64::from_be_bytes(key.try_into().expect("the ART memtable takes 8-byte keys")) as usize
+}
+
+impl MemTable for ArtTable {
+    fn insert(&self, key: &[u8], value: Value, seq: u64) {
+        let k = art_key(key);
+        let idx = self.arena.push(MemEntry { seq, value });
+        let guard = self.art.pin();
+        self.art
+            .compute_or_insert(k, |old| match old {
+                Some(o) if self.arena[o].seq > seq => o,
+                _ => idx,
+            }, &guard)
+            .expect("ART allocation failed");
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Value> {
+        let guard = self.art.pin();
+        self.art.get(&art_key(key), &guard).map(|i| self.arena[i].value.clone())
+    }
+
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+        let lo = match start {
+            Bound::Included(k) => Some(art_key(k)),
+            Bound::Excluded(k) => art_key(k).checked_add(1),
+            Bound::Unbounded => Some(0),
+        };
+        let Some(lo) = lo else { return };
+        let hi = end.map(art_key);
+        if hi.is_some_and(|h| h <= lo) || limit == 0 {
+            return;
+        }
+        let guard = self.art.pin();
+        // `range` excludes its end, so the largest key needs its own lookup.
+        let mut buf = vec![(0usize, 0usize); limit];
+        let n = self.art.range(&lo, &hi.unwrap_or(usize::MAX), &mut buf, &guard);
+        for &(k, i) in &buf[..n] {
+            out.push((Bytes::copy_from_slice(&(k as u64).to_be_bytes()), self.arena[i].value.clone()));
+        }
+        if n < limit && hi.is_none() && let Some(i) = self.art.get(&usize::MAX, &guard) {
+            out.push((Bytes::copy_from_slice(&u64::MAX.to_be_bytes()), self.arena[i].value.clone()));
+        }
+    }
+
+    fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value)) {
+        let mut out = Vec::new();
+        let mut start = Bound::Unbounded;
+        let mut last: Option<Bytes>;
+        loop {
+            out.clear();
+            self.range(start, None, 4096, &mut out);
+            for (k, v) in &out {
+                f(k, v);
+            }
+            if out.len() < 4096 {
+                return;
+            }
+            last = out.last().map(|(k, _)| k.clone());
+            start = Bound::Excluded(last.as_deref().unwrap());
+        }
+    }
+
+    fn len(&self) -> usize {
+        let mut n = 0;
+        self.for_each(&mut |_, _| n += 1);
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn newest_sequence_wins_in_every_kind() {
-        for kind in [MemTableKind::SkipList, MemTableKind::BBTree, MemTableKind::BTree] {
+        for kind in [MemTableKind::SkipList, MemTableKind::BBTree, MemTableKind::BTree, MemTableKind::Art8] {
             let t = new_memtable(kind);
-            t.insert(b"a", Value::Put(Bytes::from_static(b"2")), 2);
-            t.insert(b"a", Value::Put(Bytes::from_static(b"1")), 1);
-            t.insert(b"b", Value::Delete, 3);
-            t.insert(b"c", Value::Put(Bytes::from_static(b"3")), 4);
-            assert_eq!(t.get(b"a"), Some(Value::Put(Bytes::from_static(b"2"))), "{kind:?}");
-            assert_eq!(t.get(b"b"), Some(Value::Delete));
-            assert_eq!(t.get(b"z"), None);
+            let (a, b, c) = (b"aaaaaaaa", b"bbbbbbbb", b"\xff\xff\xff\xff\xff\xff\xff\xff");
+            t.insert(a, Value::Put(Bytes::from_static(b"2")), 2);
+            t.insert(a, Value::Put(Bytes::from_static(b"1")), 1);
+            t.insert(b, Value::Delete, 3);
+            t.insert(c, Value::Put(Bytes::from_static(b"3")), 4);
+            assert_eq!(t.get(a), Some(Value::Put(Bytes::from_static(b"2"))), "{kind:?}");
+            assert_eq!(t.get(b), Some(Value::Delete));
+            assert_eq!(t.get(b"zzzzzzzz"), None);
             let mut out = Vec::new();
-            t.range(Bound::Excluded(b"a"), Some(b"c"), 10, &mut out);
+            t.range(Bound::Excluded(a), Some(c), 10, &mut out);
             assert_eq!(out.len(), 1, "{kind:?}");
-            assert_eq!(&out[0].0[..], b"b");
+            assert_eq!(&out[0].0[..], b);
+            out.clear();
+            t.range(Bound::Excluded(a), None, 10, &mut out);
+            assert_eq!(out.len(), 2, "{kind:?}");
             let mut keys = Vec::new();
             t.for_each(&mut |k, _| keys.push(k.to_vec()));
-            assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+            assert_eq!(keys, vec![a.to_vec(), b.to_vec(), c.to_vec()], "{kind:?}");
             assert_eq!(t.len(), 3);
         }
     }

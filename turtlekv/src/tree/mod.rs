@@ -62,7 +62,7 @@ impl Default for TreeConfig {
             max_pivots: 64,
             min_pivots: 4,
             max_segments: 63,
-            max_levels: 6,
+            max_levels: 4,
             filter_bits: 12,
             merge_readahead: 1 << 20,
             parallel: true,
@@ -1002,8 +1002,8 @@ impl TreeScan {
     pub fn next(&mut self, io: &PageIo) -> Result<Option<(Bytes, Bytes)>> {
         loop {
             if let Some(m) = self.merger.as_mut() {
-                if let Some(e) = m.peek() {
-                    let out = e.value.map(|v| (Bytes::copy_from_slice(e.key), Bytes::copy_from_slice(v)));
+                if let Some((key, value)) = m.peek_owned() {
+                    let out = value.map(|v| (key, v));
                     m.advance(io)?;
                     match out {
                         Some(kv) => return Ok(Some(kv)),

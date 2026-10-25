@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bbtree = "0.1.5"
+congee = "0.4"
+crossbeam-skiplist = "0.1"
+bytes = "1"
+parking_lot = "0.12"
 fjall = "3"
 hdrhistogram = "7"
 mimalloc = { version = "0.1", default-features = false }

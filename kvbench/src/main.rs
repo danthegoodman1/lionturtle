@@ -60,10 +60,10 @@ fn parse_args() -> Args {
         memtable: get("--memtable").unwrap_or_else(|| "bbtree".into()),
         max_frozen: num("--max-frozen", 2) as usize,
         wal_buffer_kb: num("--wal-buffer-kb", 1024) as usize,
-        fjall_workers: num("--fjall-workers", 4) as usize,
+        fjall_workers: num("--fjall-workers", 8) as usize,
         fjall_memtable_mb: num("--fjall-memtable-mb", 64),
         fjall_manual_persist: num("--fjall-manual-persist", 1) == 1,
-        max_levels: num("--max-levels", 6) as usize,
+        max_levels: num("--max-levels", 4) as usize,
         filter_bits: num("--filter-bits", 12) as u32,
         label: get("--label").unwrap_or_default(),
     }
@@ -120,6 +120,16 @@ fn rss_bytes() -> u64 {
         .find_map(|l| l.strip_prefix("VmRSS:"))
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         .map_or(0, |kb| kb * 1024)
+}
+
+/// Peak memory of this process's cgroup, page cache included, if limited.
+fn cgroup_peak_bytes() -> u64 {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let path = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("");
+    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn dir_bytes(path: &std::path::Path) -> u64 {
@@ -189,7 +199,9 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
     let mix = mix(phase);
     let n = records.load(Ordering::SeqCst);
     let zipf = Arc::new(Zipfian::new(n, 0.99));
-    let per_thread = args.ops / args.threads as u64;
+    // Scans touch up to 100 entries each; like the paper, run a tenth as many.
+    let ops = if phase == "e" { args.ops / 10 } else { args.ops };
+    let per_thread = ops / args.threads as u64;
     let started = Instant::now();
     let scanned = Arc::new(AtomicU64::new(0));
     let handles: Vec<_> = (0..args.threads)
@@ -288,7 +300,7 @@ fn main() {
         }
         let written_user: u64 = result.hist[1].len() + result.hist[2].len() + result.hist[4].len();
         println!(
-            r#"{{"engine":"{}","label":"{}","phase":"{}","threads":{},"records":{},"ops":{},"secs":{:.3},"kops":{:.1},"read_mb":{:.1},"write_mb":{:.1},"waf":{:.2},"scanned":{},"rss_mb":{:.0},"disk_mb":{:.0},"engine_stats":{}{}}}"#,
+            r#"{{"engine":"{}","label":"{}","phase":"{}","threads":{},"records":{},"ops":{},"secs":{:.3},"kops":{:.1},"read_mb":{:.1},"write_mb":{:.1},"waf":{:.2},"scanned":{},"rss_mb":{:.0},"cgroup_peak_mb":{:.0},"disk_mb":{:.0},"engine_stats":{}{}}}"#,
             args.engine,
             args.label,
             phase,
@@ -299,9 +311,10 @@ fn main() {
             result.ops as f64 / secs / 1e3,
             (r1 - r0) as f64 / 1e6,
             (w1 - w0) as f64 / 1e6,
-            (w1 - w0) as f64 / (written_user * user_entry).max(1) as f64,
+            if written_user == 0 { 0.0 } else { (w1 - w0) as f64 / (written_user * user_entry) as f64 },
             result.scanned,
             rss_bytes() as f64 / 1e6,
+            cgroup_peak_bytes() as f64 / 1e6,
             dir_bytes(std::path::Path::new(&args.dir)) as f64 / 1e6,
             engine.stats_json(),
             lat

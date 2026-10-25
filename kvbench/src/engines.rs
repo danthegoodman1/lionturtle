@@ -108,7 +108,10 @@ impl Fjall {
         let manual = args.fjall_manual_persist;
         let ks = db
             .keyspace("bench", move || {
-                fjall::KeyspaceCreateOptions::default().max_memtable_size(memtable).manual_journal_persist(manual)
+                fjall::KeyspaceCreateOptions::default()
+                    .max_memtable_size(memtable)
+                    .manual_journal_persist(manual)
+                    .data_block_compression_policy(fjall::config::CompressionPolicy::all(fjall::CompressionType::None))
             })
             .unwrap();
         Self { _db: db, ks }
@@ -154,6 +157,9 @@ impl Rocks {
         block.set_cache_index_and_filter_blocks(false);
         opts.set_block_based_table_factory(&block);
         opts.set_compression_type(rocksdb::DBCompressionType::None);
+        // Buffer the log in memory like the other engines; nothing fsyncs
+        // per write.
+        opts.set_manual_wal_flush(true);
         Self { db: rocksdb::DB::open(&opts, &args.dir).unwrap() }
     }
 }

@@ -195,6 +195,13 @@ impl PageCursor {
         Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]) })
     }
 
+    /// The current entry as slices sharing the block's buffer.
+    pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
+        let (k, kl, v) = self.cur?;
+        let raw = self.block.as_ref()?.raw();
+        Some((raw.slice(k..k + kl), v.map(|(vs, vl)| raw.slice(vs..vs + vl))))
+    }
+
     pub fn advance(&mut self, io: &PageIo) -> Result<()> {
         if self.cur.is_none() {
             return Ok(());
@@ -254,6 +261,10 @@ impl LevelCursor {
         self.current.as_ref()?.peek()
     }
 
+    pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
+        self.current.as_ref()?.peek_owned()
+    }
+
     pub fn advance(&mut self, io: &PageIo) -> Result<()> {
         if let Some(c) = self.current.as_mut() {
             c.advance(io)?;
@@ -287,6 +298,13 @@ impl Source {
             Source::Level(c) => c.advance(io),
         }
     }
+
+    pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
+        match self {
+            Source::Page(c) => c.peek_owned(),
+            Source::Level(c) => c.peek_owned(),
+        }
+    }
 }
 
 /// Merges sources ordered newest first: for each key, the newest source's
@@ -297,10 +315,18 @@ pub struct Merger {
 }
 
 impl Merger {
-    pub fn new(sources: Vec<Source>) -> Self {
+    pub fn new(mut sources: Vec<Source>) -> Self {
+        // Sources that start out empty never contribute; dropping them keeps
+        // each pick short. Order, which encodes recency, is preserved.
+        sources.retain(|s| s.peek().is_some());
         let mut m = Self { sources, winner: None };
         m.pick();
         m
+    }
+
+    /// The current entry as slices sharing its block's buffer.
+    pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
+        self.sources[self.winner?].peek_owned()
     }
 
     fn pick(&mut self) {
@@ -348,12 +374,4 @@ impl Merger {
         Ok(())
     }
 
-    /// True if source `i` has an entry left.
-    pub fn source_has_more(&self, i: usize) -> bool {
-        self.sources[i].peek().is_some()
-    }
-
-    pub fn source_count(&self) -> usize {
-        self.sources.len()
-    }
 }
