@@ -235,6 +235,8 @@ pub struct DbStats {
     pub span_reads: u64,
     pub span_read_bytes: u64,
     pub cache_bytes: u64,
+    /// Cache bytes held as whole page images rather than single blocks.
+    pub cache_image_bytes: u64,
     pub memtable_bytes: u64,
     pub frozen_memtables: usize,
     pub tree: tree::TreeStats,
@@ -550,6 +552,7 @@ impl Db {
             span_reads: c.span_reads.load(Relaxed),
             span_read_bytes: c.span_read_bytes.load(Relaxed),
             cache_bytes: inner.io.cache_weight(),
+            cache_image_bytes: inner.io.cache_image_bytes(),
             memtable_bytes: v.active.bytes() + v.frozen.iter().map(|m| m.bytes()).sum::<u64>(),
             frozen_memtables: v.frozen.len(),
             tree: v.tree.as_ref().map(tree::stats).unwrap_or_default(),

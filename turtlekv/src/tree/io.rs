@@ -179,11 +179,18 @@ impl PageIo {
         }
     }
 
-    fn cached_image(&self, page: &DataPage) -> Option<Bytes> {
+    /// The page's whole image, if the cache holds it. Only merges, which read
+    /// whole pages, count as a use of the image. A point read or a scan only
+    /// looks: under skewed reads nearly every page holds a hot key, and
+    /// letting those reads keep whole images resident would fill the cache
+    /// with cold blocks.
+    fn cached_image(&self, page: &DataPage, merge: bool) -> Option<Bytes> {
         if !page.image_cached.load(Relaxed) {
             return None;
         }
-        match self.cache.get(&(page.id(), IMAGE)) {
+        let key = (page.id(), IMAGE);
+        let hit = if merge { self.cache.get(&key) } else { self.cache.peek(&key) };
+        match hit {
             Some(Cached::Image(image)) => Some(image),
             _ => {
                 page.image_cached.store(false, Relaxed);
@@ -202,7 +209,7 @@ impl PageIo {
             return Block::decode_trusted(image.slice(range));
         }
         let id = page.id();
-        if let Some(image) = self.cached_image(page) {
+        if let Some(image) = self.cached_image(page, false) {
             return Block::decode_trusted(image.slice(range));
         }
         if let Some(Cached::Block(block)) = self.cache.get(&(id, b as u32)) {
@@ -262,7 +269,7 @@ impl PageIo {
         if let Some(image) = page.pinned() {
             return Ok((image.slice(range), false));
         }
-        if let Some(image) = self.cached_image(page) {
+        if let Some(image) = self.cached_image(page, true) {
             return Ok((image.slice(range), false));
         }
         let ptr = page.ptr().expect("unpinned page is written");
@@ -299,6 +306,11 @@ impl PageIo {
 
     pub fn cache_weight(&self) -> u64 {
         self.cache.weight()
+    }
+
+    /// Bytes of whole page images in the cache. It visits every entry.
+    pub fn cache_image_bytes(&self) -> u64 {
+        self.cache.iter().map(|(_, v)| if let Cached::Image(b) = v { b.len() as u64 } else { 0 }).sum()
     }
 
     pub fn cache_capacity(&self) -> u64 {

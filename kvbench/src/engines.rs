@@ -74,7 +74,7 @@ impl Engine for Turtle {
     fn stats_json(&self) -> String {
         let s = self.db.stats();
         format!(
-            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"stage_secs":{:?}}}"#,
+            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_mb":{:.1},"image_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"stage_secs":{:?}}}"#,
             s.checkpoints,
             s.page_bytes_written as f64 / 1e6,
             s.pages_written,
@@ -82,6 +82,7 @@ impl Engine for Turtle {
             s.span_reads,
             s.span_read_bytes as f64 / 1e6,
             s.cache_bytes as f64 / 1e6,
+            s.cache_image_bytes as f64 / 1e6,
             s.memtable_bytes as f64 / 1e6,
             s.frozen_memtables,
             s.tree.height,
