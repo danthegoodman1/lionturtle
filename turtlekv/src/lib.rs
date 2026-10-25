@@ -13,6 +13,6 @@ pub mod tree;
 pub mod memtable;
 pub mod db;
 
-pub use db::{Db, DbIter, DbStats, Options};
+pub use db::{Db, DbIter, DbStats, Options, Snapshot};
 pub use memtable::MemTableKind;
 pub use tree::TreeConfig;

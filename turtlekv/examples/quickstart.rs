@@ -1,4 +1,5 @@
-//! Opens a store, writes a key and an atomic batch, then reads them back.
+//! Opens a store, writes a key and an atomic batch, then reads them back
+//! through iterators and a snapshot.
 //!
 //! `cargo run --release -p turtlekv --example quickstart`
 
@@ -26,6 +27,18 @@ fn main() -> turtlekv::Result<()> {
     while let Some((key, _)) = it.next()? {
         assert_ne!(&key[..], b"cherry");
     }
+
+    // Reads through one snapshot agree with each other, whatever is written
+    // meanwhile.
+    let snap = db.snapshot();
+    db.put(b"blueberry", b"blue")?;
+    let mut fruit = snap.prefix(b"b"); // keys starting with "b", ascending
+    while let Some((key, _)) = fruit.next()? {
+        assert_eq!(&key[..], b"banana");
+    }
+    let mut newest = snap.iter_rev(b"", None); // every key, descending
+    assert_eq!(newest.next()?.map(|(k, _)| k), Some("cherry".into()));
+    assert_eq!(snap.get(b"blueberry")?, None);
 
     db.sync()?;
     drop(db);

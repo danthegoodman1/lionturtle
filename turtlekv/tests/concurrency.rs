@@ -154,6 +154,7 @@ fn concurrent_btree_sim_disk() {
 /// Writers update pairs of keys in one batch while readers check that no
 /// read sees one half of a batch without the other: a get of the second key
 /// after the first, and every iterator and scan, which read one snapshot.
+/// Reads through one explicit snapshot must also agree with each other.
 fn atomic_batches(memtable: MemTableKind) {
     const PAIRS: u64 = 16;
     const WRITERS: u64 = 4;
@@ -200,25 +201,57 @@ fn atomic_batches(memtable: MemTableKind) {
             while !stop.load(Ordering::Relaxed) {
                 i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let p = (i >> 33) % PAIRS;
-                if r % 2 == 0 {
-                    let first = version(db.get(&key(2 * p)).unwrap());
-                    let second = version(db.get(&key(2 * p + 1)).unwrap());
-                    assert!(second >= first, "pair {p}: saw version {first} of its first key, then {second} of its second");
-                } else {
-                    let rows = db.scan(&key(0), Some(&key(2 * PAIRS)), usize::MAX).unwrap();
-                    let mut it = db.iter(&key(0), Some(&key(2 * PAIRS)));
-                    let mut iterated = Vec::new();
-                    while let Some(row) = it.next().unwrap() {
-                        iterated.push(row);
-                    }
-                    for rows in [rows, iterated] {
-                        let got: HashMap<u64, u64> = rows
-                            .iter()
-                            .map(|(k, v)| (u64::from_be_bytes(k[..].try_into().unwrap()), version(Some(v.clone()))))
-                            .collect();
-                        for p in 0..PAIRS {
+                let pairs = |rows: &[(bytes::Bytes, bytes::Bytes)]| -> Vec<(u64, u64)> {
+                    let got: HashMap<u64, u64> = rows
+                        .iter()
+                        .map(|(k, v)| (u64::from_be_bytes(k[..].try_into().unwrap()), version(Some(v.clone()))))
+                        .collect();
+                    (0..PAIRS)
+                        .map(|p| {
                             let (a, b) = (got.get(&(2 * p)), got.get(&(2 * p + 1)));
                             assert_eq!(a, b, "pair {p} differs within one snapshot");
+                            (p, a.copied().unwrap_or(0))
+                        })
+                        .collect()
+                };
+                let drain = |mut it: turtlekv::DbIter| {
+                    let mut rows = Vec::new();
+                    while let Some(row) = it.next().unwrap() {
+                        rows.push(row);
+                    }
+                    rows
+                };
+                match r {
+                    0 => {
+                        let first = version(db.get(&key(2 * p)).unwrap());
+                        let second = version(db.get(&key(2 * p + 1)).unwrap());
+                        assert!(second >= first, "pair {p}: saw version {first} of its first key, then {second} of its second");
+                    }
+                    1 => {
+                        pairs(&db.scan(&key(0), Some(&key(2 * PAIRS)), usize::MAX).unwrap());
+                        pairs(&drain(db.iter(&key(0), Some(&key(2 * PAIRS)))));
+                    }
+                    2 => {
+                        let snap = db.snapshot();
+                        let first = version(snap.get(&key(2 * p)).unwrap());
+                        let second = version(snap.get(&key(2 * p + 1)).unwrap());
+                        assert_eq!(first, second, "pair {p} differs within one snapshot");
+                    }
+                    _ => {
+                        // Every way of reading one snapshot returns the same pairs.
+                        let snap = db.snapshot();
+                        let scanned = pairs(&snap.scan(&key(0), Some(&key(2 * PAIRS)), usize::MAX).unwrap());
+                        let mut reversed = drain(snap.iter_rev(&key(0), Some(&key(2 * PAIRS))));
+                        reversed.reverse();
+                        // The pairs' keys share 7 leading zero bytes; filler keys
+                        // do not.
+                        let mut prefixed_rev = drain(snap.prefix_rev(&[0; 7]));
+                        prefixed_rev.reverse();
+                        for other in [reversed, drain(snap.prefix(&[0; 7])), prefixed_rev] {
+                            assert_eq!(pairs(&other), scanned, "reads of one snapshot disagree");
+                        }
+                        for &(p, v) in &scanned {
+                            assert_eq!(version(snap.get(&key(2 * p + 1)).unwrap()), v, "snapshot get of pair {p}");
                         }
                     }
                 }

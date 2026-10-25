@@ -25,7 +25,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 
 - **Fewer bytes written.** Each full memtable becomes one checkpoint of a Bε-tree, so a key overwritten within one checkpoint reaches disk once. Loading 50M records wrote 5.9 bytes per user byte, against RocksDB's 7.7 and fjall's 8.5.
 - **Batches are atomic to readers.** A batch survives a crash whole or not at all, and no reader sees half of one. Writers commit independently, so one slow insert delays no other writer.
-- **Iterators are snapshots.** An iterator sees every batch written before it was created and none written after.
+- **Explicit snapshots.** `Db::snapshot` returns a handle that any number of reads and iterators can share, and every read through it sees the same batches. Each iterator is a snapshot too: it sees every batch written before it was created and none after.
 - **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 - **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through writes, reads, iterators, checkpoints, crashes, torn writes, read errors and bit flips on a simulated disk. A failing seed replays exactly. See [Testing](#testing).
 
@@ -80,16 +80,17 @@ Each phase prints one JSON line with throughput, latency percentiles, bytes read
 |---|---|---|---|
 | Structure | Bε-tree, checkpointed once per memtable | Leveled LSM tree | Leveled LSM tree |
 | Atomic batches | To recovery and to readers | `WriteBatch` | Batches across keyspaces |
-| Snapshots | Each iterator reads one | Explicit snapshots | Explicit snapshots |
+| Snapshots | Explicit handles; each iterator reads one | Explicit snapshots | Explicit snapshots |
 | Transactions | None | Pessimistic and optimistic | Serializable single-writer; optimistic with conflict checks |
 | Namespaces | One keyspace | Column families | Keyspaces |
-| Iteration | Forward | Forward, reverse, prefix | Forward, reverse, prefix |
+| Iteration | Forward, reverse, prefix | Forward, reverse, prefix | Forward, reverse, prefix |
 | Compression | None | Several codecs | LZ4 |
 | Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while one frozen memtable awaits its checkpoint | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 
 - **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns after an fsync. Synchronous writers take turns at the fsync. RocksDB groups concurrent synchronous writers into one fsync.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
+- **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
 
 ## Differences from the C++ TurtleKV
@@ -124,6 +125,11 @@ let value = db.get(b"banana")?;
 let rows = db.scan(b"a", Some(b"c"), 100)?;
 let mut it = db.iter(b"", None); // a snapshot as of this call
 while let Some((key, value)) = it.next()? { /* ... */ }
+
+// Reads through one snapshot agree with each other, whatever is written meanwhile.
+let snap = db.snapshot();
+let fruit = snap.prefix(b"b"); // keys starting with "b", ascending
+let newest = snap.iter_rev(b"a", Some(b"c")); // [a, c), descending
 db.sync()?;
 ```
 
@@ -131,7 +137,7 @@ db.sync()?;
 cargo run --release -p turtlekv --example quickstart
 ```
 
-The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `sync`, `checkpoint` and `stats`. Keys run to 64 KiB and values to 16 MiB.
+The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. Keys run to 64 KiB and values to 16 MiB.
 
 ## How it works
 
@@ -159,11 +165,12 @@ Pages are immutable: checksummed 4 KiB blocks, a sparse block index, and a Bloom
 
 - **Get:** the active memtable, then the frozen one, then the tree, at each node checking each buffer level's segment that covers the key.
 - **Scan:** a merge of the memtables with the tree, one leaf's key range at a time. Each range merges the leaf with the buffer levels of every node on its path.
+- **Reverse scan:** the same merge run backward one window at a time. Each window is merged forward and returned in reverse. The first spans one leaf block, and each next one doubles, up to 32 blocks. On 4.2M cached entries, a full reverse pass takes 89 ns per entry against 62 forward; a 100-entry scan takes 25 µs against 13.
 - **Cache:** a byte-weighted cache of blocks. A freshly written page enters whole, for the next merge to read. Point reads and scans read from such an image without keeping it resident, so under skewed reads the cache holds hot blocks rather than whole pages.
 
 ### Visibility
 
-Each batch takes a ticket under the writer lock and registers it. Its versions carry the ticket. Once every op is in the memtable, the writer marks the ticket committed and returns. A get takes the newest version whose batch has committed. Committed tickets fold into a visible prefix of sequence numbers. An iterator waits until the batches registered before it commit, then reads that prefix, so it is a snapshot.
+Each batch takes a ticket under the writer lock and registers it. Its versions carry the ticket. Once every op is in the memtable, the writer marks the ticket committed and returns. A get takes the newest version whose batch has committed. Committed tickets fold into a visible prefix of sequence numbers. A snapshot waits until the batches registered before it commit, then reads that prefix. It also holds the version it started from: the memtables and tree root of that moment.
 
 ## Configuration
 
@@ -198,13 +205,13 @@ Each batch takes a ticket under the writer lock and registers it. Its versions c
 
 ```console
 cargo test --release                                   # unit, model and threaded tests
-cargo run --release --bin vopr -- --seeds 1000         # 1,000 seeds on every core
+cargo run --release --bin vopr -- --seeds 1000         # 1,000 seeds from a random start
 cargo run --release --bin vopr -- --seed 42 --verbose  # replay one seed
 ```
 
-VOPR drives the store on one thread so seeds replay exactly. Each seed draws a store configuration, a key set with shared prefixes, and a fault profile: lost unsynced sectors at power loss, failed reads, flipped bits, and failed writes and fsyncs. The oracle checks that every read matches the model, that recovery yields a prefix of history containing every synced write, that a clean reopen loses nothing, that each iterator returns exactly its creation snapshot, and that no page slot leaks.
+VOPR drives the store on one thread so seeds replay exactly. Each seed draws a store configuration, a key set with shared prefixes, and a fault profile: lost unsynced sectors at power loss, failed reads, flipped bits, and failed writes and fsyncs. The oracle checks that every read matches the model, that recovery yields a prefix of history containing every synced write, that a clean reopen loses nothing, that every read through a held snapshot matches the model as it stood when the snapshot was taken, that each iterator, forward or reverse, over a range or a prefix, returns exactly its snapshot, and that no page slot leaks.
 
-Threaded tests cover what one thread cannot: concurrent writers, readers and scanners against background checkpoints, and batches that must stay whole to every reader on every memtable.
+Threaded tests cover what one thread cannot: concurrent writers, readers and scanners against background checkpoints, and batches that must stay whole to every reader on every memtable, including gets, scans and iterators of all kinds sharing one snapshot.
 
 ### Benchmarks
 

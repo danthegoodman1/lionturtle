@@ -14,13 +14,13 @@
 //! is gone (see [`Epoch`]).
 
 use crate::error::{Error, Result};
-use crate::memtable::{MemTable, MemTableKind, new_memtable};
+use crate::memtable::{MemTable, MemTableKind, View, new_memtable};
 use crate::page::{EntryRef, PageBuilder, entry_size};
 use crate::pagestore::{PagePtr, PageStore, Superblock};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, PageIo};
 use crate::tree::{self, Ctx, Subtree, TreeConfig, TreeScan};
-use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Value, WriteOp, cmp_keys};
+use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Value, WriteOp, cmp_keys, prefix_end};
 use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -553,53 +553,39 @@ impl Db {
         self.inner.get(key)
     }
 
-    /// Up to `limit` live entries with keys in `[start, end)`, in order.
-    ///
-    /// Small entries are copied into one buffer per call. Sharing them would
-    /// make every result touch the reference count of a cached block, and
-    /// threads scanning the same hot blocks contend on those counts.
+    /// Up to `limit` live entries with keys in `[start, end)`, in order, as
+    /// of one snapshot.
     pub fn scan(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
-        enum Part {
-            Copied(usize, usize, usize),
-            Shared(Bytes, Bytes),
-        }
-        const COPY_LIMIT: usize = 512;
-        let mut it = self.iter(start, end);
-        let mut buf = Vec::with_capacity(4096);
-        let mut parts = Vec::with_capacity(limit.min(1024));
-        while parts.len() < limit {
-            let part = it.step(|e| {
-                let (k, v) = (e.key(), e.value());
-                if k.len() + v.len() <= COPY_LIMIT {
-                    let at = buf.len();
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(v);
-                    Part::Copied(at, k.len(), v.len())
-                } else {
-                    let (k, v) = e.to_owned();
-                    Part::Shared(k, v)
-                }
-            })?;
-            match part {
-                Some(p) => parts.push(p),
-                None => break,
-            }
-        }
-        let buf = Bytes::from(buf);
-        Ok(parts
-            .into_iter()
-            .map(|p| match p {
-                Part::Copied(at, kl, vl) => (buf.slice(at..at + kl), buf.slice(at + kl..at + kl + vl)),
-                Part::Shared(k, v) => (k, v),
-            })
-            .collect())
+        self.snapshot().scan(start, end, limit)
     }
 
-    /// An iterator over live entries with keys in `[start, end)` as of one
-    /// snapshot: it sees every batch written before the call returned and
-    /// none written after.
+    /// A consistent view of the store for reads that must agree with each
+    /// other; see [`Snapshot`].
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot::new(self.inner.clone())
+    }
+
+    /// An iterator over live entries with keys in `[start, end)`, in key
+    /// order, as of a snapshot taken by this call: it sees every batch
+    /// written before the call and none after.
     pub fn iter(&self, start: &[u8], end: Option<&[u8]>) -> DbIter {
-        DbIter::new(self.inner.clone(), start, end)
+        self.snapshot().iter(start, end)
+    }
+
+    /// [`Db::iter`] in descending key order.
+    pub fn iter_rev(&self, start: &[u8], end: Option<&[u8]>) -> DbIter {
+        self.snapshot().iter_rev(start, end)
+    }
+
+    /// An iterator over live entries whose keys start with `prefix`, in key
+    /// order, as of a snapshot taken by this call.
+    pub fn prefix(&self, prefix: &[u8]) -> DbIter {
+        self.snapshot().prefix(prefix)
+    }
+
+    /// [`Db::prefix`] in descending key order.
+    pub fn prefix_rev(&self, prefix: &[u8]) -> DbIter {
+        self.snapshot().prefix_rev(prefix)
     }
 
     /// Makes every completed write durable.
@@ -861,15 +847,21 @@ impl Inner {
         Ok(())
     }
 
+    /// The newest committed value of `key`.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let v = self.version.load();
         let visible = self.commits.visible.load(Acquire);
-        let view = |seq, ticket| self.commits.sees(visible, seq, ticket);
-        if let Some(val) = v.active.table.get(key, &view) {
+        self.get_in(&v, key, &|seq, ticket| self.commits.sees(visible, seq, ticket))
+    }
+
+    /// The value of `key` in version `v`, reading the memtables through
+    /// `view`. The tree holds only committed batches.
+    fn get_in(&self, v: &Version, key: &[u8], view: View) -> Result<Option<Bytes>> {
+        if let Some(val) = v.active.table.get(key, view) {
             return Ok(val.into_put());
         }
         for m in &v.frozen {
-            if let Some(val) = m.table.get(key, &view) {
+            if let Some(val) = m.table.get(key, view) {
                 return Ok(val.into_put());
             }
         }
@@ -1051,13 +1043,207 @@ enum Stage {
     Commit,
 }
 
-/// A merged iterator over the memtables and the tree of one version.
-pub struct DbIter {
+/// A consistent view of the store: every batch committed when it was
+/// taken, and none after. Reads through one snapshot agree with each other
+/// however long they run. Holding one keeps its memtables in memory and its
+/// tree's pages on disk. Drop snapshots and iterators before reopening the
+/// store, which may reuse the pages they read.
+#[derive(Clone)]
+pub struct Snapshot {
     inner: Arc<Inner>,
+    version: Arc<Version>,
+    seq: u64,
+}
+
+impl Snapshot {
+    fn new(inner: Arc<Inner>) -> Self {
+        let version = inner.version.load_full();
+        // Taken after loading the version, so it covers every batch the
+        // version's tree holds.
+        let seq = inner.commits.prefix();
+        Self { inner, version, seq }
+    }
+
+    /// The sequence number of the last write the snapshot holds.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let seq = self.seq;
+        self.inner.get_in(&self.version, key, &|s, _| s <= seq)
+    }
+
+    /// Up to `limit` live entries with keys in `[start, end)`, in order.
+    pub fn scan(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+        collect_scan(Forward::new(self, start, end), limit)
+    }
+
+    /// An iterator over live entries with keys in `[start, end)`, in key
+    /// order.
+    pub fn iter(&self, start: &[u8], end: Option<&[u8]>) -> DbIter {
+        DbIter(Walk::Forward(Forward::new(self, start, end)))
+    }
+
+    /// [`Snapshot::iter`] in descending key order.
+    pub fn iter_rev(&self, start: &[u8], end: Option<&[u8]>) -> DbIter {
+        DbIter(Walk::Reverse(Reverse::new(self, start, end)))
+    }
+
+    /// An iterator over live entries whose keys start with `prefix`.
+    pub fn prefix(&self, prefix: &[u8]) -> DbIter {
+        self.iter(prefix, prefix_end(prefix).as_deref())
+    }
+
+    /// [`Snapshot::prefix`] in descending key order.
+    pub fn prefix_rev(&self, prefix: &[u8]) -> DbIter {
+        self.iter_rev(prefix, prefix_end(prefix).as_deref())
+    }
+}
+
+/// Up to `limit` entries from `it`.
+///
+/// Small entries are copied into one buffer per call. Sharing them would
+/// make every result touch the reference count of a cached block, and
+/// threads scanning the same hot blocks contend on those counts.
+fn collect_scan(mut it: Forward, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+    enum Part {
+        Copied(usize, usize, usize),
+        Shared(Bytes, Bytes),
+    }
+    const COPY_LIMIT: usize = 512;
+    let mut buf = Vec::with_capacity(4096);
+    let mut parts = Vec::with_capacity(limit.min(1024));
+    while parts.len() < limit {
+        let part = it.step(|e| {
+            let (k, v) = (e.key(), e.value());
+            if k.len() + v.len() <= COPY_LIMIT {
+                let at = buf.len();
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(v);
+                Part::Copied(at, k.len(), v.len())
+            } else {
+                let (k, v) = e.to_owned();
+                Part::Shared(k, v)
+            }
+        })?;
+        match part {
+            Some(p) => parts.push(p),
+            None => break,
+        }
+    }
+    let buf = Bytes::from(buf);
+    Ok(parts
+        .into_iter()
+        .map(|p| match p {
+            Part::Copied(at, kl, vl) => (buf.slice(at..at + kl), buf.slice(at + kl..at + kl + vl)),
+            Part::Shared(k, v) => (k, v),
+        })
+        .collect())
+}
+
+/// An iterator over one snapshot's live entries, in either key order.
+pub struct DbIter(Walk);
+
+enum Walk {
+    Forward(Forward),
+    Reverse(Reverse),
+}
+
+impl DbIter {
+    pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        match &mut self.0 {
+            Walk::Forward(f) => f.next(),
+            Walk::Reverse(r) => r.next(),
+        }
+    }
+}
+
+/// Reads `[start, hi)` backward one window at a time. Each window goes
+/// through the forward merge and comes back reversed, so both directions
+/// share one merge. Windows start at one leaf block and double, so short
+/// reverse scans read little and long ones amortize each window's seeks.
+struct Reverse {
+    snap: Snapshot,
+    start: Bytes,
+    /// Exclusive upper bound of what remains; `None` for the end of the key
+    /// space.
+    hi: Option<Bytes>,
+    /// The current window's entries in key order, taken from the back.
+    window: Vec<(Bytes, Bytes)>,
+    /// Leaf blocks the next window spans.
+    blocks: usize,
+    done: bool,
+}
+
+/// Entries of each memtable a reverse window holds at most, per leaf block
+/// it spans.
+const MEM_WINDOW: usize = 64;
+const MAX_WINDOW_BLOCKS: usize = 32;
+
+impl Reverse {
+    fn new(snap: &Snapshot, start: &[u8], end: Option<&[u8]>) -> Self {
+        Self {
+            snap: snap.clone(),
+            start: Bytes::copy_from_slice(start),
+            hi: end.map(Bytes::copy_from_slice),
+            window: Vec::new(),
+            blocks: 1,
+            done: false,
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        loop {
+            if let Some(e) = self.window.pop() {
+                return Ok(Some(e));
+            }
+            if self.done || self.hi.as_deref().is_some_and(|h| h <= &self.start[..]) {
+                self.done = true;
+                return Ok(None);
+            }
+            let lo = self.window_start();
+            let mut forward = Forward::new(&self.snap, &lo, self.hi.as_deref());
+            while let Some(e) = forward.next()? {
+                self.window.push(e);
+            }
+            self.done = lo == self.start;
+            self.hi = Some(lo);
+            self.blocks = (self.blocks * 2).min(MAX_WINDOW_BLOCKS);
+        }
+    }
+
+    /// Where the next window begins: at or after `start`, below `hi`, and
+    /// late enough that the window spans about `blocks` leaf blocks of the
+    /// tree and at most `blocks` × [`MEM_WINDOW`] entries of each memtable.
+    fn window_start(&self) -> Bytes {
+        let hi = self.hi.as_deref();
+        let mut lo = self.start.clone();
+        if let Some(t) = &self.snap.version.tree {
+            lo = lo.max(tree::window_start(t, hi, self.blocks));
+        }
+        // Each memtable is read only within the window so far, which narrows
+        // as it goes.
+        let seq = self.snap.seq;
+        let limit = MEM_WINDOW * self.blocks;
+        let mut out = Vec::new();
+        for m in std::iter::once(&self.snap.version.active).chain(&self.snap.version.frozen) {
+            out.clear();
+            m.table.range_rev(&lo, hi, &|s, _| s <= seq, limit, &mut out);
+            if let Some((k, _)) = out.get(limit - 1) {
+                lo = k.clone();
+            }
+        }
+        lo
+    }
+}
+
+/// A merged iterator over the memtables and the tree of one snapshot.
+struct Forward {
+    snap: Snapshot,
     /// Newest first; the tree comes last.
     mems: Vec<MemSource>,
     tree: TreeScan,
-    _version: Arc<Version>,
 }
 
 struct MemSource {
@@ -1132,12 +1318,9 @@ impl EntryView<'_> {
     }
 }
 
-impl DbIter {
-    fn new(inner: Arc<Inner>, start: &[u8], end: Option<&[u8]>) -> Self {
-        let version = inner.version.load_full();
-        // Taken after loading the version, so it covers every batch the
-        // version's tree holds.
-        let snapshot = inner.commits.prefix();
+impl Forward {
+    fn new(snap: &Snapshot, start: &[u8], end: Option<&[u8]>) -> Self {
+        let (version, snapshot) = (&snap.version, snap.seq);
         let end_b = end.map(Bytes::copy_from_slice);
         let start_b = Bytes::copy_from_slice(start);
         let mems = std::iter::once(&version.active)
@@ -1153,16 +1336,16 @@ impl DbIter {
             })
             .collect();
         let tree = TreeScan::new(version.tree.clone(), start, end_b);
-        Self { inner, mems, tree, _version: version }
+        Self { snap: snap.clone(), mems, tree }
     }
 
-    pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+    fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
         self.step(|e| e.to_owned())
     }
 
     /// Finds the next live entry, passes it to `f`, and moves past it.
     fn step<T>(&mut self, f: impl FnOnce(EntryView<'_>) -> T) -> Result<Option<T>> {
-        let io = &self.inner.io;
+        let io = &self.snap.inner.io;
         loop {
             self.tree.settle(io)?;
             for m in &mut self.mems {

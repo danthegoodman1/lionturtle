@@ -1,6 +1,7 @@
 //! Runs VOPR simulations: `vopr [--seed N] [--steps N] [--seeds N] [--verbose]`.
-//! Without `--seed`, runs `--seeds` consecutive seeds starting from a random one
-//! and stops at the first failure, printing the seed that reproduces it.
+//! Runs `--seeds` consecutive seeds starting at `--seed` (one seed by default)
+//! or, without `--seed`, at a random one (100 seeds by default). Stops at the
+//! first failure, printing the seed that reproduces it.
 
 use std::time::Instant;
 use turtlekv::sim::vopr;
@@ -11,7 +12,7 @@ fn main() {
     let verbose = args.iter().any(|a| a == "--verbose");
     let steps = arg("--steps").unwrap_or(5_000);
     let (first, count) = match arg("--seed") {
-        Some(seed) => (seed, 1),
+        Some(seed) => (seed, arg("--seeds").unwrap_or(1)),
         None => {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
             (t ^ (std::process::id() as u64) << 32, arg("--seeds").unwrap_or(100))
@@ -29,6 +30,9 @@ fn main() {
                 total.crashes += r.crashes;
                 total.writes += r.writes;
                 total.reads += r.reads;
+                total.scans += r.scans;
+                total.snapshots += r.snapshots;
+                total.iterators += r.iterators;
                 total.read_errors += r.read_errors;
                 total.max_height = total.max_height.max(r.max_height);
             }
@@ -40,11 +44,14 @@ fn main() {
         }
     }
     println!(
-        "{count} seeds ok in {:.1}s: {} steps, {} writes, {} reads, {} crashes, {} read faults, max height {}",
+        "{count} seeds ok in {:.1}s: {} steps, {} writes, {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}",
         started.elapsed().as_secs_f64(),
         total.steps,
         total.writes,
         total.reads,
+        total.scans,
+        total.snapshots,
+        total.iterators,
         total.crashes,
         total.read_errors,
         total.max_height

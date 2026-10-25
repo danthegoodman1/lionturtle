@@ -972,6 +972,41 @@ pub fn get(io: &PageIo, root: &Subtree, key: &[u8]) -> Result<Option<Value>> {
     }
 }
 
+/// The start of a key range that ends at `hi` (or at the end of the key
+/// space) and covers about `blocks` leaf blocks: the first key of the
+/// `blocks`th block back from the one holding the greatest key below `hi`,
+/// or the lower bound of the leaf's range when the leaf holds fewer blocks
+/// below `hi`. Reverse iteration reads the range before `hi` one such window
+/// at a time.
+pub fn window_start(root: &Subtree, hi: Option<&[u8]>, blocks: usize) -> Bytes {
+    let mut cur = root;
+    let mut lo = Bytes::new();
+    loop {
+        match cur {
+            Subtree::Node(n) => {
+                // The child holding the greatest key below `hi`.
+                let i = match hi {
+                    None => n.children.len() - 1,
+                    Some(h) => n.pivots[1..].partition_point(|p| cmp_keys(p, h).is_lt()),
+                };
+                lo = n.pivots[i].clone();
+                cur = &n.children[i];
+            }
+            Subtree::Leaf(page) => {
+                let meta = &page.meta;
+                let below = match hi {
+                    None => meta.n_blocks as usize,
+                    Some(h) => meta.blocks_before(h),
+                };
+                return match below.checked_sub(blocks.max(1)) {
+                    Some(b) if meta.n_items > 0 => Bytes::copy_from_slice(meta.block_first_key(b)).max(lo),
+                    _ => lo,
+                };
+            }
+        }
+    }
+}
+
 /// Iterates live entries of a tree in key order from a start key, one leaf's
 /// key range at a time: each range merges the leaf with the buffer levels of
 /// every node on its root-to-leaf path.

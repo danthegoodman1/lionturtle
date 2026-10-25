@@ -11,12 +11,14 @@
 //!   `s` with `synced ≤ s ≤ last`, where `synced` is the newest write known
 //!   durable: a prefix of history that keeps every synced write;
 //! - after a clean reopen, nothing is lost;
-//! - a long-lived iterator returns exactly the model's entries in its range
-//!   when it was created, whatever is written while it runs;
+//! - a held snapshot answers every `get`, `scan`, and iterator with the
+//!   model's state when it was taken, whatever is written since;
+//! - a long-lived iterator, forward or reverse, over a range or a prefix,
+//!   returns exactly the model's entries in its range as of its snapshot;
 //! - tree invariants hold, and no page slot leaks.
 
 use super::{FaultConfig, Rng, SimStorage};
-use crate::db::{Db, DbIter, Options};
+use crate::db::{Db, DbIter, Options, Snapshot};
 use crate::error::Error;
 use crate::memtable::MemTableKind;
 use crate::tree::TreeConfig;
@@ -32,6 +34,8 @@ pub struct Report {
     pub writes: u64,
     pub reads: u64,
     pub scans: u64,
+    pub snapshots: u64,
+    pub iterators: u64,
     pub crashes: u64,
     pub reopens: u64,
     pub checkpoints: u64,
@@ -89,11 +93,19 @@ impl Model {
     }
 }
 
+type State = BTreeMap<Vec<u8>, Vec<u8>>;
+
 struct Iter {
     it: DbIter,
-    /// The model's entries in the iterator's range when it was created, which
-    /// it must return in order.
+    /// The model's entries in the iterator's range as of its snapshot, in the
+    /// order it must return them.
     expected: VecDeque<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A held snapshot and the model's state when it was taken.
+struct Snap {
+    snap: Snapshot,
+    state: State,
 }
 
 struct Sim {
@@ -105,6 +117,7 @@ struct Sim {
     keys: Vec<Vec<u8>>,
     max_value: usize,
     iters: Vec<Iter>,
+    snaps: Vec<Snap>,
     report: Report,
     verbose: bool,
 }
@@ -183,6 +196,7 @@ impl Sim {
             keys: keys.into_iter().collect(),
             max_value,
             iters: Vec::new(),
+            snaps: Vec::new(),
             report: Report::default(),
             verbose,
         }
@@ -274,6 +288,7 @@ impl Sim {
 
     fn crash_and_recover(&mut self) -> Result<(), String> {
         self.iters.clear();
+        self.snaps.clear();
         self.db = None;
         self.disk.crash();
         self.report.crashes += 1;
@@ -300,6 +315,7 @@ impl Sim {
 
     fn clean_reopen(&mut self) -> Result<(), String> {
         self.iters.clear();
+        self.snaps.clear();
         let poisoned = self.db().is_poisoned();
         self.db = None;
         if poisoned {
@@ -324,7 +340,8 @@ impl Sim {
     }
 
     fn check_invariants_inner(&mut self) -> Result<(), String> {
-        if self.iters.is_empty() {
+        // Readers keep old pages allocated, which the leak check would flag.
+        if self.iters.is_empty() && self.snaps.is_empty() {
             let db = self.db.as_ref().unwrap();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.check_invariants())) {
                 Ok(Ok(())) => {}
@@ -341,14 +358,19 @@ impl Sim {
         Ok(())
     }
 
-    fn verify_get(&mut self, key: &[u8]) -> Result<(), String> {
+    /// Reads `key` from the store, or from held snapshot `snap`, and checks
+    /// the answer against the model.
+    fn verify_get(&mut self, key: &[u8], snap: Option<usize>) -> Result<(), String> {
         self.report.reads += 1;
-        match self.db().get(key) {
+        let (got, expected) = match snap {
+            None => (self.db().get(key), self.model.state.get(key)),
+            Some(i) => (self.snaps[i].snap.get(key), self.snaps[i].state.get(key)),
+        };
+        match got {
             Ok(v) => {
-                let expected = self.model.state.get(key);
                 if v.as_deref() != expected.map(|v| &v[..]) {
                     return Err(format!(
-                        "get {:?}: got {:?}, expected {:?}",
+                        "get {:?} (snapshot {snap:?}): got {:?}, expected {:?}",
                         Bytes::copy_from_slice(key),
                         v.map(|v| v.len()),
                         expected.map(|v| v.len())
@@ -364,12 +386,18 @@ impl Sim {
         }
     }
 
-    fn verify_scan(&mut self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<(), String> {
+    /// Scans the store, or held snapshot `snap`, and checks the answer
+    /// against the model.
+    fn verify_scan(&mut self, start: &[u8], end: Option<&[u8]>, limit: usize, snap: Option<usize>) -> Result<(), String> {
         self.report.scans += 1;
         if self.rng.chance(0.5) {
             crate::tree::io::arm_prefetch();
         }
-        let got = match self.db().scan(start, end, limit) {
+        let (got, state) = match snap {
+            None => (self.db().scan(start, end, limit), &self.model.state),
+            Some(i) => (self.snaps[i].snap.scan(start, end, limit), &self.snaps[i].state),
+        };
+        let got = match got {
             Ok(v) => v,
             Err(Error::Io(_)) | Err(Error::Corruption(_)) => {
                 self.report.read_errors += 1;
@@ -377,19 +405,14 @@ impl Sim {
             }
             Err(e) => return Err(format!("scan failed: {e}")),
         };
-        let expected: Vec<(&Vec<u8>, &Vec<u8>)> = self
-            .model
-            .state
-            .range(start.to_vec()..)
-            .take_while(|(k, _)| end.is_none_or(|e| &k[..] < e))
-            .take(limit)
-            .collect();
+        let expected: Vec<(&Vec<u8>, &Vec<u8>)> =
+            state.range(start.to_vec()..).take_while(|(k, _)| end.is_none_or(|e| &k[..] < e)).take(limit).collect();
         if got.len() != expected.len()
             || got.iter().zip(&expected).any(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..])
         {
             let first_diff = got.iter().zip(&expected).position(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..]);
             return Err(format!(
-                "scan from {:?} limit {limit}: got {} entries, expected {}, first difference at {first_diff:?}",
+                "scan from {:?} limit {limit} (snapshot {snap:?}): got {} entries, expected {}, first difference at {first_diff:?}",
                 Bytes::copy_from_slice(start),
                 got.len(),
                 expected.len()
@@ -439,14 +462,50 @@ impl Sim {
     /// model's entries as they stood when it was created.
     fn step_iter(&mut self) -> Result<(), String> {
         if self.iters.is_empty() || (self.iters.len() < 3 && self.rng.chance(0.3)) {
+            self.report.iterators += 1;
+            // Read the store as it is now, or a held snapshot.
+            let held = (!self.snaps.is_empty() && self.rng.chance(0.5)).then(|| self.rng.below(self.snaps.len() as u64) as usize);
+            let snap = match held {
+                Some(i) => self.snaps[i].snap.clone(),
+                None => self.db().snapshot(),
+            };
+            let reverse = self.rng.chance(0.5);
+            // A prefix of a key, often ending in the alphabet's 0xff, or a
+            // range.
+            let prefix = self.rng.chance(0.3).then(|| {
+                let mut p = self.key();
+                p.truncate(self.rng.range(0, p.len() as u64 + 1) as usize);
+                p
+            });
             let start = self.key();
-            let end = self.rng.chance(0.3).then(|| self.key()).filter(|e| *e > start);
+            let end = self.rng.chance(0.3).then(|| self.key());
             if self.rng.chance(0.5) {
                 crate::tree::io::arm_prefetch();
             }
-            let it = self.db().iter(&start, end.as_deref());
-            let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
-            let expected = self.model.state.range::<Vec<u8>, _>((Bound::Included(start), hi)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let state = match held {
+                Some(i) => &self.snaps[i].state,
+                None => &self.model.state,
+            };
+            let (it, expected): (DbIter, Vec<_>) = if let Some(prefix) = prefix {
+                let it = if reverse { snap.prefix_rev(&prefix) } else { snap.prefix(&prefix) };
+                let expected = state.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                (it, expected)
+            } else {
+                let it = if reverse { snap.iter_rev(&start, end.as_deref()) } else { snap.iter(&start, end.as_deref()) };
+                // An empty or inverted range holds nothing.
+                let expected = match end {
+                    Some(e) if e <= start => Vec::new(),
+                    end => {
+                        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+                        state.range::<Vec<u8>, _>((Bound::Included(start), hi)).map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                };
+                (it, expected)
+            };
+            let mut expected = VecDeque::from(expected);
+            if reverse {
+                expected.make_contiguous().reverse();
+            }
             self.iters.push(Iter { it, expected });
             return Ok(());
         }
@@ -482,6 +541,27 @@ impl Sim {
         Ok(())
     }
 
+    /// A held snapshot for a read a quarter of the time, if any are held.
+    fn pick_snapshot(&mut self) -> Option<usize> {
+        (!self.snaps.is_empty() && self.rng.chance(0.25)).then(|| self.rng.below(self.snaps.len() as u64) as usize)
+    }
+
+    /// Takes a snapshot, which must hold every completed write, or drops one.
+    fn step_snapshot(&mut self) -> Result<(), String> {
+        if self.snaps.len() < 3 && self.rng.chance(0.6) {
+            self.report.snapshots += 1;
+            let snap = self.db().snapshot();
+            if snap.seq() != self.model.last_seq {
+                return Err(format!("snapshot at seq {}, last write {}", snap.seq(), self.model.last_seq));
+            }
+            self.snaps.push(Snap { snap, state: self.model.state.clone() });
+        } else if !self.snaps.is_empty() {
+            let i = self.rng.below(self.snaps.len() as u64) as usize;
+            self.snaps.swap_remove(i);
+        }
+        Ok(())
+    }
+
     fn step(&mut self) -> Result<(), String> {
         self.report.steps += 1;
         let r = self.rng.below(1000);
@@ -507,16 +587,19 @@ impl Sim {
                 let sync = self.rng.chance(0.2);
                 self.write(ops.into_iter().collect(), sync)
             }
-            430..680 => {
+            430..650 => {
                 let k = if self.rng.chance(0.9) { self.key() } else { b"missing-key".to_vec() };
-                self.verify_get(&k)
+                let snap = self.pick_snapshot();
+                self.verify_get(&k, snap)
             }
-            680..740 => {
+            650..710 => {
                 let start = self.key();
                 let end = self.rng.chance(0.3).then(|| self.key());
                 let limit = self.rng.range(0, 60) as usize;
-                self.verify_scan(&start, end.as_deref(), limit)
+                let snap = self.pick_snapshot();
+                self.verify_scan(&start, end.as_deref(), limit, snap)
             }
+            710..740 => self.step_snapshot(),
             740..770 => {
                 let r = self.db().sync();
                 match r {
@@ -577,6 +660,7 @@ fn run_inner(seed: u64, steps: u64, verbose: bool) -> Result<Report, String> {
         }
     }
     sim.iters.clear();
+    sim.snaps.clear();
     sim.disk.disarm_crash();
     sim.check_invariants().map_err(|e| format!("seed {seed} final: {e}"))?;
     sim.verify_all().map_err(|e| format!("seed {seed} final: {e}"))?;

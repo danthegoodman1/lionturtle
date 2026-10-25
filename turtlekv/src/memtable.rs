@@ -71,6 +71,10 @@ pub trait MemTable: Send + Sync {
     /// with the newest values `view` sees. Keys with no such version are
     /// skipped.
     fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>);
+    /// Appends up to `limit` keys at or after `start` and below `end`, in
+    /// descending key order, with the newest values `view` sees. Keys with
+    /// no such version are skipped.
+    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>);
     /// Visits every key's newest value in key order. Called once writers are
     /// gone.
     fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value));
@@ -117,6 +121,11 @@ fn below(key: &[u8], end: Option<&[u8]>) -> bool {
     end.is_none_or(|e| key < e)
 }
 
+/// Whether `[start, end)` holds no keys.
+fn empty_range(start: &[u8], end: Option<&[u8]>) -> bool {
+    end.is_some_and(|e| e <= start)
+}
+
 #[derive(Default)]
 pub struct SkipListTable {
     /// Each key's versions swap in place: replacing a skip list entry removes
@@ -144,6 +153,19 @@ impl MemTable for SkipListTable {
         let visible = self
             .map
             .range::<[u8], _>((start, hi))
+            .filter_map(|e| Some((e.key().clone(), e.value().load().at(view)?.clone())));
+        out.extend(visible.take(limit));
+    }
+
+    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+        if empty_range(start, end) {
+            return;
+        }
+        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+        let visible = self
+            .map
+            .range::<[u8], _>((Bound::Included(start), hi))
+            .rev()
             .filter_map(|e| Some((e.key().clone(), e.value().load().at(view)?.clone())));
         out.extend(visible.take(limit));
     }
@@ -198,6 +220,21 @@ impl MemTable for BBTreeTable {
         });
     }
 
+    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+        if limit == 0 || empty_range(start, end) {
+            return;
+        }
+        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut n = 0;
+        self.map.scan_rev::<[u8], ()>((Bound::Included(start), hi), |k, v| {
+            if let Some(value) = v.at(view) {
+                out.push((Bytes::copy_from_slice(k), value.clone()));
+                n += 1;
+            }
+            if n >= limit { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+    }
+
     fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value)) {
         self.map.scan::<[u8], ()>(.., |k, v| {
             f(k, &v.value);
@@ -244,6 +281,19 @@ impl MemTable for BTreeTable {
         out.extend(visible.take(limit));
     }
 
+    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+        if empty_range(start, end) {
+            return;
+        }
+        let map = self.map.read();
+        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+        let visible = map
+            .range::<[u8], _>((Bound::Included(start), hi))
+            .rev()
+            .filter_map(|(k, v)| Some((k.clone(), v.at(view)?.clone())));
+        out.extend(visible.take(limit));
+    }
+
     fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value)) {
         for (k, v) in self.map.read().iter() {
             f(k, &v.value);
@@ -266,6 +316,31 @@ pub struct ArtTable {
 
 fn art_key(key: &[u8]) -> usize {
     u64::from_be_bytes(key.try_into().expect("the ART memtable takes 8-byte keys")) as usize
+}
+
+/// The first eight bytes of `key` as an integer, zero-padded, and whether
+/// `key` runs past them.
+fn art_prefix(key: &[u8]) -> (u128, bool) {
+    (crate::types::key_prefix(key) as u128, key.len() > 8)
+}
+
+/// The smallest 8-byte key at or above `start` (or above it, when
+/// `exclusive`), as an integer; 2^64 when there is none.
+fn art_lower(start: &[u8], exclusive: bool) -> u128 {
+    let (p, longer) = art_prefix(start);
+    // A shorter key sorts before its zero-padded form; a longer one after.
+    if longer || (exclusive && start.len() == 8) { p + 1 } else { p }
+}
+
+/// The 8-byte keys below `end` are those below the returned integer.
+fn art_upper(end: Option<&[u8]>) -> u128 {
+    match end {
+        None => 1 << 64,
+        Some(e) => {
+            let (p, longer) = art_prefix(e);
+            if longer { p + 1 } else { p }
+        }
+    }
 }
 
 impl ArtTable {
@@ -307,20 +382,18 @@ impl MemTable for ArtTable {
 
     fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         let mut lo = match start {
-            Bound::Included(k) => Some(art_key(k)),
-            Bound::Excluded(k) => art_key(k).checked_add(1),
-            Bound::Unbounded => Some(0),
+            Bound::Included(k) => art_lower(k, false),
+            Bound::Excluded(k) => art_lower(k, true),
+            Bound::Unbounded => 0,
         };
-        let hi = end.map(art_key);
+        let hi = art_upper(end);
         let guard = self.art.pin();
         let mut buf = vec![(0usize, 0usize); limit.clamp(1, 4096)];
         let mut taken = 0;
-        while let Some(from) = lo
-            && taken < limit
-            && hi.is_none_or(|h| from < h)
-        {
+        while taken < limit && lo < hi {
             // `range` excludes its end, so the largest key needs its own lookup.
-            let n = self.art.range(&from, &hi.unwrap_or(usize::MAX), &mut buf, &guard);
+            let to = hi.min(u64::MAX as u128) as usize;
+            let n = self.art.range(&(lo as usize), &to, &mut buf, &guard);
             for &(k, i) in &buf[..n] {
                 if taken < limit && let Some(value) = self.visible(i, view) {
                     out.push((Bytes::copy_from_slice(&(k as u64).to_be_bytes()), value));
@@ -329,7 +402,8 @@ impl MemTable for ArtTable {
             }
             if n < buf.len() {
                 if taken < limit
-                    && hi.is_none()
+                    && hi > u64::MAX as u128
+                    && lo <= u64::MAX as u128
                     && let Some(i) = self.art.get(&usize::MAX, &guard)
                     && let Some(value) = self.visible(i, view)
                 {
@@ -337,7 +411,29 @@ impl MemTable for ArtTable {
                 }
                 return;
             }
-            lo = buf[n - 1].0.checked_add(1);
+            lo = buf[n - 1].0 as u128 + 1;
+        }
+    }
+
+    /// The tree only iterates forward, so this reads ever wider windows
+    /// ending at `end`, which costs about twice the entries it returns.
+    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+        let lo = art_lower(start, false);
+        let mut hi = art_upper(end);
+        let mut span: u128 = 1 << 16;
+        let mut taken = 0;
+        let mut window = Vec::new();
+        while taken < limit && lo < hi {
+            let from = hi.saturating_sub(span).max(lo);
+            let to = (hi <= u64::MAX as u128).then(|| (hi as u64).to_be_bytes());
+            window.clear();
+            self.range(Bound::Included(&(from as u64).to_be_bytes()), to.as_ref().map(|t| &t[..]), view, usize::MAX, &mut window);
+            for e in window.drain(..).rev().take(limit - taken) {
+                out.push(e);
+                taken += 1;
+            }
+            hi = from;
+            span = span.saturating_mul(2);
         }
     }
 
@@ -436,6 +532,39 @@ mod tests {
             assert_eq!(out, vec![(Bytes::from_static(a), put(b"5"))], "{kind:?}");
             out.clear();
             t.range(Bound::Excluded(a), None, &|seq, _| seq <= 5, 10, &mut out);
+            assert!(out.is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn reverse_ranges_and_short_bounds_in_every_kind() {
+        for kind in KINDS {
+            let t = new_memtable(kind);
+            let keys: Vec<[u8; 8]> =
+                [1u64, 2, 0x6161_0000_0000_0000, 0x6161_ffff_ffff_ffff, 0x6200_0000_0000_0000, u64::MAX].map(u64::to_be_bytes).to_vec();
+            for (i, k) in keys.iter().enumerate() {
+                t.insert(k, put(b"v"), i as u64 + 1, 0);
+            }
+            let got = |out: &Vec<(Bytes, Value)>| out.iter().map(|(k, _)| k.to_vec()).collect::<Vec<_>>();
+            let want = |idx: &[usize]| idx.iter().map(|&i| keys[i].to_vec()).collect::<Vec<_>>();
+            let mut out = Vec::new();
+            t.range_rev(b"", None, ALL, 100, &mut out);
+            assert_eq!(got(&out), want(&[5, 4, 3, 2, 1, 0]), "{kind:?}");
+            out.clear();
+            t.range_rev(b"", None, ALL, 2, &mut out);
+            assert_eq!(got(&out), want(&[5, 4]), "{kind:?}");
+            // Keys starting with "aa", bounded by keys shorter than the stored ones.
+            out.clear();
+            t.range(Bound::Included(b"aa"), Some(b"ab"), ALL, 100, &mut out);
+            assert_eq!(got(&out), want(&[2, 3]), "{kind:?}");
+            out.clear();
+            t.range_rev(b"aa", Some(b"ab"), ALL, 100, &mut out);
+            assert_eq!(got(&out), want(&[3, 2]), "{kind:?}");
+            out.clear();
+            t.range_rev(&keys[1], Some(&keys[4]), &|seq, _| seq != 4, 100, &mut out);
+            assert_eq!(got(&out), want(&[2, 1]), "{kind:?}");
+            out.clear();
+            t.range_rev(&keys[3], Some(&keys[3]), ALL, 100, &mut out);
             assert!(out.is_empty(), "{kind:?}");
         }
     }

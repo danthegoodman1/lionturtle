@@ -30,6 +30,19 @@ pub fn key_prefix(key: &[u8]) -> u64 {
     u64::from_be_bytes(b)
 }
 
+/// The smallest key above every key that starts with `prefix`, or `None`
+/// when no key is (the prefix is empty or all `0xff` bytes).
+pub fn prefix_end(prefix: &[u8]) -> Option<Bytes> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return Some(Bytes::from(end));
+        }
+    }
+    None
+}
+
 /// The newest state of a key: a value or a tombstone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
@@ -83,3 +96,17 @@ impl WriteOp {
 pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 /// Largest value the store accepts.
 pub const MAX_VALUE_LEN: usize = 1 << 24;
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_end;
+
+    #[test]
+    fn prefix_end_skips_trailing_ff() {
+        assert_eq!(prefix_end(b""), None);
+        assert_eq!(prefix_end(b"\xff\xff"), None);
+        assert_eq!(prefix_end(b"ab").as_deref(), Some(&b"ac"[..]));
+        assert_eq!(prefix_end(b"a\xff\xff").as_deref(), Some(&b"b"[..]));
+        assert_eq!(prefix_end(b"\x00\xff").as_deref(), Some(&b"\x01"[..]));
+    }
+}

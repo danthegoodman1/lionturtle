@@ -199,6 +199,20 @@ impl PageMeta {
         Some(self.upper_block(key) - 1)
     }
 
+    /// Number of blocks whose first key is below `key`.
+    pub fn blocks_before(&self, key: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0usize, self.n_blocks as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if cmp_keys(self.block_first_key(mid), key) == Ordering::Less {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Number of blocks whose first key is at most `key`.
     fn upper_block(&self, key: &[u8]) -> usize {
         let (mut lo, mut hi) = (0usize, self.n_blocks as usize);
