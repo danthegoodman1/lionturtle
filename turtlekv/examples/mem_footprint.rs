@@ -26,7 +26,7 @@ fn main() {
         for i in 0..n {
             let k = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_be_bytes();
             let v = Value::Put(Bytes::copy_from_slice(&value));
-            if std::env::var_os("NO_CLONE").is_some() { t.insert(&k, v, i + 1) } else { t.insert(&k, v.clone(), i + 1) }
+            if std::env::var_os("NO_CLONE").is_some() { t.insert(&k, v, i + 1, 0) } else { t.insert(&k, v.clone(), i + 1, 0) }
         }
         let used = rss() - before;
         println!("{kind:?}: {:.0} bytes per entry for 128 logical bytes", used as f64 / n as f64);

@@ -1,13 +1,13 @@
 //! In-memory tables of recent writes.
 //!
 //! A memtable keeps every version of a key, each tagged with its sequence
-//! number, and reads it as of a snapshot: the newest version written at or
-//! before a given sequence number. Writers insert outside the writer lock,
-//! so a reader at the published snapshot never sees part of a batch, and an
-//! iterator keeps one snapshot throughout. Concurrent writers to one key may
-//! insert in any order; versions stay sorted by sequence number. Four
-//! implementations share the [`MemTable`] trait so the in-memory layer can be
-//! compared head to head.
+//! number and its batch's ticket, and a read takes the newest version its
+//! [`View`] accepts. Writers insert outside the writer lock, so a version
+//! may sit in the table before its batch commits; the view decides which
+//! versions a reader sees. Concurrent writers to one key may insert in any
+//! order; versions stay sorted by sequence number. Four implementations share
+//! the [`MemTable`] trait so the in-memory layer can be compared head to
+//! head.
 
 use crate::types::Value;
 use arc_swap::ArcSwap;
@@ -17,40 +17,44 @@ use std::collections::BTreeMap;
 use std::ops::{Bound, ControlFlow};
 use std::sync::Arc;
 
+/// Which versions a reader sees, by sequence number and batch ticket.
+pub type View<'a> = &'a dyn Fn(u64, u64) -> bool;
+
 /// The versions of one key, newest first.
 #[derive(Clone, Debug)]
 pub struct Versions {
     seq: u64,
+    ticket: u64,
     value: Value,
     older: Option<Arc<Versions>>,
 }
 
 impl Versions {
-    fn new(seq: u64, value: Value) -> Self {
-        Self { seq, value, older: None }
+    fn new(seq: u64, ticket: u64, value: Value) -> Self {
+        Self { seq, ticket, value, older: None }
     }
 
     /// These versions plus the one written at `seq`.
-    fn with(&self, seq: u64, value: Value) -> Self {
+    fn with(&self, seq: u64, ticket: u64, value: Value) -> Self {
         if seq > self.seq {
-            return Self { seq, value, older: Some(Arc::new(self.clone())) };
+            return Self { seq, ticket, value, older: Some(Arc::new(self.clone())) };
         }
         if seq == self.seq {
-            return Self { seq, value, older: self.older.clone() };
+            return Self { seq, ticket, value, older: self.older.clone() };
         }
         // A writer with an earlier sequence number inserted second.
         let older = match &self.older {
-            Some(o) => o.with(seq, value),
-            None => Self::new(seq, value),
+            Some(o) => o.with(seq, ticket, value),
+            None => Self::new(seq, ticket, value),
         };
-        Self { seq: self.seq, value: self.value.clone(), older: Some(Arc::new(older)) }
+        Self { older: Some(Arc::new(older)), ..self.clone() }
     }
 
-    /// The newest value written at or before `snapshot`.
-    fn at(&self, snapshot: u64) -> Option<&Value> {
+    /// The newest value `view` sees.
+    fn at(&self, view: View) -> Option<&Value> {
         let mut v = self;
         loop {
-            if v.seq <= snapshot {
+            if view(v.seq, v.ticket) {
                 return Some(&v.value);
             }
             v = v.older.as_deref()?;
@@ -59,14 +63,14 @@ impl Versions {
 }
 
 pub trait MemTable: Send + Sync {
-    /// Adds the version of `key` written at `seq`.
-    fn insert(&self, key: &[u8], value: Value, seq: u64);
-    /// The newest value of `key` written at or before `snapshot`.
-    fn get(&self, key: &[u8], snapshot: u64) -> Option<Value>;
+    /// Adds the version of `key` written at `seq` by batch `ticket`.
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64);
+    /// The newest value of `key` that `view` sees.
+    fn get(&self, key: &[u8], view: View) -> Option<Value>;
     /// Appends up to `limit` keys after `start` and below `end`, in key order,
-    /// with their newest values written at or before `snapshot`. Keys with
-    /// no such version are skipped.
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, snapshot: u64, limit: usize, out: &mut Vec<(Bytes, Value)>);
+    /// with the newest values `view` sees. Keys with no such version are
+    /// skipped.
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>);
     /// Visits every key's newest value in key order. Called once writers are
     /// gone.
     fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value));
@@ -122,25 +126,25 @@ pub struct SkipListTable {
 }
 
 impl MemTable for SkipListTable {
-    fn insert(&self, key: &[u8], value: Value, seq: u64) {
-        let first = Arc::new(Versions::new(seq, value.clone()));
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
+        let first = Arc::new(Versions::new(seq, ticket, value.clone()));
         let entry = self.map.get_or_insert(Bytes::copy_from_slice(key), ArcSwap::new(first.clone()));
         let versions = entry.value();
         if !Arc::ptr_eq(&versions.load(), &first) {
-            versions.rcu(|v| v.with(seq, value.clone()));
+            versions.rcu(|v| v.with(seq, ticket, value.clone()));
         }
     }
 
-    fn get(&self, key: &[u8], snapshot: u64) -> Option<Value> {
-        self.map.get(key)?.value().load().at(snapshot).cloned()
+    fn get(&self, key: &[u8], view: View) -> Option<Value> {
+        self.map.get(key)?.value().load().at(view).cloned()
     }
 
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, snapshot: u64, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
         let visible = self
             .map
             .range::<[u8], _>((start, hi))
-            .filter_map(|e| Some((e.key().clone(), e.value().load().at(snapshot)?.clone())));
+            .filter_map(|e| Some((e.key().clone(), e.value().load().at(view)?.clone())));
         out.extend(visible.take(limit));
     }
 
@@ -161,20 +165,20 @@ pub struct BBTreeTable {
 }
 
 impl MemTable for BBTreeTable {
-    fn insert(&self, key: &[u8], value: Value, seq: u64) {
-        let result = self.map.update_or_insert(key.to_vec(), Versions::new(seq, value), |_, stored, new| {
-            *stored = stored.with(new.seq, new.value);
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
+        let result = self.map.update_or_insert(key.to_vec(), Versions::new(seq, ticket, value), |_, stored, new| {
+            *stored = stored.with(new.seq, new.ticket, new.value);
         });
         if result.is_err() {
             panic!("memtable allocation failed");
         }
     }
 
-    fn get(&self, key: &[u8], snapshot: u64) -> Option<Value> {
-        self.map.read(key, |_, v| v.at(snapshot).cloned()).flatten()
+    fn get(&self, key: &[u8], view: View) -> Option<Value> {
+        self.map.read(key, |_, v| v.at(view).cloned()).flatten()
     }
 
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, snapshot: u64, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         if limit == 0 {
             return;
         }
@@ -186,7 +190,7 @@ impl MemTable for BBTreeTable {
         }
         let mut n = 0;
         self.map.scan::<[u8], ()>((start, hi), |k, v| {
-            if let Some(value) = v.at(snapshot) {
+            if let Some(value) = v.at(view) {
                 out.push((Bytes::copy_from_slice(k), value.clone()));
                 n += 1;
             }
@@ -217,26 +221,26 @@ pub struct BTreeTable {
 }
 
 impl MemTable for BTreeTable {
-    fn insert(&self, key: &[u8], value: Value, seq: u64) {
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
         let mut map = self.map.write();
         match map.get_mut(key) {
-            Some(v) => *v = v.with(seq, value),
+            Some(v) => *v = v.with(seq, ticket, value),
             None => {
-                map.insert(Bytes::copy_from_slice(key), Versions::new(seq, value));
+                map.insert(Bytes::copy_from_slice(key), Versions::new(seq, ticket, value));
             }
         }
     }
 
-    fn get(&self, key: &[u8], snapshot: u64) -> Option<Value> {
-        self.map.read().get(key)?.at(snapshot).cloned()
+    fn get(&self, key: &[u8], view: View) -> Option<Value> {
+        self.map.read().get(key)?.at(view).cloned()
     }
 
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, snapshot: u64, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         let map = self.map.read();
         let visible = map
             .range::<[u8], _>((start, Bound::Unbounded))
             .take_while(|(k, _)| below(k, end))
-            .filter_map(|(k, v)| Some((k.clone(), v.at(snapshot)?.clone())));
+            .filter_map(|(k, v)| Some((k.clone(), v.at(view)?.clone())));
         out.extend(visible.take(limit));
     }
 
@@ -265,13 +269,13 @@ fn art_key(key: &[u8]) -> usize {
 }
 
 impl ArtTable {
-    fn visible(&self, i: usize, snapshot: u64) -> Option<Value> {
-        self.arena[i].at(snapshot).cloned()
+    fn visible(&self, i: usize, view: View) -> Option<Value> {
+        self.arena[i].at(view).cloned()
     }
 }
 
 impl MemTable for ArtTable {
-    fn insert(&self, key: &[u8], value: Value, seq: u64) {
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
         let k = art_key(key);
         let guard = self.art.pin();
         // Each version adds a chain to the arena, and the key moves to it only
@@ -279,8 +283,8 @@ impl MemTable for ArtTable {
         loop {
             let current = self.art.get(&k, &guard);
             let next = match current {
-                Some(c) => self.arena[c].with(seq, value.clone()),
-                None => Versions::new(seq, value.clone()),
+                Some(c) => self.arena[c].with(seq, ticket, value.clone()),
+                None => Versions::new(seq, ticket, value.clone()),
             };
             let idx = self.arena.push(next);
             let mut moved = false;
@@ -296,12 +300,12 @@ impl MemTable for ArtTable {
         }
     }
 
-    fn get(&self, key: &[u8], snapshot: u64) -> Option<Value> {
+    fn get(&self, key: &[u8], view: View) -> Option<Value> {
         let guard = self.art.pin();
-        self.visible(self.art.get(&art_key(key), &guard)?, snapshot)
+        self.visible(self.art.get(&art_key(key), &guard)?, view)
     }
 
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, snapshot: u64, limit: usize, out: &mut Vec<(Bytes, Value)>) {
+    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         let mut lo = match start {
             Bound::Included(k) => Some(art_key(k)),
             Bound::Excluded(k) => art_key(k).checked_add(1),
@@ -318,7 +322,7 @@ impl MemTable for ArtTable {
             // `range` excludes its end, so the largest key needs its own lookup.
             let n = self.art.range(&from, &hi.unwrap_or(usize::MAX), &mut buf, &guard);
             for &(k, i) in &buf[..n] {
-                if taken < limit && let Some(value) = self.visible(i, snapshot) {
+                if taken < limit && let Some(value) = self.visible(i, view) {
                     out.push((Bytes::copy_from_slice(&(k as u64).to_be_bytes()), value));
                     taken += 1;
                 }
@@ -327,7 +331,7 @@ impl MemTable for ArtTable {
                 if taken < limit
                     && hi.is_none()
                     && let Some(i) = self.art.get(&usize::MAX, &guard)
-                    && let Some(value) = self.visible(i, snapshot)
+                    && let Some(value) = self.visible(i, view)
                 {
                     out.push((Bytes::copy_from_slice(&u64::MAX.to_be_bytes()), value));
                 }
@@ -343,7 +347,7 @@ impl MemTable for ArtTable {
         let mut last: Option<Bytes>;
         loop {
             out.clear();
-            self.range(start, None, u64::MAX, 4096, &mut out);
+            self.range(start, None, &|_, _| true, 4096, &mut out);
             for (k, v) in &out {
                 f(k, v);
             }
@@ -372,24 +376,26 @@ mod tests {
         Value::Put(Bytes::from_static(v))
     }
 
+    const ALL: View = &|_, _| true;
+
     #[test]
     fn newest_sequence_wins_in_every_kind() {
         for kind in KINDS {
             let t = new_memtable(kind);
             let (a, b, c) = (b"aaaaaaaa", b"bbbbbbbb", b"\xff\xff\xff\xff\xff\xff\xff\xff");
-            t.insert(a, put(b"2"), 2);
-            t.insert(a, put(b"1"), 1);
-            t.insert(b, Value::Delete, 3);
-            t.insert(c, put(b"3"), 4);
-            assert_eq!(t.get(a, u64::MAX), Some(put(b"2")), "{kind:?}");
-            assert_eq!(t.get(b, u64::MAX), Some(Value::Delete));
-            assert_eq!(t.get(b"zzzzzzzz", u64::MAX), None);
+            t.insert(a, put(b"2"), 2, 2);
+            t.insert(a, put(b"1"), 1, 1);
+            t.insert(b, Value::Delete, 3, 3);
+            t.insert(c, put(b"3"), 4, 4);
+            assert_eq!(t.get(a, ALL), Some(put(b"2")), "{kind:?}");
+            assert_eq!(t.get(b, ALL), Some(Value::Delete));
+            assert_eq!(t.get(b"zzzzzzzz", ALL), None);
             let mut out = Vec::new();
-            t.range(Bound::Excluded(a), Some(c), u64::MAX, 10, &mut out);
+            t.range(Bound::Excluded(a), Some(c), ALL, 10, &mut out);
             assert_eq!(out.len(), 1, "{kind:?}");
             assert_eq!(&out[0].0[..], b);
             out.clear();
-            t.range(Bound::Excluded(a), None, u64::MAX, 10, &mut out);
+            t.range(Bound::Excluded(a), None, ALL, 10, &mut out);
             assert_eq!(out.len(), 2, "{kind:?}");
             let mut keys = Vec::new();
             t.for_each(&mut |k, v| keys.push((k.to_vec(), v.clone())));
@@ -399,15 +405,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_see_the_snapshot_in_every_kind() {
+    fn reads_see_what_the_view_accepts_in_every_kind() {
         for kind in KINDS {
             let t = new_memtable(kind);
             let (a, b) = (b"aaaaaaaa", b"bbbbbbbb");
+            // Tickets run backwards, so a view by ticket differs from one by sequence number.
             for seq in [5, 1, 9, 3, 7] {
-                t.insert(a, Value::Put(Bytes::from(seq.to_string())), seq);
+                t.insert(a, Value::Put(Bytes::from(seq.to_string())), seq, 10 - seq);
             }
-            t.insert(b, put(b"b"), 6);
-            let at = |s| t.get(a, s).and_then(Value::into_put).map(|v| String::from_utf8(v.to_vec()).unwrap());
+            t.insert(b, put(b"b"), 6, 4);
+            let at = |s: u64| t.get(a, &|seq, _| seq <= s).and_then(Value::into_put).map(|v| String::from_utf8(v.to_vec()).unwrap());
             assert_eq!([at(0), at(1), at(2), at(4), at(6), at(8), at(9), at(100)], [
                 None,
                 Some("1".into()),
@@ -418,14 +425,17 @@ mod tests {
                 Some("9".into()),
                 Some("9".into())
             ], "{kind:?}");
+            let committed = |ticket: u64| ticket >= 5;
+            let newest_committed = t.get(a, &|_, ticket| committed(ticket));
+            assert_eq!(newest_committed, Some(Value::Put(Bytes::from("5"))), "{kind:?}");
             let mut out = Vec::new();
-            t.range(Bound::Unbounded, None, 4, 10, &mut out);
+            t.range(Bound::Unbounded, None, &|seq, _| seq <= 4, 10, &mut out);
             assert_eq!(out, vec![(Bytes::from_static(a), put(b"3"))], "{kind:?}");
             out.clear();
-            t.range(Bound::Unbounded, None, 6, 1, &mut out);
+            t.range(Bound::Unbounded, None, &|seq, _| seq <= 6, 1, &mut out);
             assert_eq!(out, vec![(Bytes::from_static(a), put(b"5"))], "{kind:?}");
             out.clear();
-            t.range(Bound::Excluded(a), None, 5, 10, &mut out);
+            t.range(Bound::Excluded(a), None, &|seq, _| seq <= 5, 10, &mut out);
             assert!(out.is_empty(), "{kind:?}");
         }
     }

@@ -122,66 +122,124 @@ impl Inflight {
     }
 }
 
-/// Batches in flight between taking their sequence numbers, in ticket
-/// order under the writer lock, and becoming visible. A batch becomes
-/// visible once it and every earlier batch are in the memtable, so readers
-/// never see part of a batch. Whichever writer holds the advance lock
-/// publishes every finished batch at once, so publication keeps pace with
-/// many writers rather than passing from each writer to the next.
-struct Publisher {
-    /// Readers see sequence numbers up to this one.
+/// Batches between taking their sequence numbers and becoming visible.
+///
+/// A writer registers its batch under the writer lock, inserts its ops into
+/// the memtable, and commits the batch; a get takes the newest version
+/// whose batch has committed. A batch thus shows whole or not at all, and no
+/// writer waits for another's inserts. `visible` trails behind as the prefix
+/// of committed batches: every version at or below it is committed, and an
+/// iterator reads that prefix as its snapshot.
+struct Commits {
+    /// Every batch ending at or below this sequence number has committed.
     visible: AtomicU64,
-    /// The last sequence number of each finished, unpublished batch, by
-    /// ticket modulo the ring size; zero for none.
-    done: Box<[Slot]>,
-    /// The next ticket to publish. Holding the lock is advancing.
-    next: Mutex<u64>,
+    /// The last sequence number of the newest registered batch.
+    assigned: AtomicU64,
+    /// Each in-flight batch, by ticket modulo the ring size.
+    slots: Box<[CommitSlot]>,
+    /// The oldest ticket not yet folded into `visible`.
+    folded: AtomicU64,
+    /// Held while folding committed batches into `visible`.
+    fold_lock: Mutex<()>,
 }
 
 #[repr(align(128))]
-struct Slot(AtomicU64);
+#[derive(Default)]
+struct CommitSlot {
+    /// `ticket << 1`, plus one once the batch commits.
+    state: AtomicU64,
+    /// The batch's last sequence number.
+    last: AtomicU64,
+}
 
-/// Batches that may finish ahead of the oldest unpublished one. Each writer
-/// thread has at most one batch in flight.
-const PUBLISH_RING: u64 = 1024;
+/// Batches that may be in flight at once. Each writer thread has at most
+/// one.
+const COMMIT_RING: u64 = 1024;
 
-impl Publisher {
+impl Commits {
+    /// Tickets start at 1, so an empty slot names no batch.
     fn new(visible: u64) -> Self {
         Self {
             visible: AtomicU64::new(visible),
-            done: (0..PUBLISH_RING).map(|_| Slot(AtomicU64::new(0))).collect(),
-            next: Mutex::new(0),
+            assigned: AtomicU64::new(visible),
+            slots: (0..COMMIT_RING).map(|_| CommitSlot::default()).collect(),
+            folded: AtomicU64::new(1),
+            fold_lock: Mutex::new(()),
         }
     }
 
-    /// Marks batch `ticket`, ending at sequence number `last`, inserted, and
-    /// returns once it is visible.
-    fn publish(&self, ticket: u64, last: u64) {
-        let slot = &self.done[(ticket % PUBLISH_RING) as usize].0;
-        // The slot frees when the batch a ring earlier publishes.
+    fn slot(&self, ticket: u64) -> &CommitSlot {
+        &self.slots[(ticket % COMMIT_RING) as usize]
+    }
+
+    /// Registers batch `ticket`, ending at sequence number `last`. Called
+    /// under the writer lock, in ticket order.
+    fn register(&self, ticket: u64, last: u64) {
+        // A slot is reused once the batch a ring earlier has folded.
         let mut spins = 0;
-        while slot.load(Acquire) != 0 {
+        while self.folded.load(Acquire) + COMMIT_RING <= ticket {
+            self.fold();
             backoff(&mut spins);
         }
-        slot.store(last, Release);
+        let slot = self.slot(ticket);
+        slot.last.store(last, Relaxed);
+        slot.state.store(ticket << 1, Release);
+        self.assigned.store(last, Release);
+    }
+
+    /// Makes batch `ticket` visible.
+    fn commit(&self, ticket: u64) {
+        self.slot(ticket).state.store(ticket << 1 | 1, SeqCst);
+        std::sync::atomic::fence(SeqCst);
+        self.fold();
+    }
+
+    /// Advances `visible` over the committed batches at the front.
+    fn fold(&self) {
         loop {
-            if let Some(mut next) = self.next.try_lock() {
-                loop {
-                    let s = &self.done[(*next % PUBLISH_RING) as usize].0;
-                    let end = s.load(Acquire);
-                    if end == 0 {
-                        break;
-                    }
-                    self.visible.store(end, Release);
-                    s.store(0, Release);
-                    *next += 1;
+            let Some(guard) = self.fold_lock.try_lock() else { return };
+            let mut t = self.folded.load(Relaxed);
+            loop {
+                let slot = self.slot(t);
+                if slot.state.load(Acquire) != t << 1 | 1 {
+                    break;
                 }
+                self.visible.store(slot.last.load(Relaxed), Release);
+                t += 1;
             }
-            if self.visible.load(Acquire) >= last {
+            self.folded.store(t, Release);
+            drop(guard);
+            // A batch that committed while the lock was held, and found it
+            // taken, leaves its folding to this thread.
+            std::sync::atomic::fence(SeqCst);
+            if self.slot(t).state.load(SeqCst) != t << 1 | 1 {
                 return;
             }
+        }
+    }
+
+    /// Whether a get that loaded `visible` sees the version at `seq`
+    /// written by batch `ticket`.
+    fn sees(&self, visible: u64, seq: u64, ticket: u64) -> bool {
+        if seq <= visible {
+            return true;
+        }
+        let state = self.slot(ticket).state.load(Acquire);
+        // A later ticket in the slot means this batch folded long ago.
+        state == ticket << 1 | 1 || state >> 1 > ticket
+    }
+
+    /// A sequence number at or below which every batch has committed and
+    /// above which none had registered when this was called: a snapshot
+    /// holding every batch written before the call.
+    fn prefix(&self) -> u64 {
+        let upto = self.assigned.load(Acquire);
+        let mut spins = 0;
+        while self.visible.load(Acquire) < upto {
+            self.fold();
             backoff(&mut spins);
         }
+        upto
     }
 }
 
@@ -206,7 +264,7 @@ impl Mem {
     }
 
     fn insert(&self, op: &WriteOp, seq: u64) {
-        self.table.insert(&op.key, op.value.clone(), seq);
+        self.table.insert(&op.key, op.value.clone(), seq, 0);
         self.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
     }
 
@@ -271,7 +329,7 @@ pub struct Version {
 struct Writer {
     wal: WalWriter,
     next_seq: u64,
-    /// Publication order of the next batch; see [`Publisher`].
+    /// Commit ticket of the next batch; see [`Commits`].
     next_ticket: u64,
     active: Arc<Mem>,
     user_bytes: u64,
@@ -339,7 +397,7 @@ struct Inner {
     poisoned: AtomicBool,
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
-    publisher: Publisher,
+    commits: Commits,
     timing: Timing,
     merge_pool: Option<rayon::ThreadPool>,
 }
@@ -447,7 +505,7 @@ impl Db {
             io,
             version: ArcSwap::from_pointee(version),
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, next_ticket: 0, active, user_bytes: 0, wal_bytes: 0 }),
+            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, next_ticket: 1, active, user_bytes: 0, wal_bytes: 0 }),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
@@ -456,7 +514,7 @@ impl Db {
             poisoned: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
-            publisher: Publisher::new(last_seq),
+            commits: Commits::new(last_seq),
             timing: Timing::default(),
             merge_pool,
             opts,
@@ -751,14 +809,14 @@ impl Inner {
                 let shard = w.active.inflight.enter();
                 let ticket = w.next_ticket;
                 w.next_ticket += 1;
+                self.commits.register(ticket, seq + ops.len() as u64 - 1);
                 (w.active.clone(), seq, shard, flush, ticket)
             };
             let flushed = flush.map_or(Ok(()), |f| f.write());
-            let last = seq + ops.len() as u64 - 1;
             for (i, op) in ops.into_iter().enumerate() {
-                mem.table.insert(&op.key, op.value, seq + i as u64);
+                mem.table.insert(&op.key, op.value, seq + i as u64, ticket);
             }
-            self.publisher.publish(ticket, last);
+            self.commits.commit(ticket);
             mem.inflight.exit(shard);
             self.poison_on_err(flushed)
         })
@@ -803,20 +861,15 @@ impl Inner {
         Ok(())
     }
 
-    /// A snapshot for reading `v`. It is taken after loading the version,
-    /// so it covers every batch the version's tree holds.
-    fn snapshot(&self, _v: &Version) -> u64 {
-        self.publisher.visible.load(Acquire)
-    }
-
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let v = self.version.load();
-        let snapshot = self.snapshot(&v);
-        if let Some(val) = v.active.table.get(key, snapshot) {
+        let visible = self.commits.visible.load(Acquire);
+        let view = |seq, ticket| self.commits.sees(visible, seq, ticket);
+        if let Some(val) = v.active.table.get(key, &view) {
             return Ok(val.into_put());
         }
         for m in &v.frozen {
-            if let Some(val) = m.table.get(key, snapshot) {
+            if let Some(val) = m.table.get(key, &view) {
                 return Ok(val.into_put());
             }
         }
@@ -1034,7 +1087,8 @@ impl MemSource {
             Bound::Excluded(k) => Bound::Excluded(&k[..]),
             Bound::Unbounded => Bound::Unbounded,
         };
-        self.mem.table.range(start, self.end.as_deref(), self.snapshot, self.chunk, &mut out);
+        let snapshot = self.snapshot;
+        self.mem.table.range(start, self.end.as_deref(), &|seq, _| seq <= snapshot, self.chunk, &mut out);
         self.exhausted = out.len() < self.chunk;
         self.chunk = (self.chunk * 2).min(MEM_CHUNK_MAX);
         if let Some((k, _)) = out.last() {
@@ -1081,7 +1135,9 @@ impl EntryView<'_> {
 impl DbIter {
     fn new(inner: Arc<Inner>, start: &[u8], end: Option<&[u8]>) -> Self {
         let version = inner.version.load_full();
-        let snapshot = inner.snapshot(&version);
+        // Taken after loading the version, so it covers every batch the
+        // version's tree holds.
+        let snapshot = inner.commits.prefix();
         let end_b = end.map(Bytes::copy_from_slice);
         let start_b = Bytes::copy_from_slice(start);
         let mems = std::iter::once(&version.active)
