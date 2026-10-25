@@ -68,3 +68,11 @@ Departures from the C++ code:
   each record carries its sequence number last, so the lock only appends it.
 - Nodes default to 4 buffer levels: scans and point reads gain more than
   write amplification loses at this depth.
+- A scan merges a leaf with every buffer level on its root-to-leaf path, so
+  a cold key range can need a disk read per level. When its thread has been
+  waiting on the device, a scan starts those reads together before reading
+  any, and the range costs about one read latency.
+- Merges run on the store's own pool of 4 threads (`merge_threads`). They
+  wait on I/O more than CPU, and every worker thread keeps memory that other
+  threads freed from its buffers resident, so a pool sized to the machine
+  raises RSS with little gain.

@@ -47,6 +47,12 @@ pub struct Options {
     /// checkpoints through [`Db::checkpoint_step`], and a writer that finds no
     /// room for another frozen memtable checkpoints inline.
     pub background: bool,
+    /// Threads in the store's own pool for parallel merges and page writes;
+    /// 0 runs them on the caller's rayon pool. Merges wait on I/O more than
+    /// CPU, so a few threads keep up, and each extra thread costs memory: an
+    /// allocator keeps what other threads free from a worker's buffers
+    /// resident in that worker's heap until the worker allocates again.
+    pub merge_threads: usize,
 }
 
 impl Default for Options {
@@ -59,6 +65,7 @@ impl Default for Options {
             wal_buffer_bytes: 1 << 20,
             max_frozen: 1,
             background: true,
+            merge_threads: 4,
         }
     }
 }
@@ -257,6 +264,7 @@ struct Inner {
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
     timing: Timing,
+    merge_pool: Option<rayon::ThreadPool>,
 }
 
 /// Cumulative nanoseconds spent in each checkpoint stage, and by writers
@@ -349,6 +357,13 @@ impl Db {
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
         let version = Version { active: active.clone(), frozen, tree: root, _epoch: epoch.clone() };
+        let merge_pool = (opts.tree.parallel && opts.merge_threads > 0).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(opts.merge_threads)
+                .thread_name(|i| format!("turtlekv-merge-{i}"))
+                .build()
+                .expect("build merge pool")
+        });
         let inner = Arc::new(Inner {
             storage,
             next_page_id: AtomicU64::new(sb.next_page_id),
@@ -365,6 +380,7 @@ impl Db {
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             timing: Timing::default(),
+            merge_pool,
             opts,
         });
         // Two pipeline stages, as in the paper: one thread applies the next
@@ -800,21 +816,28 @@ impl Inner {
             std::thread::yield_now();
         }
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
-        let mut root = applier.root.clone();
         let t = std::time::Instant::now();
         let batches = self.build_batches(&mem);
         self.timing.build_ns.fetch_add(since(t), Relaxed);
-        let t = std::time::Instant::now();
-        for batch in batches {
-            root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
-        }
-        self.timing.apply_ns.fetch_add(since(t), Relaxed);
-        let t = std::time::Instant::now();
-        let created_files = match &root {
-            Some(r) => tree::write_tree(&ctx, r)?,
-            None => false,
+        let apply = || -> Result<(Option<Subtree>, bool)> {
+            let mut root = applier.root.clone();
+            let t = std::time::Instant::now();
+            for batch in batches {
+                root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
+            }
+            self.timing.apply_ns.fetch_add(since(t), Relaxed);
+            let t = std::time::Instant::now();
+            let created_files = match &root {
+                Some(r) => tree::write_tree(&ctx, r)?,
+                None => false,
+            };
+            self.timing.write_ns.fetch_add(since(t), Relaxed);
+            Ok((root, created_files))
         };
-        self.timing.write_ns.fetch_add(since(t), Relaxed);
+        let (root, created_files) = match &self.merge_pool {
+            Some(pool) => pool.install(apply)?,
+            None => apply()?,
+        };
         applier.root = root.clone();
         applier.last_applied = mem.id;
         self.pending.lock().push_back(Applied { mem, root, created_files });

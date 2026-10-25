@@ -984,6 +984,27 @@ impl TreeScan {
                 }
             }
         };
+        // Each source reads its first block as it opens. Starting the cold
+        // ones together makes a cold range cost about one read latency
+        // rather than one per source.
+        if io.should_prefetch() {
+            let mut first_blocks: Vec<(&DataPage, usize)> = Vec::new();
+            for n in &path {
+                for level in &n.levels {
+                    let first = level.iter().find_map(|s| {
+                        let key = live_start(s, &start).filter(|k| hi.as_deref().is_none_or(|h| *k < h))?;
+                        s.page.meta.find_block(key).map(|b| (&*s.page, b))
+                    });
+                    first_blocks.extend(first);
+                }
+            }
+            if leaf.meta.n_items > 0
+                && let Some(b) = leaf.meta.find_block(leaf.meta.min_key().max(&start[..]))
+            {
+                first_blocks.push((leaf, b));
+            }
+            io.prefetch(&first_blocks);
+        }
         let mut sources: Vec<Source> = Vec::new();
         for n in &path {
             for level in &n.levels {

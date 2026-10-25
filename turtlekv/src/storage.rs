@@ -36,6 +36,9 @@ pub trait File: Send + Sync {
     /// Starts writing `[offset, offset + len)` to the device without waiting,
     /// so a later sync has less left to do. Durability still needs a sync.
     fn start_writeback(&self, _offset: u64, _len: u64) {}
+    /// Starts reading `[offset, offset + len)` into the page cache without
+    /// waiting, so a later read of it waits less.
+    fn prefetch(&self, _offset: u64, _len: u64) {}
 }
 
 /// Storage backed by a directory on the local file system.
@@ -112,6 +115,13 @@ impl File for FsFile {
         // SAFETY: sync_file_range only reads its integer arguments.
         unsafe {
             libc::sync_file_range(self.0.as_raw_fd(), offset as libc::off64_t, len as libc::off64_t, libc::SYNC_FILE_RANGE_WRITE);
+        }
+    }
+
+    fn prefetch(&self, offset: u64, len: u64) {
+        // SAFETY: posix_fadvise only reads its integer arguments.
+        unsafe {
+            libc::posix_fadvise(self.0.as_raw_fd(), offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_WILLNEED);
         }
     }
 

@@ -19,7 +19,7 @@ use crate::storage::{File, Storage};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const MIN_SLOT: u64 = 4096;
 pub const CLASSES: usize = 20;
@@ -90,7 +90,10 @@ struct ClassAlloc {
 
 pub struct PageStore {
     storage: Arc<dyn Storage>,
-    files: Mutex<Vec<Option<Arc<dyn File>>>>,
+    /// Arena files by size class. Reads find them without locking.
+    files: Vec<OnceLock<Arc<dyn File>>>,
+    /// Serializes arena creation.
+    create: Mutex<()>,
     alloc: Mutex<Vec<ClassAlloc>>,
     /// Freed slots whose disk space has not been released yet. They become
     /// allocatable in [`PageStore::reclaim`].
@@ -100,7 +103,7 @@ pub struct PageStore {
 impl PageStore {
     /// Opens the arenas, treating every slot outside `live` as free.
     pub fn open(storage: Arc<dyn Storage>, live: &[PagePtr]) -> Result<Self> {
-        let mut files: Vec<Option<Arc<dyn File>>> = vec![None; CLASSES];
+        let files: Vec<OnceLock<Arc<dyn File>>> = (0..CLASSES).map(|_| OnceLock::new()).collect();
         let mut alloc: Vec<ClassAlloc> = (0..CLASSES).map(|_| ClassAlloc::default()).collect();
         let names = storage.list()?;
         for class in 0..CLASSES as u8 {
@@ -109,7 +112,7 @@ impl PageStore {
                 file.advise_random();
                 let slots = file.len()?.div_ceil(slot_size(class));
                 alloc[class as usize].next = slots as u32;
-                files[class as usize] = Some(file);
+                let _ = files[class as usize].set(file);
             }
         }
         let mut used: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); CLASSES];
@@ -123,7 +126,7 @@ impl PageStore {
         for (class, a) in alloc.iter_mut().enumerate() {
             a.free = (0..a.next).filter(|s| !used[class].contains(s)).collect();
         }
-        Ok(Self { storage, files: Mutex::new(files), alloc: Mutex::new(alloc), freed: Mutex::new(Vec::new()) })
+        Ok(Self { storage, files, create: Mutex::new(()), alloc: Mutex::new(alloc), freed: Mutex::new(Vec::new()) })
     }
 
     /// Reserves a slot for a page image of `len` bytes.
@@ -150,10 +153,9 @@ impl PageStore {
     /// pages from before a restart. Call only on a store opened with the
     /// complete set of live pages.
     pub fn punch_free(&self) {
-        let files = self.files.lock().clone();
         let alloc = self.alloc.lock();
         for (class, a) in alloc.iter().enumerate() {
-            let Some(file) = &files[class] else { continue };
+            let Some(file) = self.files[class].get() else { continue };
             let size = slot_size(class as u8);
             let mut slots = a.free.iter().copied().peekable();
             while let Some(first) = slots.next() {
@@ -198,15 +200,18 @@ impl PageStore {
     /// Opens or creates the arena for `class`. Returns the file and whether it
     /// was created, in which case the directory needs a sync before a
     /// checkpoint may reference it.
-    fn file(&self, class: u8) -> Result<(Arc<dyn File>, bool)> {
-        let mut files = self.files.lock();
-        if let Some(f) = &files[class as usize] {
-            return Ok((f.clone(), false));
+    fn file(&self, class: u8) -> Result<(&Arc<dyn File>, bool)> {
+        let slot = &self.files[class as usize];
+        if let Some(f) = slot.get() {
+            return Ok((f, false));
+        }
+        let _g = self.create.lock();
+        if let Some(f) = slot.get() {
+            return Ok((f, false));
         }
         let f = self.storage.open(&arena_name(class), true)?;
         f.advise_random();
-        files[class as usize] = Some(f.clone());
-        Ok((f, true))
+        Ok((slot.get_or_init(|| f), true))
     }
 
     /// Writes a page image to its slot. Returns true if this created an arena
@@ -230,10 +235,17 @@ impl PageStore {
         Ok(Bytes::from(buf))
     }
 
+    /// Starts reading `len` bytes at `offset` within the page into the page
+    /// cache; see [`File::prefetch`].
+    pub fn prefetch(&self, ptr: &PagePtr, offset: u64, len: u64) {
+        if let Some(file) = self.files[ptr.class as usize].get() {
+            file.prefetch(ptr.offset() + offset, len);
+        }
+    }
+
     /// Syncs every arena file.
     pub fn sync(&self) -> Result<()> {
-        let files: Vec<_> = self.files.lock().iter().flatten().cloned().collect();
-        for f in files {
+        for f in self.files.iter().filter_map(OnceLock::get) {
             f.sync_data()?;
         }
         Ok(())

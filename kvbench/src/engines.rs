@@ -47,6 +47,7 @@ impl Turtle {
             wal_buffer_bytes: args.wal_buffer_kb << 10,
             max_frozen: args.max_frozen,
             background: true,
+            merge_threads: args.merge_threads,
         };
         let storage = Arc::new(turtlekv::storage::FsStorage::new(&args.dir).unwrap());
         Self { db: turtlekv::Db::open(storage, opts).unwrap() }

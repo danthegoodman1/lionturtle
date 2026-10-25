@@ -60,6 +60,7 @@ pub fn run(cfg: &PerfConfig) -> PerfReport {
         wal_buffer_bytes: 1 << 20,
         max_frozen: 1,
         background: false,
+        merge_threads: 0,
     };
     let db = Db::open(Arc::new(disk.clone()), opts).expect("open");
     let mut value = vec![0u8; cfg.value_size];

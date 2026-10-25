@@ -132,6 +132,7 @@ fn random_options(rng: &mut Rng) -> Options {
         wal_buffer_bytes: *rng.pick(&[0, 512, 1 << 16]),
         max_frozen: rng.range(1, 3) as usize,
         background: false,
+        merge_threads: 0,
     }
 }
 
@@ -371,6 +372,9 @@ impl Sim {
 
     fn verify_scan(&mut self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<(), String> {
         self.report.scans += 1;
+        if self.rng.chance(0.5) {
+            crate::tree::io::arm_prefetch();
+        }
         let got = match self.db().scan(start, end, limit) {
             Ok(v) => v,
             Err(Error::Io(_)) | Err(Error::Corruption(_)) => {
@@ -444,6 +448,9 @@ impl Sim {
         if self.iters.is_empty() || (self.iters.len() < 3 && self.rng.chance(0.3)) {
             let start = self.key();
             let end = self.rng.chance(0.3).then(|| self.key()).filter(|e| *e > start);
+            if self.rng.chance(0.5) {
+                crate::tree::io::arm_prefetch();
+            }
             let it = self.db().iter(&start, end.as_deref());
             self.iters.push(Iter { it, start, end, last: None, dirty: BTreeSet::new() });
             return Ok(());

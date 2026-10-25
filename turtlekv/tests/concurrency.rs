@@ -43,6 +43,7 @@ fn stress(storage: Arc<dyn turtlekv::storage::Storage>, memtable: MemTableKind, 
         wal_buffer_bytes: 4096,
         max_frozen: 2,
         background: true,
+        merge_threads: 2,
     };
     let db = Arc::new(Db::open(storage.clone(), opts.clone()).unwrap());
     // Highest version each key has been written with (published after the

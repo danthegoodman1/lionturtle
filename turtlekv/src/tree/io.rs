@@ -10,6 +10,7 @@ use crate::pagestore::{PagePtr, PageStore};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use quick_cache::sync::Cache;
+use std::cell::Cell;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -126,6 +127,24 @@ impl Hasher for KeyHasher {
 
 type BuildKeyHasher = BuildHasherDefault<KeyHasher>;
 
+thread_local! {
+    /// Range opens left before this thread stops prefetching, renewed by each
+    /// block read that waited on the device. A thread whose reads hit a cache
+    /// skips the prefetch and its extra index and cache lookups.
+    static PREFETCH_BUDGET: Cell<u8> = const { Cell::new(0) };
+}
+
+/// Range opens a device read keeps prefetching enabled for.
+const PREFETCH_RENEW: u8 = 8;
+/// Reads slower than this went to the device rather than the page cache.
+const DEVICE_READ: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// Enables prefetching for this thread's next range opens, as a device read
+/// would. The simulator calls it, since its reads never wait on a device.
+pub fn arm_prefetch() {
+    PREFETCH_BUDGET.set(PREFETCH_RENEW);
+}
+
 #[derive(Default, Debug)]
 pub struct IoCounters {
     pub block_reads: AtomicU64,
@@ -190,11 +209,47 @@ impl PageIo {
             return Ok(block);
         }
         let ptr = page.ptr().expect("unpinned page is written");
+        let t = std::time::Instant::now();
         let bytes = self.store.read(&ptr, info.offset as u64, info.len as u64)?;
+        if t.elapsed() > DEVICE_READ {
+            PREFETCH_BUDGET.set(PREFETCH_RENEW);
+        }
         self.counters.block_reads.fetch_add(1, Relaxed);
         let block = Block::decode(bytes, id)?;
         self.cache.insert((id, b as u32), Cached::Block(block.clone()));
         Ok(block)
+    }
+
+    /// Whether reading block `b` of `page` would go to disk.
+    fn is_cold(&self, page: &DataPage, b: usize) -> bool {
+        let id = page.id();
+        page.is_written()
+            && !(page.image_cached.load(Relaxed) && self.cache.contains_key(&(id, IMAGE)))
+            && !self.cache.contains_key(&(id, b as u32))
+    }
+
+    /// Whether a range about to open should prefetch: true while this thread
+    /// has read from disk recently.
+    pub fn should_prefetch(&self) -> bool {
+        let budget = PREFETCH_BUDGET.get();
+        PREFETCH_BUDGET.set(budget.saturating_sub(1));
+        budget > 0
+    }
+
+    /// Starts the disk reads of the cold blocks among `blocks` together, so
+    /// their latencies overlap instead of adding up. A lone cold block is
+    /// left to its synchronous read, which would gain nothing.
+    pub fn prefetch(&self, blocks: &[(&DataPage, usize)]) {
+        let mut cold = blocks.iter().filter(|(page, b)| self.is_cold(page, *b));
+        let (Some(first), Some(second)) = (cold.next(), cold.next()) else {
+            return;
+        };
+        for (page, b) in [first, second].into_iter().chain(cold) {
+            if let Some(ptr) = page.ptr() {
+                let info = page.meta.block(*b);
+                self.store.prefetch(&ptr, info.offset as u64, info.len as u64);
+            }
+        }
     }
 
     /// The bytes of `blocks`, contiguous, for sequential reading, and whether
