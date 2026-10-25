@@ -355,6 +355,75 @@ struct SimFile {
     direct: bool,
 }
 
+impl SimFile {
+    /// Writes `buf`, durable at once when `durable` is set: a crash keeps it
+    /// whole and leaves every other unsynced write to chance.
+    fn write(&self, buf: &[u8], offset: u64, durable: bool) -> io::Result<()> {
+        if self.direct {
+            let align = crate::storage::DIRECT_ALIGN;
+            assert!(
+                (offset as usize).is_multiple_of(align) && buf.len().is_multiple_of(align) && (buf.as_ptr() as usize).is_multiple_of(align),
+                "misaligned direct write: {} bytes at {offset}",
+                buf.len()
+            );
+        }
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        state.check_up(self.generation)?;
+        state.tick_mutation()?;
+        if state.rng.chance(state.faults.write_error) {
+            return Err(io::Error::other("sim: write error"));
+        }
+        let inode = state
+            .inodes
+            .get_mut(&self.ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
+        let start = offset as usize;
+        let end = start + buf.len();
+        if durable {
+            // Durable at once: no undo, and no older undo may revert it.
+            forget_range(&mut inode.undo, offset, end as u64);
+            inode.durable_len = inode.durable_len.max(end as u64);
+        } else {
+            let old_end = end.min(inode.data.len()).max(start.min(inode.data.len()));
+            let old = inode.data[start.min(inode.data.len())..old_end].to_vec();
+            inode.undo.push(Undo { offset, len: buf.len() as u64, old });
+        }
+        if end > inode.data.len() {
+            inode.data.resize(end, 0);
+        }
+        inode.data[start..end].copy_from_slice(buf);
+        let stats = state.stats.by_class.entry(self.class.clone()).or_default();
+        stats.writes += 1;
+        stats.write_bytes += buf.len() as u64;
+        Ok(())
+    }
+}
+
+/// Drops `[start, end)` from unsynced writes' undo records, so a crash
+/// cannot revert those bytes.
+fn forget_range(undo: &mut Vec<Undo>, start: u64, end: u64) {
+    let mut kept = Vec::with_capacity(undo.len());
+    for u in undo.drain(..) {
+        let (us, ue) = (u.offset, u.offset + u.len);
+        if ue <= start || us >= end {
+            kept.push(u);
+            continue;
+        }
+        let piece = |a: u64, b: u64| {
+            let (lo, hi) = ((a - us) as usize, ((b - us) as usize).min(u.old.len()));
+            Undo { offset: a, len: b - a, old: if lo < hi { u.old[lo..hi].to_vec() } else { Vec::new() } }
+        };
+        if us < start {
+            kept.push(piece(us, start));
+        }
+        if end < ue {
+            kept.push(piece(end, ue));
+        }
+    }
+    *undo = kept;
+}
+
 impl File for SimFile {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         let mut guard = self.state.lock();
@@ -386,38 +455,11 @@ impl File for SimFile {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        if self.direct {
-            let align = crate::storage::DIRECT_ALIGN;
-            assert!(
-                offset as usize % align == 0 && buf.len() % align == 0 && buf.as_ptr() as usize % align == 0,
-                "misaligned direct write: {} bytes at {offset}",
-                buf.len()
-            );
-        }
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-        state.check_up(self.generation)?;
-        state.tick_mutation()?;
-        if state.rng.chance(state.faults.write_error) {
-            return Err(io::Error::other("sim: write error"));
-        }
-        let inode = state
-            .inodes
-            .get_mut(&self.ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
-        let start = offset as usize;
-        let end = start + buf.len();
-        let old_end = end.min(inode.data.len()).max(start.min(inode.data.len()));
-        let old = inode.data[start.min(inode.data.len())..old_end].to_vec();
-        inode.undo.push(Undo { offset, len: buf.len() as u64, old });
-        if end > inode.data.len() {
-            inode.data.resize(end, 0);
-        }
-        inode.data[start..end].copy_from_slice(buf);
-        let stats = state.stats.by_class.entry(self.class.clone()).or_default();
-        stats.writes += 1;
-        stats.write_bytes += buf.len() as u64;
-        Ok(())
+        self.write(buf, offset, false)
+    }
+
+    fn write_all_at_durable(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.write(buf, offset, true)
     }
 
     fn sync_data(&self) -> io::Result<()> {

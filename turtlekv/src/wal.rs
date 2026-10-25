@@ -258,7 +258,8 @@ struct Staging {
 impl Staging {
     /// Writes `data`, which continues the tail, as whole blocks from `base`,
     /// zero-filling the last, and keeps the new partial block as the tail.
-    fn write(&mut self, file: &dyn File, data: &[u8]) -> Result<()> {
+    /// With `durable`, the write is durable when this returns.
+    fn write(&mut self, file: &dyn File, data: &[u8], durable: bool) -> Result<()> {
         if self.failed {
             return Err(std::io::Error::other("an earlier log write failed").into());
         }
@@ -273,7 +274,8 @@ impl Staging {
         bytes[..self.tail.len()].copy_from_slice(&self.tail);
         bytes[self.tail.len()..len].copy_from_slice(data);
         bytes[len..].fill(0);
-        if let Err(e) = file.write_all_at(bytes, self.base) {
+        let written = if durable { file.write_all_at_durable(bytes, self.base) } else { file.write_all_at(bytes, self.base) };
+        if let Err(e) = written {
             self.failed = true;
             return Err(e.into());
         }
@@ -352,10 +354,24 @@ impl Log {
         }
     }
 
-    /// Writes every buffered record, waits out writes in flight, and
-    /// fsyncs. Returns the bytes now durable.
+    /// Writes every buffered record and makes everything written durable.
+    /// Returns the bytes now durable.
+    ///
+    /// When every earlier write is already durable, one durable write
+    /// (RWF_DSYNC) of the rest does it, without an fsync: on Linux that
+    /// saves a system call and, on RAID, a flush sent to every member drive.
+    /// Otherwise a plain write and an fsync cover the earlier writes too.
     fn write_and_sync(self: &Arc<Self>) -> Result<u64> {
-        self.start_flush().write()?;
+        let flush = self.start_flush();
+        // The flush holds the I/O lock, so no write is in flight and
+        // `completed` counts every write so far.
+        let completed = self.completed.load(Ordering::Acquire);
+        if !flush.buf.is_empty() && self.synced.load(Ordering::Acquire) == completed {
+            let end = flush.offset + flush.buf.len() as u64;
+            flush.write_durable()?;
+            return Ok(end);
+        }
+        flush.write()?;
         drop(self.io.lock());
         let target = self.completed.load(Ordering::Acquire);
         self.file.sync_data()?;
@@ -380,10 +396,19 @@ pub struct Flush {
 }
 
 impl Flush {
-    pub fn write(mut self) -> Result<()> {
+    pub fn write(self) -> Result<()> {
+        self.write_as(false)
+    }
+
+    /// Writes the records durably; see [`File::write_all_at_durable`].
+    fn write_durable(self) -> Result<()> {
+        self.write_as(true)
+    }
+
+    fn write_as(mut self, durable: bool) -> Result<()> {
         if !self.buf.is_empty() {
             debug_assert_eq!(self.io.base + self.io.tail.len() as u64, self.offset);
-            self.io.write(&*self.log.file, &self.buf)?;
+            self.io.write(&*self.log.file, &self.buf, durable)?;
             self.log.complete(self.offset, self.buf.len());
         }
         Ok(())

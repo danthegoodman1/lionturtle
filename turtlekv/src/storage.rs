@@ -35,6 +35,12 @@ pub trait Storage: Send + Sync {
 pub trait File: Send + Sync {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    /// Writes `buf` and returns once it, and what is needed to read it back,
+    /// is durable. Earlier writes stay only as durable as they were.
+    fn write_all_at_durable(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.write_all_at(buf, offset)?;
+        self.sync_data()
+    }
     /// Makes every completed write to this file durable.
     fn sync_data(&self) -> io::Result<()>;
     fn len(&self) -> io::Result<u64>;
@@ -127,6 +133,33 @@ impl File for FsFile {
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.0.write_all_at(buf, offset)
+    }
+
+    /// One `pwritev2` with RWF_DSYNC: the kernel writes with FUA, or follows
+    /// the write with a flush, so no separate fsync is needed.
+    fn write_all_at_durable(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
+            // SAFETY: `iov` describes `buf`, which outlives the call.
+            let n = unsafe { libc::pwritev2(self.0.as_raw_fd(), &iov, 1, offset as libc::off_t, libc::RWF_DSYNC) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                match e.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+                        self.0.write_all_at(buf, offset)?;
+                        return self.0.sync_data();
+                    }
+                    _ => return Err(e),
+                }
+            }
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            buf = &buf[n as usize..];
+            offset += n as u64;
+        }
+        Ok(())
     }
 
     fn sync_data(&self) -> io::Result<()> {
