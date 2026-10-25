@@ -215,6 +215,7 @@ impl PageStore {
         debug_assert_eq!(image.len(), ptr.len as usize);
         let (file, created) = self.file(ptr.class)?;
         file.write_all_at(image, ptr.offset())?;
+        file.start_writeback(ptr.offset(), image.len() as u64);
         Ok(created)
     }
 

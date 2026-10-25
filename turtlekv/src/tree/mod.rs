@@ -1317,6 +1317,29 @@ fn load_subtree(
 }
 
 /// Every page location the tree references.
+/// The written pages reachable from a tree whose newest pages may still be
+/// unwritten.
+pub fn reachable_written(t: &Subtree, out: &mut std::collections::HashSet<PagePtr>) {
+    match t {
+        Subtree::Leaf(p) => {
+            out.extend(p.ptr());
+        }
+        Subtree::Node(n) => {
+            if let Some(ptr) = n.ptr()
+                && !out.insert(ptr)
+            {
+                return;
+            }
+            for seg in n.levels.iter().flatten() {
+                out.extend(seg.page.ptr());
+            }
+            for c in &n.children {
+                reachable_written(c, out);
+            }
+        }
+    }
+}
+
 pub fn reachable(t: &Subtree, out: &mut std::collections::HashSet<PagePtr>) {
     match t {
         Subtree::Leaf(p) => {
