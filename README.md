@@ -81,24 +81,24 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 
 - **One journal lock.** Every fjall write takes one journal mutex, so loads slow as threads grow. On the workstation at 10M records, fjall loaded 781 thousand inserts per second on one thread, ahead of RocksDB's 681, and 435 thousand on 16.
 - **Version skipping.** A fjall scan steps past a key's older versions one at a time; RocksDB reseeks after eight. Zipfian updates pile versions onto hot keys, so E after A and B scans slowly: on 2M records with one thread, fjall ran 106–125 thousand scans per second after the load and 7.6 thousand after 400 thousand operations of workload A.
-- **Synchronous writes.** fjall persists its journal once per writer, without grouping, so durable throughput stays flat as threads grow.
+- **Synchronous writes.** fjall persists its journal once per writer, without grouping, so more threads add no durable throughput: on EC2 it fell from 31 thousand per second on one thread to 19 thousand on 64.
 
 ### Synchronous writes
 
 `write(.., true)` returns once its batch is durable. Synchronous writers share syncs: one writer at a time writes every buffered record in one direct write and makes it durable, and the others return when a sync covers them. When every earlier log write is already durable, that write is one `pwritev2` with `RWF_DSYNC`; otherwise it is a write and an fsync. The log bypasses the page cache and writes over retired segments, so a sync has no dirty pages to write back and no file size to journal.
 
-Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB memtables, background work finished first):
+Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB memtables, background work finished first), median of three runs:
 
 | Client threads | turtlekv-rs | RocksDB | RocksDB, recycled logs | fjall |
 |---|--:|--:|--:|--:|
 | Workstation NVMe, 1 | 0.5 | 0.2 | 0.5 | 0.5 |
-| Workstation NVMe, 16 | 3.9 | 2.0 | 3.6 | 0.4 |
-| Workstation NVMe, 64 | 15.0 | 6.5 | 11.5 | 0.4 |
-| EC2 instance store, 1 | 35.0 | 11.5 | 30.2 | 29.9 |
-| EC2 instance store, 16 | 166.6 | 75.4 | 143.3 | 26.5 |
-| EC2 instance store, 64 | 343.4 | 192.7 | 299.5 | 19.1 |
+| Workstation NVMe, 16 | 3.7 | 2.2 | 3.9 | 0.5 |
+| Workstation NVMe, 64 | 15.1 | 7.3 | 14.2 | 0.4 |
+| EC2 instance store, 1 | 33.6 | 11.5 | 30.4 | 31.0 |
+| EC2 instance store, 16 | 157.1 | 71.1 | 144.2 | 27.0 |
+| EC2 instance store, 64 | 337.8 | 187.9 | 288.0 | 18.8 |
 
-The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 28 µs on average for turtlekv-rs on one thread. The 64-thread EC2 figures for turtlekv-rs and recycled-log RocksDB are means of three alternating runs. fjall persists its journal once per writer, without grouping.
+The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 30 µs on average for turtlekv-rs on one thread.
 
 The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit, and with it enabled, a tenth or more of writes wake a CPU from it. Then every engine's one-thread mean rises to 50–110 µs, runs swing by 40%, and no engine passes 43 thousand per second at 16 or 64 threads. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
 
