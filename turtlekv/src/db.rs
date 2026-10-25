@@ -182,6 +182,9 @@ pub struct DbStats {
     pub frozen_memtables: usize,
     pub tree: tree::TreeStats,
     pub arena_bytes: u64,
+    /// Seconds in each checkpoint stage: build, apply, write, sync, commit;
+    /// then seconds writers stalled.
+    pub stage_secs: [f64; 6],
 }
 
 struct Inner {
@@ -203,6 +206,23 @@ struct Inner {
     checkpoints: AtomicU64,
     user_bytes: AtomicU64,
     wal_bytes: AtomicU64,
+    timing: Timing,
+}
+
+/// Cumulative nanoseconds spent in each checkpoint stage, and by writers
+/// waiting for a frozen-memtable slot.
+#[derive(Default, Debug)]
+pub struct Timing {
+    pub build_ns: AtomicU64,
+    pub apply_ns: AtomicU64,
+    pub write_ns: AtomicU64,
+    pub sync_ns: AtomicU64,
+    pub commit_ns: AtomicU64,
+    pub stall_ns: AtomicU64,
+}
+
+fn since(t: std::time::Instant) -> u64 {
+    t.elapsed().as_nanos() as u64
 }
 
 pub struct Db {
@@ -292,6 +312,7 @@ impl Db {
             checkpoints: AtomicU64::new(0),
             user_bytes: AtomicU64::new(0),
             wal_bytes: AtomicU64::new(0),
+            timing: Timing::default(),
             opts,
         });
         let worker = inner.opts.background.then(|| {
@@ -419,6 +440,15 @@ impl Db {
             frozen_memtables: v.frozen.len(),
             tree: v.tree.as_ref().map(tree::stats).unwrap_or_default(),
             arena_bytes: inner.io.store.arena_bytes(),
+            stage_secs: [
+                &inner.timing.build_ns,
+                &inner.timing.apply_ns,
+                &inner.timing.write_ns,
+                &inner.timing.sync_ns,
+                &inner.timing.commit_ns,
+                &inner.timing.stall_ns,
+            ]
+            .map(|c| c.load(Relaxed) as f64 / 1e9),
         }
     }
 
@@ -527,6 +557,7 @@ impl Inner {
     /// Freezes the active memtable and starts a new one with a new log
     /// segment. Waits (or checkpoints inline) until a frozen slot is free.
     fn rotate(&self, w: &mut Writer) -> Result<()> {
+        let stall = std::time::Instant::now();
         loop {
             if self.version.load().frozen.len() < self.opts.max_frozen {
                 break;
@@ -541,6 +572,7 @@ impl Inner {
                 self.checkpoint_step()?;
             }
         }
+        self.timing.stall_ns.fetch_add(since(stall), Relaxed);
         // The old segment must be durable before the new one takes writes,
         // so that recovery always replays a prefix of history.
         w.wal.sync()?;
@@ -633,17 +665,27 @@ impl Inner {
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
         let mut root = v.tree.clone();
         drop(v);
-        for batch in self.build_batches(&mem) {
+        let t = std::time::Instant::now();
+        let batches = self.build_batches(&mem);
+        self.timing.build_ns.fetch_add(since(t), Relaxed);
+        let t = std::time::Instant::now();
+        for batch in batches {
             root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
         }
+        self.timing.apply_ns.fetch_add(since(t), Relaxed);
+        let t = std::time::Instant::now();
         let created = match &root {
             Some(r) => tree::write_tree(&ctx, r)?,
             None => false,
         };
+        self.timing.write_ns.fetch_add(since(t), Relaxed);
+        let t = std::time::Instant::now();
         self.io.store.sync()?;
         if created {
             self.storage.sync_dir()?;
         }
+        self.timing.sync_ns.fetch_add(since(t), Relaxed);
+        let t = std::time::Instant::now();
         let sb = Superblock {
             checkpoint_id: durable.sb.checkpoint_id + 1,
             last_seq: mem.last_seq.load(SeqCst),
@@ -674,6 +716,7 @@ impl Inner {
         }
         drop(old_epoch);
         drop(durable);
+        self.timing.commit_ns.fetch_add(since(t), Relaxed);
         self.checkpoints.fetch_add(1, Relaxed);
         self.notify();
         for id in wal::list_segments(&*self.storage)? {

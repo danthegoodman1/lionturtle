@@ -19,3 +19,4 @@ thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
+mimalloc = { version = "0.1", default-features = false }

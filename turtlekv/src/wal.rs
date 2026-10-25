@@ -290,6 +290,12 @@ mod tests {
         let r = replay(&disk, 1, 2, |_, _| {}).unwrap();
         assert!(r.last_seq >= 3);
         let r = replay(&disk, 1, 7, |_, _| {}).unwrap();
-        assert_eq!(r.end, End::Gap);
+        assert_eq!((r.last_seq, r.end), (7, End::Clean), "covered records are skipped");
+
+        let mut w = WalWriter::create(&disk, 2).unwrap();
+        w.append(10, &[WriteOp::put("e", "5")]);
+        w.sync().unwrap();
+        let r = replay(&disk, 2, 5, |_, _| {}).unwrap();
+        assert_eq!((r.last_seq, r.end), (5, End::Gap));
     }
 }

@@ -45,6 +45,10 @@ impl KeyRanges {
         self.ranges.len()
     }
 
+    pub fn as_slice(&self) -> &[(Bytes, Option<Bytes>)] {
+        &self.ranges
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &(Bytes, Option<Bytes>)> {
         self.ranges.iter()
     }

@@ -273,12 +273,18 @@ pub struct Block {
 }
 
 impl Block {
+    /// Decodes a block read from disk, verifying its checksum.
     pub fn decode(bytes: Bytes, page_id: PageId) -> Result<Self> {
+        if bytes.len() >= BLOCK_HEADER && u32_at(&bytes, 0) != block_crc(page_id, &bytes[4..]) {
+            return Err(corruption(format!("page {page_id} block checksum mismatch")));
+        }
+        Self::decode_trusted(bytes)
+    }
+
+    /// Decodes a block of an image that never left memory.
+    pub fn decode_trusted(bytes: Bytes) -> Result<Self> {
         if bytes.len() < BLOCK_HEADER {
             return Err(corruption("block too short"));
-        }
-        if u32_at(&bytes, 0) != block_crc(page_id, &bytes[4..]) {
-            return Err(corruption(format!("page {page_id} block checksum mismatch")));
         }
         let count = u32_at(&bytes, 4) as usize;
         let offsets_pos = u32_at(&bytes, 8) as usize;
@@ -298,6 +304,23 @@ impl Block {
 
     fn entry_pos(&self, i: usize) -> usize {
         u32_at(&self.bytes, self.offsets_pos + i * 4) as usize
+    }
+
+    /// Byte offsets of entry `i` within the block: key start, key length,
+    /// and value start and length (`None` for a tombstone).
+    #[inline]
+    pub fn entry_span(&self, i: usize) -> (usize, usize, Option<(usize, usize)>) {
+        let pos = self.entry_pos(i);
+        let b = &self.bytes;
+        let klen = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
+        let vword = u32_at(b, pos + 2);
+        let kstart = pos + ENTRY_HEADER;
+        let value = (vword & TOMBSTONE == 0).then_some((kstart + klen, vword as usize));
+        (kstart, klen, value)
+    }
+
+    pub fn raw(&self) -> &Bytes {
+        &self.bytes
     }
 
     pub fn entry(&self, i: usize) -> EntryRef<'_> {
@@ -536,6 +559,9 @@ impl PageBuilder {
         let mut crc = crc32c::crc32c(&self.buf[meta_off..footer_start + 4]);
         crc = crc32c::crc32c_append(crc, &self.buf[footer_start + 8..]);
         self.buf[footer_start + 4..footer_start + 8].copy_from_slice(&crc.to_le_bytes());
+        // Builders reserve generously; give the slack back before the image
+        // is pinned or cached for a long time.
+        self.buf.shrink_to_fit();
         let bytes = Bytes::from(self.buf);
         let meta = PageMeta::decode(bytes.slice(meta_off..), self.id).expect("fresh page decodes");
         PageImage { bytes, meta }

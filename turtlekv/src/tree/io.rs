@@ -121,16 +121,15 @@ impl PageIo {
     pub fn block(&self, page: &DataPage, b: usize) -> Result<Block> {
         let info = page.meta.block(b);
         let range = info.offset as usize..(info.offset + info.len) as usize;
+        // Pinned and cached images were built in memory, so only blocks read
+        // from disk need their checksums verified.
         if let Some(image) = page.pinned() {
-            return Block::decode(image.slice(range), page.id());
+            return Block::decode_trusted(image.slice(range));
         }
         let id = page.id();
-        match self.cache.get(&(id, IMAGE)) {
-            Some(Cached::Image(image)) => {
-                self.counters.cache_hits.fetch_add(1, Relaxed);
-                return Block::decode(image.slice(range), id);
-            }
-            _ => {}
+        if let Some(Cached::Image(image)) = self.cache.get(&(id, IMAGE)) {
+            self.counters.cache_hits.fetch_add(1, Relaxed);
+            return Block::decode_trusted(image.slice(range));
         }
         if let Some(Cached::Block(block)) = self.cache.get(&(id, b as u32)) {
             self.counters.cache_hits.fetch_add(1, Relaxed);
@@ -144,23 +143,24 @@ impl PageIo {
         Ok(block)
     }
 
-    /// The bytes of `blocks`, contiguous, for sequential reading. The first
+    /// The bytes of `blocks`, contiguous, for sequential reading, and whether
+    /// they came from disk (so their checksums need verifying). The first
     /// returned byte is the start of `blocks.start`. Reads from disk bypass
     /// the cache, since merges consume what they read.
-    pub fn span(&self, page: &DataPage, blocks: Range<usize>) -> Result<Bytes> {
+    pub fn span(&self, page: &DataPage, blocks: Range<usize>) -> Result<(Bytes, bool)> {
         let (off, len) = page.meta.span(blocks);
         let range = off as usize..(off + len) as usize;
         if let Some(image) = page.pinned() {
-            return Ok(image.slice(range));
+            return Ok((image.slice(range), false));
         }
         if let Some(Cached::Image(image)) = self.cache.get(&(page.id(), IMAGE)) {
             self.counters.cache_hits.fetch_add(1, Relaxed);
-            return Ok(image.slice(range));
+            return Ok((image.slice(range), false));
         }
         let ptr = page.ptr().expect("unpinned page is written");
         self.counters.span_reads.fetch_add(1, Relaxed);
         self.counters.span_read_bytes.fetch_add(len, Relaxed);
-        self.store.read(&ptr, off, len)
+        Ok((self.store.read(&ptr, off, len)?, true))
     }
 
     /// Writes an unwritten page to a fresh slot, then moves its image from the

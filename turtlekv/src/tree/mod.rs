@@ -32,7 +32,7 @@ use crate::pagestore::PagePtr;
 use crate::types::Value;
 use bytes::Bytes;
 use codec::{Reader, put_bytes};
-use cursor::{EntrySource, LevelCursor, Merger, PageCursor, ReadMode};
+use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source};
 use io::{DataPage, PageIo};
 use ranges::{KeyRanges, successor};
 use std::collections::HashMap;
@@ -230,20 +230,21 @@ impl Node {
     }
 }
 
-/// Merges `sources` (newest first) into pages of about `target` bytes each,
-/// never over `max`.
+/// Merges `sources` (newest first) into pages of about `target` bytes each.
 fn build_pages(
     ctx: &Ctx,
     merger: &mut Merger,
     target: u64,
     drop_tombstones: bool,
 ) -> Result<Vec<Arc<DataPage>>> {
+    let capacity = (target + target / 16) as usize + 4096;
     let mut pages = Vec::new();
-    let mut b = PageBuilder::new(ctx.new_page_id());
+    let mut b = PageBuilder::with_capacity(ctx.new_page_id(), capacity);
     while let Some(e) = merger.peek() {
         if !(drop_tombstones && e.value.is_none()) {
             if !b.is_empty() && b.data_bytes() + e.size() > target {
-                pages.push(ctx.finish(std::mem::replace(&mut b, PageBuilder::new(ctx.new_page_id()))));
+                let next = PageBuilder::with_capacity(ctx.new_page_id(), capacity);
+                pages.push(ctx.finish(std::mem::replace(&mut b, next)));
             }
             b.push(e);
         }
@@ -262,21 +263,97 @@ fn balanced_target(total: u64, limit: u64) -> u64 {
     total.div_ceil(parts).max(1)
 }
 
-fn page_source(ctx: &Ctx, page: &Arc<DataPage>) -> Result<Box<dyn EntrySource + Send>> {
-    Ok(Box::new(PageCursor::new(ctx.io, page.clone(), b"", None, KeyRanges::new(), ctx.merge_mode())?))
+/// One input of a merge.
+#[derive(Clone, Copy)]
+enum Run<'a> {
+    Page(&'a Arc<DataPage>),
+    Level(&'a [Segment]),
+}
+
+impl Run<'_> {
+    fn bytes(&self) -> u64 {
+        match self {
+            Run::Page(p) => p.data_bytes(),
+            Run::Level(l) => l.iter().map(|s| s.page.data_bytes()).sum(),
+        }
+    }
+
+    fn source(&self, ctx: &Ctx, lo: &[u8], hi: Option<&[u8]>) -> Result<Source> {
+        Ok(match self {
+            Run::Page(p) => Source::Page(PageCursor::new(
+                ctx.io,
+                (*p).clone(),
+                lo,
+                hi.map(Bytes::copy_from_slice),
+                KeyRanges::new(),
+                ctx.merge_mode(),
+            )?),
+            Run::Level(l) => Source::Level(LevelCursor::new(ctx.io, l, lo, hi, ctx.merge_mode())?),
+        })
+    }
+
+    /// Keys inside `(lo, hi)` that cut this run into pieces of about `every`
+    /// bytes, taken from the block index without reading data.
+    fn split_keys(&self, lo: &[u8], hi: Option<&[u8]>, every: u64, out: &mut Vec<Bytes>) {
+        let pages: Vec<&Arc<DataPage>> = match self {
+            Run::Page(p) => vec![p],
+            Run::Level(l) => l.iter().filter(|s| s.overlaps(lo, hi)).map(|s| &s.page).collect(),
+        };
+        let mut acc = 0;
+        for page in pages {
+            let meta = &page.meta;
+            for b in meta.blocks_for_range(lo, hi) {
+                acc += meta.block(b).len as u64;
+                if acc >= every {
+                    let key = meta.block_first_key(b);
+                    if key > lo && hi.is_none_or(|h| key < h) && out.last().is_none_or(|l| &l[..] < key) {
+                        out.push(Bytes::copy_from_slice(key));
+                        acc = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Merges `runs` (newest first) over `[lo, hi)` into balanced pages of at
+/// most a leaf each. Large merges split the key range into leaf-sized
+/// pieces, merged in parallel when configured.
+fn merge_runs(ctx: &Ctx, runs: &[Run], lo: &[u8], hi: Option<&[u8]>, drop_tombstones: bool) -> Result<Vec<Arc<DataPage>>> {
+    let limit = ctx.cfg.leaf_size;
+    let total: u64 = runs.iter().map(Run::bytes).sum();
+    let mut cuts = Vec::new();
+    if ctx.cfg.parallel && total > 2 * limit {
+        let largest = runs.iter().max_by_key(|r| r.bytes()).unwrap();
+        largest.split_keys(lo, hi, limit, &mut cuts);
+    }
+    let mut ranges: Vec<(Bytes, Option<Bytes>)> = Vec::with_capacity(cuts.len() + 1);
+    let mut start = Bytes::copy_from_slice(lo);
+    for cut in cuts {
+        ranges.push((std::mem::replace(&mut start, cut.clone()), Some(cut)));
+    }
+    ranges.push((start, hi.map(Bytes::copy_from_slice)));
+    let target = balanced_target(total.div_ceil(ranges.len() as u64), limit);
+    let merge = |(a, b): &(Bytes, Option<Bytes>)| -> Result<Vec<Arc<DataPage>>> {
+        let sources = runs.iter().map(|r| r.source(ctx, a, b.as_deref())).collect::<Result<Vec<_>>>()?;
+        build_pages(ctx, &mut Merger::new(sources), target, drop_tombstones)
+    };
+    if ranges.len() == 1 {
+        return merge(&ranges[0]);
+    }
+    use rayon::prelude::*;
+    let parts = ranges.par_iter().map(merge).collect::<Result<Vec<_>>>()?;
+    Ok(parts.into_iter().flatten().collect())
 }
 
 /// Merges `batch` into a leaf (or into nothing), dropping tombstones, and
 /// splits the result into balanced leaves.
 fn leaf_apply(ctx: &Ctx, leaf: Option<&Arc<DataPage>>, batch: &Arc<DataPage>) -> Result<Vec<Arc<DataPage>>> {
-    let mut sources = vec![page_source(ctx, batch)?];
-    let mut total = batch.data_bytes();
+    let mut runs = vec![Run::Page(batch)];
     if let Some(leaf) = leaf {
-        sources.push(page_source(ctx, leaf)?);
-        total += leaf.data_bytes();
+        runs.push(Run::Page(leaf));
     }
-    let mut merger = Merger::new(sources);
-    build_pages(ctx, &mut merger, balanced_target(total, ctx.cfg.leaf_size), true)
+    merge_runs(ctx, &runs, b"", None, true)
 }
 
 fn leaf_pieces(pages: Vec<Arc<DataPage>>, lo: &Bytes) -> Vec<Piece> {
@@ -316,14 +393,9 @@ fn buffer_insert(ctx: &Ctx, node: &mut Node, batch: Arc<DataPage>) -> Result<()>
     }
     let target = first_empty.min(n - 1);
     let merged_levels = if first_empty == n { n } else { first_empty };
-    let mut total = batch.data_bytes();
-    let mut sources = vec![page_source(ctx, &batch)?];
-    for level in &node.levels[..merged_levels] {
-        total += level.iter().map(|s| s.page.data_bytes()).sum::<u64>();
-        sources.push(Box::new(LevelCursor::new(ctx.io, level, b"", None, ctx.merge_mode())?));
-    }
-    let mut merger = Merger::new(sources);
-    let pages = build_pages(ctx, &mut merger, balanced_target(total, ctx.cfg.leaf_size), false)?;
+    let mut runs = vec![Run::Page(&batch)];
+    runs.extend(node.levels[..merged_levels].iter().map(|l| Run::Level(l)));
+    let pages = merge_runs(ctx, &runs, b"", None, false)?;
     for level in &mut node.levels[..merged_levels] {
         level.clear();
     }
@@ -353,9 +425,9 @@ fn flush_to_pivot(ctx: &Ctx, node: &mut Node, p: usize) -> Result<()> {
     let hi = node.pivot_hi(p).cloned();
     let limit = ctx.cfg.leaf_size;
 
-    let mut sources: Vec<Box<dyn EntrySource + Send>> = Vec::with_capacity(node.levels.len());
+    let mut sources: Vec<Source> = Vec::with_capacity(node.levels.len());
     for level in &node.levels {
-        sources.push(Box::new(LevelCursor::new(ctx.io, level, &lo, hi.as_deref(), ctx.merge_mode())?));
+        sources.push(Source::Level(LevelCursor::new(ctx.io, level, &lo, hi.as_deref(), ctx.merge_mode())?));
     }
     let mut merger = Merger::new(sources);
     let mut b = PageBuilder::new(ctx.new_page_id());
@@ -511,10 +583,7 @@ fn fix_undersized_children(ctx: &Ctx, node: &mut Node) -> Result<()> {
 fn merge_siblings(ctx: &Ctx, left: &Subtree, right: &Subtree, lo: &Bytes) -> Result<Vec<Piece>> {
     match (left, right) {
         (Subtree::Leaf(a), Subtree::Leaf(b)) => {
-            let sources = vec![page_source(ctx, a)?, page_source(ctx, b)?];
-            let mut merger = Merger::new(sources);
-            let total = a.data_bytes() + b.data_bytes();
-            let mut pages = build_pages(ctx, &mut merger, balanced_target(total, ctx.cfg.leaf_size), true)?;
+            let mut pages = merge_runs(ctx, &[Run::Page(a), Run::Page(b)], b"", None, true)?;
             if pages.is_empty() {
                 pages.push(Arc::new(DataPage::unwritten(PageBuilder::new(ctx.new_page_id()).finish(0))));
             }
@@ -650,15 +719,8 @@ fn split_node(node: &Node) -> (Node, Node) {
 
 /// Merges every buffer level into one run in the deepest level.
 fn compact_levels(ctx: &Ctx, node: &mut Node) -> Result<()> {
-    let lo = node.pivots[0].clone();
-    let mut sources: Vec<Box<dyn EntrySource + Send>> = Vec::new();
-    let mut total = 0;
-    for level in &node.levels {
-        total += level.iter().map(|s| s.page.data_bytes()).sum::<u64>();
-        sources.push(Box::new(LevelCursor::new(ctx.io, level, &lo, node.hi.as_deref(), ctx.merge_mode())?));
-    }
-    let mut merger = Merger::new(sources);
-    let pages = build_pages(ctx, &mut merger, balanced_target(total, ctx.cfg.leaf_size), false)?;
+    let runs: Vec<Run> = node.levels.iter().map(|l| Run::Level(l)).collect();
+    let pages = merge_runs(ctx, &runs, &node.pivots[0], node.hi.as_deref(), false)?;
     for level in &mut node.levels {
         level.clear();
     }
@@ -826,13 +888,13 @@ impl TreeScan {
                 }
             }
         };
-        let mut sources: Vec<Box<dyn EntrySource + Send>> = Vec::new();
+        let mut sources: Vec<Source> = Vec::new();
         for n in &path {
             for level in &n.levels {
-                sources.push(Box::new(LevelCursor::new(io, level, &start, hi.as_deref(), ReadMode::Cached)?));
+                sources.push(Source::Level(LevelCursor::new(io, level, &start, hi.as_deref(), ReadMode::Cached)?));
             }
         }
-        sources.push(Box::new(PageCursor::new(io, leaf.clone(), &start, hi.clone(), KeyRanges::new(), ReadMode::Cached)?));
+        sources.push(Source::Page(PageCursor::new(io, leaf.clone(), &start, hi.clone(), KeyRanges::new(), ReadMode::Cached)?));
         self.merger = Some(Merger::new(sources));
         self.next_start = match (&hi, &self.end) {
             (Some(h), Some(e)) if h >= e => None,

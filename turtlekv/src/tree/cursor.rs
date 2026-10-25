@@ -1,4 +1,8 @@
 //! Ordered iteration over pages, buffer levels, and merges of them.
+//!
+//! Merging is the checkpoint's inner loop, so cursors decode each entry once
+//! when they reach it, sources dispatch statically, and short keys compare as
+//! integers.
 
 use super::Segment;
 use super::io::{DataPage, PageIo};
@@ -6,12 +10,26 @@ use super::ranges::KeyRanges;
 use crate::error::Result;
 use crate::page::{Block, EntryRef};
 use bytes::Bytes;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// A source of entries in strictly increasing key order.
-pub trait EntrySource {
-    fn peek(&self) -> Option<EntryRef<'_>>;
-    fn advance(&mut self, io: &PageIo) -> Result<()>;
+/// Compares keys, taking the first eight bytes as one integer when both
+/// keys have them.
+#[inline]
+pub fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
+    if a.len() >= 8 && b.len() >= 8 {
+        let x = u64::from_be_bytes(a[..8].try_into().unwrap());
+        let y = u64::from_be_bytes(b[..8].try_into().unwrap());
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    a.cmp(b)
+}
+
+#[inline]
+fn keys_equal(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && cmp_keys(a, b) == Ordering::Equal
 }
 
 /// How a cursor fetches blocks: one at a time through the cache (point and
@@ -28,14 +46,19 @@ pub struct PageCursor {
     page: Arc<DataPage>,
     hi: Option<Bytes>,
     dead: KeyRanges,
+    /// Index of the first dead range that ends after the current key.
+    dead_next: usize,
     mode: ReadMode,
-    /// Loaded run of blocks: its bytes and the index of its first block.
+    /// Loaded run of blocks: its bytes, the blocks it covers, and whether it
+    /// came from disk.
     span: Bytes,
     span_blocks: std::ops::Range<usize>,
+    span_from_disk: bool,
     block_idx: usize,
     block: Option<Block>,
     entry: usize,
-    done: bool,
+    /// The current entry's offsets in the block, decoded once.
+    cur: Option<(usize, usize, Option<(usize, usize)>)>,
 }
 
 impl PageCursor {
@@ -51,13 +74,15 @@ impl PageCursor {
             page,
             hi,
             dead,
+            dead_next: 0,
             mode,
             span: Bytes::new(),
             span_blocks: 0..0,
+            span_from_disk: false,
             block_idx: 0,
             block: None,
             entry: 0,
-            done: false,
+            cur: None,
         };
         c.seek(io, lo)?;
         Ok(c)
@@ -77,13 +102,14 @@ impl PageCursor {
                         bytes += meta.block(end).len as u64;
                         end += 1;
                     }
-                    self.span = io.span(&self.page, b..end)?;
+                    (self.span, self.span_from_disk) = io.span(&self.page, b..end)?;
                     self.span_blocks = b..end;
                 }
                 let base = meta.block(self.span_blocks.start).offset;
                 let info = meta.block(b);
                 let start = (info.offset - base) as usize;
-                Block::decode(self.span.slice(start..start + info.len as usize), self.page.id())?
+                let bytes = self.span.slice(start..start + info.len as usize);
+                if self.span_from_disk { Block::decode(bytes, self.page.id())? } else { Block::decode_trusted(bytes)? }
             }
         };
         self.block = Some(block);
@@ -95,7 +121,7 @@ impl PageCursor {
     fn seek(&mut self, io: &PageIo, key: &[u8]) -> Result<()> {
         let meta = &self.page.meta;
         if meta.n_items == 0 || key > meta.max_key() {
-            self.done = true;
+            self.cur = None;
             return Ok(());
         }
         let b = meta.find_block(key).unwrap_or(0);
@@ -104,11 +130,10 @@ impl PageCursor {
             self.entry = 0;
         }
         let block = self.block.as_ref().unwrap();
-        let from = self.entry;
         let pos = match block.search(key) {
             Ok(i) | Err(i) => i,
         };
-        self.entry = pos.max(from);
+        self.entry = pos.max(self.entry);
         self.settle(io)
     }
 
@@ -118,33 +143,41 @@ impl PageCursor {
             let block = self.block.as_ref().unwrap();
             if self.entry >= block.len() {
                 let next = self.block_idx + 1;
-                if next >= self.page.meta.n_blocks as usize {
-                    self.done = true;
-                    return Ok(());
-                }
-                if let Some(hi) = &self.hi
-                    && self.page.meta.block_first_key(next) >= &hi[..]
+                if next >= self.page.meta.n_blocks as usize
+                    || self.hi.as_ref().is_some_and(|hi| self.page.meta.block_first_key(next) >= &hi[..])
                 {
-                    self.done = true;
+                    self.cur = None;
                     return Ok(());
                 }
                 self.load_block(io, next)?;
                 self.entry = 0;
                 continue;
             }
-            let key = block.entry(self.entry).key;
-            if self.hi.as_ref().is_some_and(|hi| key >= &hi[..]) {
-                self.done = true;
+            let span = block.entry_span(self.entry);
+            let key = &block.raw()[span.0..span.0 + span.1];
+            if self.hi.as_ref().is_some_and(|hi| cmp_keys(key, hi) != Ordering::Less) {
+                self.cur = None;
                 return Ok(());
             }
-            match self.dead.skip(key) {
-                Ok(None) => return Ok(()),
-                Ok(Some(next)) => {
-                    let next = next.clone();
-                    return self.seek(io, &next);
-                }
-                Err(()) => {
-                    self.done = true;
+            let dead = self.dead.as_slice();
+            while self.dead_next < dead.len() && dead[self.dead_next].1.as_ref().is_some_and(|h| cmp_keys(h, key) != Ordering::Greater) {
+                self.dead_next += 1;
+            }
+            match dead.get(self.dead_next) {
+                Some((lo, hi)) if cmp_keys(lo, key) != Ordering::Greater => match hi {
+                    // Inside a dead range: skip to its end.
+                    Some(hi) => {
+                        let hi = hi.clone();
+                        self.cur = None;
+                        return self.seek(io, &hi);
+                    }
+                    None => {
+                        self.cur = None;
+                        return Ok(());
+                    }
+                },
+                _ => {
+                    self.cur = Some(span);
                     return Ok(());
                 }
             }
@@ -154,18 +187,16 @@ impl PageCursor {
     pub fn page(&self) -> &Arc<DataPage> {
         &self.page
     }
-}
 
-impl EntrySource for PageCursor {
-    fn peek(&self) -> Option<EntryRef<'_>> {
-        if self.done {
-            return None;
-        }
-        Some(self.block.as_ref()?.entry(self.entry))
+    #[inline]
+    pub fn peek(&self) -> Option<EntryRef<'_>> {
+        let (k, kl, v) = self.cur?;
+        let raw = self.block.as_ref()?.raw();
+        Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]) })
     }
 
-    fn advance(&mut self, io: &PageIo) -> Result<()> {
-        if self.done {
+    pub fn advance(&mut self, io: &PageIo) -> Result<()> {
+        if self.cur.is_none() {
             return Ok(());
         }
         self.entry += 1;
@@ -217,14 +248,13 @@ impl LevelCursor {
         }
         Ok(())
     }
-}
 
-impl EntrySource for LevelCursor {
-    fn peek(&self) -> Option<EntryRef<'_>> {
+    #[inline]
+    pub fn peek(&self) -> Option<EntryRef<'_>> {
         self.current.as_ref()?.peek()
     }
 
-    fn advance(&mut self, io: &PageIo) -> Result<()> {
+    pub fn advance(&mut self, io: &PageIo) -> Result<()> {
         if let Some(c) = self.current.as_mut() {
             c.advance(io)?;
             if c.peek().is_none() {
@@ -235,17 +265,40 @@ impl EntrySource for LevelCursor {
     }
 }
 
+/// One input of a merge.
+pub enum Source {
+    Page(PageCursor),
+    Level(LevelCursor),
+}
+
+impl Source {
+    #[inline]
+    pub fn peek(&self) -> Option<EntryRef<'_>> {
+        match self {
+            Source::Page(c) => c.peek(),
+            Source::Level(c) => c.peek(),
+        }
+    }
+
+    #[inline]
+    pub fn advance(&mut self, io: &PageIo) -> Result<()> {
+        match self {
+            Source::Page(c) => c.advance(io),
+            Source::Level(c) => c.advance(io),
+        }
+    }
+}
+
 /// Merges sources ordered newest first: for each key, the newest source's
 /// entry wins and older entries for the key are skipped.
 pub struct Merger {
-    sources: Vec<Box<dyn EntrySource + Send>>,
+    sources: Vec<Source>,
     winner: Option<usize>,
-    scratch: Vec<u8>,
 }
 
 impl Merger {
-    pub fn new(sources: Vec<Box<dyn EntrySource + Send>>) -> Self {
-        let mut m = Self { sources, winner: None, scratch: Vec::new() };
+    pub fn new(sources: Vec<Source>) -> Self {
+        let mut m = Self { sources, winner: None };
         m.pick();
         m
     }
@@ -254,7 +307,7 @@ impl Merger {
         let mut best: Option<(usize, &[u8])> = None;
         for (i, s) in self.sources.iter().enumerate() {
             if let Some(e) = s.peek()
-                && best.is_none_or(|(_, k)| e.key < k)
+                && best.is_none_or(|(_, k)| cmp_keys(e.key, k) == Ordering::Less)
             {
                 best = Some((i, e.key));
             }
@@ -262,24 +315,35 @@ impl Merger {
         self.winner = best.map(|(i, _)| i);
     }
 
+    #[inline]
     pub fn peek(&self) -> Option<EntryRef<'_>> {
         self.sources[self.winner?].peek()
     }
 
-    /// Index of the source the current entry comes from.
-    pub fn winner(&self) -> Option<usize> {
-        self.winner
-    }
-
     pub fn advance(&mut self, io: &PageIo) -> Result<()> {
         let Some(w) = self.winner else { return Ok(()) };
-        self.scratch.clear();
-        self.scratch.extend_from_slice(self.sources[w].peek().unwrap().key);
-        for s in self.sources.iter_mut() {
-            while s.peek().is_some_and(|e| e.key == &self.scratch[..]) {
-                s.advance(io)?;
+        // Each source is strictly increasing, so at most one entry per older
+        // source shares the winner's key.
+        for j in 0..self.sources.len() {
+            if j == w {
+                continue;
+            }
+            let (winner, other) = if j < w {
+                let (l, r) = self.sources.split_at_mut(w);
+                (&r[0], &mut l[j])
+            } else {
+                let (l, r) = self.sources.split_at_mut(j);
+                (&l[w], &mut r[0])
+            };
+            let same = match (other.peek(), winner.peek()) {
+                (Some(o), Some(k)) => keys_equal(o.key, k.key),
+                _ => false,
+            };
+            if same {
+                other.advance(io)?;
             }
         }
+        self.sources[w].advance(io)?;
         self.pick();
         Ok(())
     }

@@ -122,7 +122,9 @@ fn random_options(rng: &mut Rng) -> Options {
             max_levels: rng.range(1, 6) as usize,
             filter_bits: *rng.pick(&[0, 4, 10]),
             merge_readahead: rng.range(4096, 1 << 16),
-            parallel: false,
+            // Parallel merges run on a one-thread pool (see `run`), which
+            // keeps them deterministic.
+            parallel: rng.chance(0.5),
         },
         checkpoint_distance: rng.range(1, 8),
         cache_bytes: *rng.pick(&[0, 1 << 14, 1 << 20, 1 << 26]),
@@ -572,6 +574,11 @@ impl Sim {
 
 /// Runs one seed for `steps` steps.
 pub fn run(seed: u64, steps: u64, verbose: bool) -> Result<Report, String> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread pool");
+    pool.install(|| run_inner(seed, steps, verbose))
+}
+
+fn run_inner(seed: u64, steps: u64, verbose: bool) -> Result<Report, String> {
     let mut sim = Sim::new(seed, verbose);
     sim.open()?;
     for i in 0..steps {

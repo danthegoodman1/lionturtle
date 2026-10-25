@@ -120,7 +120,7 @@ fn small_cfg(rng: &mut Rng) -> TreeConfig {
         max_levels: rng.range(1, 5) as usize,
         filter_bits: 8,
         merge_readahead: rng.range(4096, 20000),
-        parallel: false,
+        parallel: rng.chance(0.5),
     }
 }
 

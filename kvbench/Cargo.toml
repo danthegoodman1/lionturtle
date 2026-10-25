@@ -1,7 +1,15 @@
 [package]
 name = "kvbench"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 fjall = "3"
+hdrhistogram = "7"
+mimalloc = { version = "0.1", default-features = false }
+turtlekv = { path = "../turtlekv" }
+rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4"] }
+
+[features]
+rocksdb = ["dep:rocksdb"]
