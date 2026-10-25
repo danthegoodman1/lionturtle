@@ -763,12 +763,14 @@ impl Inner {
     fn build_batches(&self, mem: &Mem) -> Vec<Arc<DataPage>> {
         let limit = self.opts.tree.leaf_size;
         let bits = self.opts.tree.filter_bits;
+        let capacity = (limit + limit / 16) as usize + 4096;
         let mut batches = Vec::new();
-        let mut b = PageBuilder::new(self.next_page_id.fetch_add(1, Relaxed));
+        let mut b = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
         mem.table.for_each(&mut |key, value| {
             let e = EntryRef { key, value: value.as_put().map(|v| &v[..]) };
             if !b.is_empty() && b.data_bytes() + e.size() > limit {
-                let full = std::mem::replace(&mut b, PageBuilder::new(self.next_page_id.fetch_add(1, Relaxed)));
+                let next = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
+                let full = std::mem::replace(&mut b, next);
                 batches.push(Arc::new(DataPage::unwritten(full.finish(bits))));
             }
             b.push(e);

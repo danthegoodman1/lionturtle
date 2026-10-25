@@ -560,10 +560,16 @@ impl PageBuilder {
         let mut crc = crc32c::crc32c(&self.buf[meta_off..footer_start + 4]);
         crc = crc32c::crc32c_append(crc, &self.buf[footer_start + 8..]);
         self.buf[footer_start + 4..footer_start + 8].copy_from_slice(&crc.to_le_bytes());
-        // Builders reserve generously; give the slack back before the image
-        // is pinned or cached for a long time.
-        self.buf.shrink_to_fit();
-        let bytes = Bytes::from(self.buf);
+        // The image may stay pinned or cached for a long time, so it must not
+        // keep much slack. `shrink_to_fit` cannot guarantee that: mimalloc
+        // keeps a block in place when shrinking it by less than half, so a
+        // 4.1 MB page that outgrew a 4 MiB buffer would hold 8 MiB. A copy
+        // into an exact allocation can.
+        let bytes = if self.buf.capacity() - self.buf.len() > self.buf.len() / 16 {
+            Bytes::copy_from_slice(&self.buf)
+        } else {
+            Bytes::from(self.buf)
+        };
         let meta = PageMeta::decode(bytes.slice(meta_off..), self.id).expect("fresh page decodes");
         PageImage { bytes, meta }
     }
