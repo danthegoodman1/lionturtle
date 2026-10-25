@@ -8,6 +8,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 
 - [What sets it apart](#what-sets-it-apart)
 - [Performance](#performance)
+  - [On EC2 at 400M records](#on-ec2-at-400m-records)
   - [Where it wins and where it pays](#where-it-wins-and-where-it-pays)
   - [Synchronous writes](#synchronous-writes)
   - [How the benchmark is run](#how-the-benchmark-is-run)
@@ -48,6 +49,24 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 
 Read p99 on workload C was 81 µs for turtlekv-rs, 151 µs for RocksDB and 160 µs for fjall. Scan p50 on E was 25, 28 and 87 µs. The machine was an Intel Core Ultra 9 285 (24 cores) with one NVMe drive on ext4.
 
+### On EC2 at 400M records
+
+400M records (51 GB of user data) on i7ie.48xlarge (192 vCPUs, 16 NVMe drives in RAID 0 under XFS), under a 16 GB memory cap that covers page cache. Every engine got a 4 GB block cache, 128 MiB memtables and 32 client threads; RocksDB loaded with 8, its fastest.
+
+| Workload (thousand ops/s) | turtlekv-rs | RocksDB | fjall | vs RocksDB |
+|---|--:|--:|--:|--:|
+| Load (inserts) | 550 | 473 | 311 | 1.16× |
+| A: 50% read, 50% update | 487 | 296 | 180 | 1.65× |
+| B: 95% read, 5% update | 467 | 399 | 357 | 1.17× |
+| C: 100% read | 446 | 379 | 354 | 1.18× |
+| E: 95% scan of up to 100 keys, 5% insert | 94 | 84 | 40 | 1.13× |
+| F: 50% read, 50% read-modify-write | 298 | 227 | 143 | 1.31× |
+| Write amplification during load | 9.0 | 13.5 | 15.5 | |
+| Disk after load (GB) | 63.9 | 55.8 | 55.4 | |
+| RSS during reads (GB) | 7.0 | 6.0 | 6.6 | |
+
+Reads at this scale wait on the drives: read p99 on C was 550 µs for turtlekv-rs, 577 µs for RocksDB and 588 µs for fjall. Scan p50 on E was 63, 50 and 499 µs. turtlekv-rs ran on a second instance of the same type. In a separate test on one instance, with the page cache dropped before each run, E ran at 101 thousand scans per second for turtlekv-rs and 73 for RocksDB, three runs each.
+
 ### Where it wins and where it pays
 
 - **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. Loads lead by 1.43×, and the mixed workloads A and F by 1.25–1.38×.
@@ -57,7 +76,7 @@ Read p99 on workload C was 81 µs for turtlekv-rs, 151 µs for RocksDB and 160 �
 
 ### Synchronous writes
 
-`write(.., true)` returns once its batch is durable. Synchronous writers share fsyncs: one writer at a time writes every buffered record in one direct write and fsyncs, and the others return when an fsync covers them. The log bypasses the page cache and writes over retired segments, so an fsync has no dirty pages to write back and no file size to journal.
+`write(.., true)` returns once its batch is durable. Synchronous writers share syncs: one writer at a time writes every buffered record in one direct write and makes it durable, and the others return when a sync covers them. When every earlier log write is already durable, that write is one `pwritev2` with `RWF_DSYNC`; otherwise it is a write and an fsync. The log bypasses the page cache and writes over retired segments, so a sync has no dirty pages to write back and no file size to journal.
 
 Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB memtables, background work finished first):
 
@@ -66,13 +85,15 @@ Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB m
 | Workstation NVMe, 1 | 0.5 | 0.2 | 0.5 | 0.5 |
 | Workstation NVMe, 16 | 3.9 | 2.0 | 3.6 | 0.4 |
 | Workstation NVMe, 64 | 15.0 | 6.5 | 11.5 | 0.4 |
-| EC2 instance store, 1 | 13.8 | 2.3 | 10.9 | 19.0 |
-| EC2 instance store, 16 | 36.9 | 13.6 | 24.6 | 7.8 |
-| EC2 instance store, 64 | 38.2 | 27.7 | 42.8 | 3.8 |
+| EC2 instance store, 1 | 35.3 | 11.5 | 30.2 | 29.9 |
+| EC2 instance store, 16 | 164.4 | 75.4 | 143.3 | 26.5 |
+| EC2 instance store, 64 | 274.2 | 192.7 | 295.6 | 19.1 |
 
-The workstation drive (ext4) has a volatile write cache, so every fsync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 26 µs at the median for every engine. One-thread EC2 figures are medians of three runs; the drives' 400 µs tail moves single runs by up to 40%. fjall persists its journal once per writer, without grouping.
+The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 28 µs on average for turtlekv-rs on one thread. fjall persists its journal once per writer, without grouping.
 
-Power-loss protection needs no setting. Linux reads each drive's cache mode from `/sys/block/<drive>/queue/write_cache` and skips flushes on `write through`. A drive with power-loss protection that reports `write back` still gets flushes, which such drives finish quickly; writing `write through` to that file stops them, and is safe only when the cache really survives power loss.
+The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit, and with it enabled, a tenth or more of writes wake a CPU from it. Then every engine's one-thread mean rises to 50–110 µs, runs swing by 40%, and no engine passes 43 thousand per second at 16 or 64 threads. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
+
+Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cache mode from `/sys/block/<drive>/queue/write_cache` and skips flushes on `write through`. A drive with power-loss protection that reports `write back` still gets flushes, which such drives finish quickly; writing `write through` to that file stops them, and is safe only when the cache really survives power loss.
 
 ### How the benchmark is run
 
