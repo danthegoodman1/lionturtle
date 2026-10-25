@@ -1107,6 +1107,7 @@ impl Snapshot {
 /// make every result touch the reference count of a cached block, and
 /// threads scanning the same hot blocks contend on those counts.
 fn collect_scan(mut it: Forward, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+    it.tree.expect(limit);
     enum Part {
         Copied(usize, usize, usize),
         Shared(Bytes, Bytes),

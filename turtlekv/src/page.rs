@@ -172,6 +172,12 @@ impl PageMeta {
         &self.raw[off..off + len]
     }
 
+    /// Entries in block `i`.
+    pub fn block_items(&self, i: usize) -> usize {
+        let end = if i + 1 < self.n_blocks as usize { self.block(i + 1).first_item } else { self.n_items };
+        (end - self.block(i).first_item) as usize
+    }
+
     pub fn min_key(&self) -> &[u8] {
         self.block_first_key(0)
     }

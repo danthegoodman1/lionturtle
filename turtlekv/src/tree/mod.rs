@@ -1016,11 +1016,19 @@ pub struct TreeScan {
     merger: Option<Merger>,
     /// Start of the next leaf range, or `None` when this is the last one.
     next_start: Option<Bytes>,
+    /// Entries the caller expects to read, which decides how far ahead in
+    /// the leaf a cold range prefetches.
+    expected: usize,
 }
 
 impl TreeScan {
     pub fn new(root: Option<Subtree>, start: &[u8], end: Option<Bytes>) -> Self {
-        Self { root, end, merger: None, next_start: Some(Bytes::copy_from_slice(start)) }
+        Self { root, end, merger: None, next_start: Some(Bytes::copy_from_slice(start)), expected: usize::MAX }
+    }
+
+    /// Sets how many entries the caller expects to read.
+    pub fn expect(&mut self, entries: usize) {
+        self.expected = entries;
     }
 
     fn open_range(&mut self, io: &PageIo, start: Bytes) -> Result<()> {
@@ -1064,6 +1072,15 @@ impl TreeScan {
                 && let Some(b) = leaf.meta.find_block(leaf.meta.min_key().max(&start[..]))
             {
                 first_blocks.push((leaf, b));
+                // The leaf holds most of a range's entries, so a scan that
+                // expects more than about half a block likely reads the next.
+                let next = b + 1;
+                if next < leaf.meta.n_blocks as usize
+                    && self.expected > leaf.meta.block_items(b) / 2
+                    && hi.as_deref().is_none_or(|h| leaf.meta.block_first_key(next) < h)
+                {
+                    first_blocks.push((leaf, next));
+                }
             }
             io.prefetch(&first_blocks);
         }
