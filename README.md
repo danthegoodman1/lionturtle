@@ -36,6 +36,7 @@ cargo run --release --bin vopr -- --seed N --verbose  # replay one seed
 cargo run --release --bin simperf                     # deterministic WAF sweep over χ
 cargo run --release -p kvbench --features rocksdb -- --engine turtlekv --records 10000000
 cargo run --release -p kvbench --bin indexbench       # bbtree vs ART vs skip list
+cargo run --release -p turtlekv --example mem_footprint bbtree  # resident bytes per memtable entry
 ```
 
 ## Design notes
@@ -49,15 +50,21 @@ Checkpoint distance χ sets the memtable size in leaf-sized batches. Each
 frozen memtable becomes one checkpoint, so pages that later batches in the
 same checkpoint supersede are never written.
 
-Departures from the C++ code, chosen for simplicity:
+Departures from the C++ code:
 
-- Flushed data is tracked per segment as key intervals plus a clip range,
-  not as item-index filters. Pivot changes then never touch segment
-  metadata, and flushes need no page reads to update it.
-- Free space is never persisted. At open, every arena slot outside the
-  recovered tree is free. Later, a slot frees only when a newer checkpoint no
-  longer references it and every reader of older versions has finished.
-- Bloom filters and a sparse block index replace quotient filters and the
-  per-leaf trie.
-- The log, page arenas, and superblock are fsynced. The C++ code relies on
-  O_DIRECT completion alone.
+- Each buffered segment records its flushed keys as key intervals plus a
+  clip range, where the C++ code keeps item-index filters. Pivot changes
+  leave segment metadata alone, and flushes update it without reading pages.
+- Free space lives only in memory. At open, every arena slot outside the
+  recovered tree is free. Later, a slot frees once a newer checkpoint drops
+  it and every reader of older versions has finished; the commit stage then
+  punches a hole over the slot, returning its space to the file system.
+- Bloom filters and a sparse block index stand in for quotient filters and
+  the per-leaf trie.
+- The log, page arenas, and superblock are fsynced, where the C++ code
+  relies on O_DIRECT completion. Each page write starts device writeback at
+  once, so the commit's fsync has little left to flush.
+- Writers encode and checksum log records before taking the writer lock;
+  each record carries its sequence number last, so the lock only appends it.
+- Nodes default to 4 buffer levels: scans and point reads gain more than
+  write amplification loses at this depth.
