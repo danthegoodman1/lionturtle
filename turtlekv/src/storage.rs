@@ -11,9 +11,19 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Alignment of offsets, lengths and buffers for writes to a file opened
+/// with [`Storage::open_direct`].
+pub const DIRECT_ALIGN: usize = 4096;
+
 pub trait Storage: Send + Sync {
     /// Opens `name`, creating an empty file when `create` is set and none exists.
     fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>>;
+    /// Opens `name` for writes that bypass the page cache. Every write's
+    /// offset, length and buffer address must be multiples of
+    /// [`DIRECT_ALIGN`].
+    fn open_direct(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
+        self.open(name, create)
+    }
     fn remove(&self, name: &str) -> io::Result<()>;
     /// Renames `from` to `to`, replacing any file named `to`.
     fn rename(&self, from: &str, to: &str) -> io::Result<()>;
@@ -64,6 +74,23 @@ impl Storage for FsStorage {
             .truncate(false)
             .open(self.dir.join(name))?;
         Ok(Arc::new(FsFile(file)))
+    }
+
+    /// Opens with O_DIRECT, or buffered on a file system without it.
+    fn open_direct(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let opened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .custom_flags(libc::O_DIRECT)
+            .open(self.dir.join(name));
+        match opened {
+            Ok(file) => Ok(Arc::new(FsFile(file))),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => self.open(name, create),
+            Err(e) => Err(e),
+        }
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {

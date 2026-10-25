@@ -9,6 +9,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 - [What sets it apart](#what-sets-it-apart)
 - [Performance](#performance)
   - [Where it wins and where it pays](#where-it-wins-and-where-it-pays)
+  - [Synchronous writes](#synchronous-writes)
   - [How the benchmark is run](#how-the-benchmark-is-run)
 - [Behavior compared with RocksDB and fjall](#behavior-compared-with-rocksdb-and-fjall)
 - [Differences from the C++ TurtleKV](#differences-from-the-c-turtlekv)
@@ -54,6 +55,25 @@ Read p99 on workload C was 81 µs for turtlekv-rs, 151 µs for RocksDB and 160 �
 - **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs.
 - **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap.
 
+### Synchronous writes
+
+`write(.., true)` returns once its batch is durable. Synchronous writers share fsyncs: one writer at a time writes every buffered record in one direct write and fsyncs, and the others return when an fsync covers them. The log bypasses the page cache and writes over retired segments, so an fsync has no dirty pages to write back and no file size to journal.
+
+Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB memtables, background work finished first):
+
+| Client threads | turtlekv-rs | RocksDB | RocksDB, recycled logs | fjall |
+|---|--:|--:|--:|--:|
+| Workstation NVMe, 1 | 0.5 | 0.2 | 0.5 | 0.5 |
+| Workstation NVMe, 16 | 3.9 | 2.0 | 3.6 | 0.4 |
+| Workstation NVMe, 64 | 15.0 | 6.5 | 11.5 | 0.4 |
+| EC2 instance store, 1 | 13.8 | 2.3 | 10.9 | 19.0 |
+| EC2 instance store, 16 | 36.9 | 13.6 | 24.6 | 7.8 |
+| EC2 instance store, 64 | 38.2 | 27.7 | 42.8 | 3.8 |
+
+The workstation drive (ext4) has a volatile write cache, so every fsync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 26 µs at the median for every engine. One-thread EC2 figures are medians of three runs; the drives' 400 µs tail moves single runs by up to 40%. fjall persists its journal once per writer, without grouping.
+
+Power-loss protection needs no setting. Linux reads each drive's cache mode from `/sys/block/<drive>/queue/write_cache` and skips flushes on `write through`. A drive with power-loss protection that reports `write back` still gets flushes, which such drives finish quickly; writing `write through` to that file stops them, and is safe only when the cache really survives power loss.
+
 ### How the benchmark is run
 
 `kvbench` drives every engine with the same keys, values, operation mix, operation counts and client threads.
@@ -88,7 +108,7 @@ Each phase prints one JSON line with throughput, latency percentiles, bytes read
 | Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while one frozen memtable awaits its checkpoint | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 
-- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Concurrent synchronous writers share fsyncs: one covers every record written before it began. Retired log segments are reused, so a log fsync writes data and no file-size metadata. RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
+- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused; see [Synchronous writes](#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
 - **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
@@ -99,7 +119,7 @@ turtlekv-rs follows the C++ TurtleTree: buffer levels that fill like a binary co
 
 - **Filters and indexes.** Bloom filters and a sparse block index replace quotient filters and the per-leaf trie.
 - **Flushed keys.** Each buffered segment records the keys flushed out of it as key intervals plus a clip range. Pivot changes leave segment metadata alone, and flushes update it without reading pages.
-- **Durability.** The log, page arenas and superblock are fsynced. The C++ code counts O_DIRECT write completion as durable, which holds only on drives whose write cache survives power loss. Here the kernel decides per drive: on one that reports a write-through cache, as drives with power-loss protection and EC2 instance store do, fsync sends no cache flush.
+- **Durability.** Both write the log with O_DIRECT. The C++ code counts write completion as durable, which holds only on drives whose write cache survives power loss. Here the log, page arenas and superblock are fsynced, and the kernel decides per drive whether that flushes a cache: on one that reports a write-through cache, as drives with power-loss protection and EC2 instance store do, it does not.
 - **Free space.** Free space lives in memory and is rebuilt at open by walking the recovered tree. A freed slot is hole-punched before reuse, returning its space to the file system.
 - **Atomic visibility.** Memtables keep version chains, and batches commit independently, so readers see whole batches and iterators are snapshots.
 - **Defaults.** 4 MiB leaves, 4 buffer levels and a fixed checkpoint distance of 32 leaves (128 MiB). The paper used 32 MB leaves and tuned checkpoint distance per workload.

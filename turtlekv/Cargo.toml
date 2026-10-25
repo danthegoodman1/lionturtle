@@ -15,6 +15,7 @@ crc32c = "0.6"
 crossbeam-skiplist = "0.1"
 libc = "0.2"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
+parking_lot_core = "0.9"
 quick_cache = "0.6"
 rayon = "1.10"
 thiserror = "2"

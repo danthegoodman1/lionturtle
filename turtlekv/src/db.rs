@@ -600,12 +600,11 @@ impl Db {
     /// Makes every completed write durable.
     pub fn sync(&self) -> Result<()> {
         self.inner.check_poisoned()?;
-        let (flush, log_sync, end) = {
-            let mut w = self.inner.writer.lock();
-            let flush = (w.wal.buffered() > 0).then(|| w.wal.start_flush());
-            (flush, w.wal.log_sync(), w.wal.len())
+        let (log, end) = {
+            let w = self.inner.writer.lock();
+            (w.wal.log(), w.wal.len())
         };
-        let r = flush.map_or(Ok(()), |f| f.write()).and_then(|()| log_sync.sync_to(end));
+        let r = log.sync_to(end);
         self.inner.poison_on_err(r)
     }
 
@@ -796,13 +795,13 @@ impl Inner {
                 w.wal.append_body(body, seq);
                 w.user_bytes += user_bytes;
                 w.wal_bytes += body.record_len() as u64;
-                // A synchronous writer writes and syncs after releasing the
-                // lock, sharing its fsync with writers that arrive meanwhile.
+                // A synchronous writer syncs after releasing the lock,
+                // sharing a write and fsync with writers that arrive
+                // meanwhile.
                 let mut flush = None;
                 let mut sync_to = None;
                 if sync {
-                    flush = Some(w.wal.start_flush());
-                    sync_to = Some((w.wal.log_sync(), w.wal.len()));
+                    sync_to = Some((w.wal.log(), w.wal.len()));
                 } else if w.wal.buffered() >= self.opts.wal_buffer_bytes {
                     flush = Some(w.wal.start_flush());
                 }
@@ -817,7 +816,7 @@ impl Inner {
             // A synchronous batch becomes visible once it is durable.
             let flushed = flush
                 .map_or(Ok(()), |f| f.write())
-                .and_then(|()| sync_to.map_or(Ok(()), |(log_sync, end)| log_sync.sync_to(end)));
+                .and_then(|()| sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
             for (i, op) in ops.into_iter().enumerate() {
                 mem.table.insert(&op.key, op.value, seq + i as u64, ticket);
             }

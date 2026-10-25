@@ -264,8 +264,8 @@ impl SimStorage {
     }
 }
 
-impl Storage for SimStorage {
-    fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
+impl SimStorage {
+    fn open_file(&self, name: &str, create: bool, direct: bool) -> io::Result<Arc<dyn File>> {
         let mut state = self.state.lock();
         let generation = state.generation;
         state.check_up(generation)?;
@@ -287,7 +287,20 @@ impl Storage for SimStorage {
             ino,
             generation,
             class: class_of(name),
+            direct,
         }))
+    }
+}
+
+impl Storage for SimStorage {
+    fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
+        self.open_file(name, create, false)
+    }
+
+    /// Like `open`, but writes must be aligned as for O_DIRECT; a misaligned
+    /// one panics, since the real call would fail on every run.
+    fn open_direct(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
+        self.open_file(name, create, true)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -338,6 +351,8 @@ struct SimFile {
     ino: u64,
     generation: u64,
     class: String,
+    /// Opened with `open_direct`.
+    direct: bool,
 }
 
 impl File for SimFile {
@@ -371,6 +386,14 @@ impl File for SimFile {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        if self.direct {
+            let align = crate::storage::DIRECT_ALIGN;
+            assert!(
+                offset as usize % align == 0 && buf.len() % align == 0 && buf.as_ptr() as usize % align == 0,
+                "misaligned direct write: {} bytes at {offset}",
+                buf.len()
+            );
+        }
         let mut guard = self.state.lock();
         let state = &mut *guard;
         state.check_up(self.generation)?;

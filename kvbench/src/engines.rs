@@ -15,7 +15,8 @@ pub trait Engine: Send + Sync {
     fn stats_json(&self) -> String {
         "{}".into()
     }
-    /// Finishes background work the writes so far started.
+    /// Finishes background work the writes so far started: turtlekv-rs
+    /// checkpoints its memtables, and the LSM engines flush and compact fully.
     fn settle(&self) {}
 }
 
@@ -143,6 +144,11 @@ impl Engine for Fjall {
         }
     }
 
+    fn settle(&self) {
+        self.ks.rotate_memtable_and_wait().unwrap();
+        self.ks.major_compact().unwrap();
+    }
+
     fn get(&self, key: &[u8]) -> Option<usize> {
         self.ks.get(key).unwrap().map(|v| v.len())
     }
@@ -194,6 +200,11 @@ impl Engine for Rocks {
         let mut wo = rocksdb::WriteOptions::default();
         wo.set_sync(sync);
         self.db.put_opt(key, value, &wo).unwrap();
+    }
+
+    fn settle(&self) {
+        self.db.flush().unwrap();
+        self.db.compact_range::<&[u8], &[u8]>(None, None);
     }
 
     fn get(&self, key: &[u8]) -> Option<usize> {
