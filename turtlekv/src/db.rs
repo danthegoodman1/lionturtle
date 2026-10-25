@@ -214,6 +214,7 @@ struct Applier {
 struct Applied {
     mem: Arc<Mem>,
     root: Option<Subtree>,
+    created_files: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -366,8 +367,8 @@ impl Db {
             timing: Timing::default(),
             opts,
         });
-        // Two pipeline stages: one thread applies the next frozen memtable
-        // while the other writes, syncs, and commits the last one.
+        // Two pipeline stages, as in the paper: one thread applies the next
+        // frozen memtable while the other syncs and commits the last one.
         let mut workers = Vec::new();
         if inner.opts.background {
             for (name, stage) in [("turtlekv-apply", Stage::Apply), ("turtlekv-commit", Stage::Commit)] {
@@ -558,7 +559,7 @@ impl Db {
         let mut expected = durable.live.clone();
         for a in inner.pending.lock().iter() {
             if let Some(r) = &a.root {
-                tree::reachable_written(r, &mut expected);
+                tree::reachable(r, &mut expected);
             }
         }
         let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
@@ -783,8 +784,8 @@ impl Inner {
         r
     }
 
-    /// Applies the oldest unapplied frozen memtable to the newest tree,
-    /// leaving its pages for the committer to write.
+    /// Applies the oldest unapplied frozen memtable to the newest tree and
+    /// writes the resulting pages, leaving the checkpoint for the committer.
     fn apply_step(&self) -> Result<bool> {
         self.check_poisoned()?;
         let mut applier = self.applier.lock();
@@ -804,9 +805,15 @@ impl Inner {
             root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
         }
         self.timing.apply_ns.fetch_add(since(t), Relaxed);
+        let t = std::time::Instant::now();
+        let created_files = match &root {
+            Some(r) => tree::write_tree(&ctx, r)?,
+            None => false,
+        };
+        self.timing.write_ns.fetch_add(since(t), Relaxed);
         applier.root = root.clone();
         applier.last_applied = mem.id;
-        self.pending.lock().push_back(Applied { mem, root });
+        self.pending.lock().push_back(Applied { mem, root, created_files });
         Ok(true)
     }
 
@@ -815,19 +822,9 @@ impl Inner {
     fn commit_step(&self) -> Result<bool> {
         self.check_poisoned()?;
         let mut durable = self.durable.lock();
-        let Some(Applied { mem, root }) = self.pending.lock().pop_front() else {
+        let Some(Applied { mem, root, created_files }) = self.pending.lock().pop_front() else {
             return Ok(false);
         };
-        // Writing here rather than in the apply stage overlaps this
-        // checkpoint's page writes, and the device writeback they start, with
-        // the next checkpoint's merges.
-        let t = std::time::Instant::now();
-        let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
-        let created_files = match &root {
-            Some(r) => tree::write_tree(&ctx, r)?,
-            None => false,
-        };
-        self.timing.write_ns.fetch_add(since(t), Relaxed);
         let t = std::time::Instant::now();
         self.io.store.sync()?;
         if created_files {

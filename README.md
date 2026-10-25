@@ -19,7 +19,7 @@ against fjall and RocksDB.
   - `tree/` — the TurtleTree: buffer levels, flushes, splits and merges,
     queries, scans, and checkpoint serialization.
   - `db.rs` — the store: write path, memtable rotation, the two-stage
-    checkpoint pipeline (apply, then write, sync, and commit), recovery, and
+    checkpoint pipeline (apply, then sync and commit), recovery, and
     epoch-deferred page reclamation.
   - `sim/` — deterministic simulation: a seeded PRNG, a simulated disk with
     crash and fault semantics, the VOPR driver, and a deterministic
