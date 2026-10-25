@@ -71,5 +71,6 @@ fn main() {
         written as f64 / user as f64,
         tree::stats(root.as_ref().unwrap())
     );
+    println!("apply profile (pending, insert, extract, leaf, reshape): {:?}", tree::profile::snapshot());
     let _ = std::fs::remove_dir_all(dir);
 }

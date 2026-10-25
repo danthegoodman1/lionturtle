@@ -166,6 +166,20 @@ struct Durable {
     epoch: Arc<Epoch>,
 }
 
+/// The applier's view: the newest tree, which may be ahead of the committed
+/// one by checkpoints still waiting to commit.
+struct Applier {
+    root: Option<Subtree>,
+    last_applied: u64,
+}
+
+/// A checkpoint whose pages are written but not yet synced and committed.
+struct Applied {
+    mem: Arc<Mem>,
+    root: Option<Subtree>,
+    created_files: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DbStats {
     pub checkpoints: u64,
@@ -201,6 +215,8 @@ struct Inner {
     signal_lock: Mutex<()>,
     signal: Condvar,
     durable: Mutex<Durable>,
+    applier: Mutex<Applier>,
+    pending: Mutex<VecDeque<Applied>>,
     poisoned: AtomicBool,
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
@@ -227,7 +243,7 @@ fn since(t: std::time::Instant) -> u64 {
 
 pub struct Db {
     inner: Arc<Inner>,
-    worker: Option<JoinHandle<()>>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl Db {
@@ -296,6 +312,7 @@ impl Db {
         let wal = WalWriter::create(&*storage, active_id)?;
         let active = Arc::new(Mem::new(active_id, opts.memtable, last_seq));
         let epoch = Arc::new(Epoch::new(io.clone()));
+        let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
         let version = Version { active: active.clone(), frozen, tree: root, _epoch: epoch.clone() };
         let inner = Arc::new(Inner {
             storage,
@@ -307,6 +324,8 @@ impl Db {
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
+            applier: Mutex::new(applier),
+            pending: Mutex::new(VecDeque::new()),
             poisoned: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
@@ -315,14 +334,21 @@ impl Db {
             timing: Timing::default(),
             opts,
         });
-        let worker = inner.opts.background.then(|| {
-            let inner = inner.clone();
-            std::thread::Builder::new()
-                .name("turtlekv-checkpoint".into())
-                .spawn(move || inner.checkpoint_loop())
-                .expect("spawn checkpoint thread")
-        });
-        Ok(Self { inner, worker })
+        // Two pipeline stages, as in the paper: one thread applies the next
+        // frozen memtable while the other syncs and commits the last one.
+        let mut workers = Vec::new();
+        if inner.opts.background {
+            for (name, stage) in [("turtlekv-apply", Stage::Apply), ("turtlekv-commit", Stage::Commit)] {
+                let inner = inner.clone();
+                workers.push(
+                    std::thread::Builder::new()
+                        .name(name.into())
+                        .spawn(move || inner.stage_loop(stage))
+                        .expect("spawn checkpoint thread"),
+                );
+            }
+        }
+        Ok(Self { inner, workers })
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -396,8 +422,10 @@ impl Db {
         }
     }
 
-    /// Checkpoints the oldest frozen memtable, if any. For callers that run
-    /// without a background thread.
+    /// Advances the checkpoint pipeline by one stage: commits an applied
+    /// checkpoint if one is waiting, or else applies the oldest unapplied
+    /// frozen memtable. Returns false if there was nothing to do. For callers
+    /// that run without background threads.
     pub fn checkpoint_step(&self) -> Result<bool> {
         self.inner.checkpoint_step()
     }
@@ -463,7 +491,13 @@ impl Db {
         }
         let durable = inner.durable.lock();
         let allocated: HashSet<(u8, u32)> = inner.io.store.allocated().into_iter().collect();
-        let live: HashSet<(u8, u32)> = durable.live.iter().map(|p| (p.class, p.slot)).collect();
+        let mut expected = durable.live.clone();
+        for a in inner.pending.lock().iter() {
+            if let Some(r) = &a.root {
+                tree::reachable(r, &mut expected);
+            }
+        }
+        let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
         assert!(live.is_subset(&allocated), "a live page is not allocated");
         if Arc::strong_count(&v) <= 2 {
             // No reader pins an older version, so no garbage awaits release.
@@ -481,7 +515,7 @@ impl Drop for Db {
             let _g = self.inner.signal_lock.lock();
             self.inner.signal.notify_all();
         }
-        if let Some(w) = self.worker.take() {
+        for w in self.workers.drain(..) {
             let _ = w.join();
         }
         if !self.inner.poisoned.load(SeqCst) {
@@ -609,24 +643,44 @@ impl Inner {
         }
     }
 
-    fn checkpoint_loop(self: Arc<Self>) {
+    /// Runs one pipeline stage until shutdown or failure.
+    fn stage_loop(self: Arc<Self>, stage: Stage) {
         loop {
             {
                 let mut g = self.signal_lock.lock();
-                while self.version.load().frozen.is_empty()
-                    && !self.shutdown.load(SeqCst)
-                    && !self.poisoned.load(SeqCst)
-                {
+                while !self.stage_ready(stage) && !self.shutdown.load(SeqCst) && !self.poisoned.load(SeqCst) {
                     self.signal.wait(&mut g);
                 }
             }
             if self.shutdown.load(SeqCst) || self.poisoned.load(SeqCst) {
                 return;
             }
-            if self.checkpoint_step().is_err() {
+            let r = match stage {
+                Stage::Apply => self.apply_step(),
+                Stage::Commit => self.commit_step(),
+            };
+            if self.poison_on_err(r).is_err() {
                 return;
             }
+            self.notify();
         }
+    }
+
+    fn stage_ready(&self, stage: Stage) -> bool {
+        match stage {
+            // Apply ahead of the committer by at most one checkpoint.
+            Stage::Apply => {
+                let idle = self.pending.lock().is_empty();
+                idle && self.next_to_apply().is_some()
+            }
+            Stage::Commit => !self.pending.lock().is_empty(),
+        }
+    }
+
+    /// The oldest frozen memtable not yet applied.
+    fn next_to_apply(&self) -> Option<Arc<Mem>> {
+        let last = self.applier.lock().last_applied;
+        self.version.load().frozen.iter().rev().find(|m| m.id > last).cloned()
     }
 
     /// Cuts a frozen memtable into sorted batches of about one leaf each.
@@ -650,21 +704,25 @@ impl Inner {
     }
 
     fn checkpoint_step(&self) -> Result<bool> {
-        let r = self.checkpoint_inner();
-        self.poison_on_err(r)
+        let r = if !self.pending.lock().is_empty() { self.commit_step() } else { self.apply_step() };
+        let r = self.poison_on_err(r);
+        self.notify();
+        r
     }
 
-    fn checkpoint_inner(&self) -> Result<bool> {
+    /// Applies the oldest unapplied frozen memtable to the newest tree and
+    /// writes the resulting pages, leaving the checkpoint for the committer.
+    fn apply_step(&self) -> Result<bool> {
         self.check_poisoned()?;
-        let mut durable = self.durable.lock();
-        let v = self.version.load_full();
-        let Some(mem) = v.frozen.last().cloned() else { return Ok(false) };
+        let mut applier = self.applier.lock();
+        let Some(mem) = self.version.load().frozen.iter().rev().find(|m| m.id > applier.last_applied).cloned() else {
+            return Ok(false);
+        };
         while mem.inflight.load(SeqCst) > 0 {
             std::thread::yield_now();
         }
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
-        let mut root = v.tree.clone();
-        drop(v);
+        let mut root = applier.root.clone();
         let t = std::time::Instant::now();
         let batches = self.build_batches(&mem);
         self.timing.build_ns.fetch_add(since(t), Relaxed);
@@ -674,14 +732,28 @@ impl Inner {
         }
         self.timing.apply_ns.fetch_add(since(t), Relaxed);
         let t = std::time::Instant::now();
-        let created = match &root {
+        let created_files = match &root {
             Some(r) => tree::write_tree(&ctx, r)?,
             None => false,
         };
         self.timing.write_ns.fetch_add(since(t), Relaxed);
+        applier.root = root.clone();
+        applier.last_applied = mem.id;
+        self.pending.lock().push_back(Applied { mem, root, created_files });
+        Ok(true)
+    }
+
+    /// Makes the oldest applied checkpoint durable, commits it, and swaps it
+    /// into the read path in place of its memtable.
+    fn commit_step(&self) -> Result<bool> {
+        self.check_poisoned()?;
+        let mut durable = self.durable.lock();
+        let Some(Applied { mem, root, created_files }) = self.pending.lock().pop_front() else {
+            return Ok(false);
+        };
         let t = std::time::Instant::now();
         self.io.store.sync()?;
-        if created {
+        if created_files {
             self.storage.sync_dir()?;
         }
         self.timing.sync_ns.fetch_add(since(t), Relaxed);
@@ -718,7 +790,6 @@ impl Inner {
         drop(durable);
         self.timing.commit_ns.fetch_add(since(t), Relaxed);
         self.checkpoints.fetch_add(1, Relaxed);
-        self.notify();
         for id in wal::list_segments(&*self.storage)? {
             if id <= mem.id {
                 self.storage.remove(&wal::segment_name(id))?;
@@ -726,6 +797,12 @@ impl Inner {
         }
         Ok(true)
     }
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Apply,
+    Commit,
 }
 
 /// A merged iterator over the memtables and the tree of one version.

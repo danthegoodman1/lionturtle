@@ -29,7 +29,11 @@ impl std::fmt::Debug for DataPage {
 
 impl DataPage {
     pub fn unwritten(image: PageImage) -> Self {
-        Self { meta: image.meta, ptr: OnceLock::new(), pinned: Mutex::new(Some(image.bytes)) }
+        // The metadata outlives the pinned image, so it must not share the
+        // image's allocation.
+        let mut meta = image.meta;
+        meta.detach();
+        Self { meta, ptr: OnceLock::new(), pinned: Mutex::new(Some(image.bytes)) }
     }
 
     pub fn written(meta: PageMeta, ptr: PagePtr) -> Self {

@@ -34,7 +34,7 @@ use bytes::Bytes;
 use codec::{Reader, put_bytes};
 use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source};
 use io::{DataPage, PageIo};
-use ranges::{KeyRanges, successor};
+use ranges::KeyRanges;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -67,6 +67,27 @@ impl Default for TreeConfig {
             merge_readahead: 1 << 20,
             parallel: true,
         }
+    }
+}
+
+/// Cumulative nanoseconds in the main steps of `apply_batch`, for tuning.
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static PENDING: AtomicU64 = AtomicU64::new(0);
+    pub static INSERT: AtomicU64 = AtomicU64::new(0);
+    pub static EXTRACT: AtomicU64 = AtomicU64::new(0);
+    pub static LEAF: AtomicU64 = AtomicU64::new(0);
+    pub static RESHAPE: AtomicU64 = AtomicU64::new(0);
+
+    pub fn add(counter: &AtomicU64, since: std::time::Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    /// Seconds in: pending-byte accounting, buffer inserts, flush
+    /// extraction, leaf merges, and splits/merges of nodes.
+    pub fn snapshot() -> [f64; 5] {
+        [&PENDING, &INSERT, &EXTRACT, &LEAF, &RESHAPE].map(|c| c.load(Relaxed) as f64 / 1e9)
     }
 }
 
@@ -271,10 +292,14 @@ enum Run<'a> {
 }
 
 impl Run<'_> {
-    fn bytes(&self) -> u64 {
+    /// Estimated bytes in `[lo, hi)`.
+    fn bytes_in(&self, lo: &[u8], hi: Option<&[u8]>) -> u64 {
         match self {
-            Run::Page(p) => p.data_bytes(),
-            Run::Level(l) => l.iter().map(|s| s.page.data_bytes()).sum(),
+            Run::Page(p) => p.meta.estimate_bytes(lo, hi),
+            Run::Level(l) => {
+                let segs: Vec<&Segment> = l.iter().filter(|s| s.overlaps(lo, hi)).collect();
+                buffered_bytes(&segs, lo, hi)
+            }
         }
     }
 
@@ -321,11 +346,15 @@ impl Run<'_> {
 /// pieces, merged in parallel when configured.
 fn merge_runs(ctx: &Ctx, runs: &[Run], lo: &[u8], hi: Option<&[u8]>, drop_tombstones: bool) -> Result<Vec<Arc<DataPage>>> {
     let limit = ctx.cfg.leaf_size;
-    let total: u64 = runs.iter().map(Run::bytes).sum();
+    let sizes: Vec<u64> = runs.iter().map(|r| r.bytes_in(lo, hi)).collect();
+    let total: u64 = sizes.iter().sum();
     let mut cuts = Vec::new();
-    if ctx.cfg.parallel && total > 2 * limit {
-        let largest = runs.iter().max_by_key(|r| r.bytes()).unwrap();
-        largest.split_keys(lo, hi, limit, &mut cuts);
+    let chunks = total.div_ceil(limit);
+    if ctx.cfg.parallel && chunks > 1 {
+        // Cut the largest run into equal pieces; the others, sharing its key
+        // distribution, divide in about the same proportion.
+        let (largest, size) = runs.iter().zip(&sizes).max_by_key(|(_, s)| **s).unwrap();
+        largest.split_keys(lo, hi, size.div_ceil(chunks).max(1), &mut cuts);
     }
     let mut ranges: Vec<(Bytes, Option<Bytes>)> = Vec::with_capacity(cuts.len() + 1);
     let mut start = Bytes::copy_from_slice(lo);
@@ -346,10 +375,14 @@ fn merge_runs(ctx: &Ctx, runs: &[Run], lo: &[u8], hi: Option<&[u8]>, drop_tombst
     Ok(parts.into_iter().flatten().collect())
 }
 
+/// A sorted run of pages with disjoint key ranges, applied to a node or
+/// leaf as one unit.
+type Batch = Vec<Segment>;
+
 /// Merges `batch` into a leaf (or into nothing), dropping tombstones, and
 /// splits the result into balanced leaves.
-fn leaf_apply(ctx: &Ctx, leaf: Option<&Arc<DataPage>>, batch: &Arc<DataPage>) -> Result<Vec<Arc<DataPage>>> {
-    let mut runs = vec![Run::Page(batch)];
+fn leaf_apply(ctx: &Ctx, leaf: Option<&Arc<DataPage>>, batch: &[Segment]) -> Result<Vec<Arc<DataPage>>> {
+    let mut runs = vec![Run::Level(batch)];
     if let Some(leaf) = leaf {
         runs.push(Run::Page(leaf));
     }
@@ -367,33 +400,35 @@ fn leaf_pieces(pages: Vec<Arc<DataPage>>, lo: &Bytes) -> Vec<Piece> {
         .collect()
 }
 
-/// Adds each pivot's share of `batch` to its pending bytes.
-fn add_pending(ctx: &Ctx, node: &mut Node, batch: &Arc<DataPage>) -> Result<()> {
-    let mut c = PageCursor::new(ctx.io, batch.clone(), b"", None, KeyRanges::new(), ctx.merge_mode())?;
-    let mut p = 0;
-    while let Some(e) = c.peek() {
-        while node.pivots.get(p + 1).is_some_and(|next| e.key >= &next[..]) {
-            p += 1;
+/// Adds each pivot's share of `batch` to its pending bytes, estimated from
+/// the batch pages' block indexes.
+fn add_pending(node: &mut Node, batch: &[Segment]) {
+    for seg in batch {
+        let meta = &seg.page.meta;
+        if meta.n_items == 0 {
+            continue;
         }
-        node.pending[p] += e.size();
-        c.advance(ctx.io)?;
+        let first = node.find_pivot(meta.min_key());
+        let last = node.find_pivot(meta.max_key());
+        for p in first..=last {
+            node.pending[p] += meta.estimate_bytes(&node.pivots[p], node.pivot_hi(p).map(|h| &h[..]));
+        }
     }
-    Ok(())
 }
 
 /// Inserts `batch` as the newest run: it merges with the occupied prefix of
 /// levels and lands in the first empty level (or the last level, if all are
 /// occupied).
-fn buffer_insert(ctx: &Ctx, node: &mut Node, batch: Arc<DataPage>) -> Result<()> {
+fn buffer_insert(ctx: &Ctx, node: &mut Node, batch: Batch) -> Result<()> {
     let n = node.levels.len();
     let first_empty = node.levels.iter().position(Vec::is_empty).unwrap_or(n);
     if first_empty == 0 {
-        node.levels[0] = vec![Segment::whole(batch)];
+        node.levels[0] = batch;
         return Ok(());
     }
     let target = first_empty.min(n - 1);
     let merged_levels = if first_empty == n { n } else { first_empty };
-    let mut runs = vec![Run::Page(&batch)];
+    let mut runs = vec![Run::Level(&batch)];
     runs.extend(node.levels[..merged_levels].iter().map(|l| Run::Level(l)));
     let pages = merge_runs(ctx, &runs, b"", None, false)?;
     for level in &mut node.levels[..merged_levels] {
@@ -418,79 +453,108 @@ fn flush_if_necessary(ctx: &Ctx, node: &mut Node, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where a segment's live keys at or after `lo` begin, or `None` if it has
+/// none from there on.
+fn live_start<'a>(s: &'a Segment, lo: &'a [u8]) -> Option<&'a [u8]> {
+    let start = s.min_key().max(lo);
+    match s.dead.skip(start) {
+        Ok(None) => Some(start),
+        Ok(Some(next)) => Some(next),
+        Err(()) => None,
+    }
+}
+
+/// Estimated live bytes buffered in `[lo, hi)`. Keys flushed from the
+/// front of a segment's range are excluded; scattered dead keys are not.
+fn buffered_bytes(segs: &[&Segment], lo: &[u8], hi: Option<&[u8]>) -> u64 {
+    segs.iter()
+        .filter_map(|s| {
+            let lo = live_start(s, lo)?;
+            let hi = match (s.hi.as_deref(), hi) {
+                (None, h) | (h, None) => h,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
+            Some(if hi.is_some_and(|h| h <= lo) { 0 } else { s.page.meta.estimate_bytes(lo, hi) })
+        })
+        .sum()
+}
+
+/// The end of the smallest-keyed prefix of `[lo, hi)` that holds about
+/// `limit` buffered bytes, or `None` if the whole range holds less. The cut
+/// lies past the first live key position, so every flush makes progress.
+fn choose_cut(segs: &[&Segment], lo: &[u8], hi: Option<&[u8]>, limit: u64) -> Option<Bytes> {
+    if buffered_bytes(segs, lo, hi) <= limit {
+        return None;
+    }
+    let first_live = segs.iter().filter_map(|s| live_start(s, lo)).min()?;
+    let mut candidates: Vec<&[u8]> = Vec::new();
+    for s in segs {
+        let meta = &s.page.meta;
+        for b in meta.blocks_for_range(first_live, hi) {
+            let k = meta.block_first_key(b);
+            if k > first_live && hi.is_none_or(|h| k < h) {
+                candidates.push(k);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let fits = candidates.partition_point(|c| buffered_bytes(segs, lo, Some(c)) <= limit);
+    candidates.get(fits.saturating_sub(1)).map(|c| Bytes::copy_from_slice(c))
+}
+
 /// Moves the smallest-keyed leaf-sized prefix of pivot `p`'s buffered data
 /// into child `p`.
 fn flush_to_pivot(ctx: &Ctx, node: &mut Node, p: usize) -> Result<()> {
+    let t = std::time::Instant::now();
     let lo = node.pivots[p].clone();
     let hi = node.pivot_hi(p).cloned();
-    let limit = ctx.cfg.leaf_size;
+    let segs: Vec<&Segment> = node.levels.iter().flatten().filter(|s| s.overlaps(&lo, hi.as_deref())).collect();
+    let cut = choose_cut(&segs, &lo, hi.as_deref(), ctx.cfg.leaf_size);
+    let end = cut.as_ref().or(hi.as_ref()).map(|b| &b[..]);
+    let runs: Vec<Run> = node.levels.iter().map(|l| Run::Level(l)).collect();
+    let pages = merge_runs(ctx, &runs, &lo, end, false)?;
 
-    let mut sources: Vec<Source> = Vec::with_capacity(node.levels.len());
-    for level in &node.levels {
-        sources.push(Source::Level(LevelCursor::new(ctx.io, level, &lo, hi.as_deref(), ctx.merge_mode())?));
-    }
-    let mut merger = Merger::new(sources);
-    let mut b = PageBuilder::new(ctx.new_page_id());
-    while let Some(e) = merger.peek() {
-        if !b.is_empty() && b.data_bytes() + e.size() > limit {
-            break;
-        }
-        b.push(e);
-        merger.advance(ctx.io)?;
-    }
-    let level_has_more: Vec<bool> = (0..merger.source_count()).map(|i| merger.source_has_more(i)).collect();
-    drop(merger);
-
-    let cut = b.last_key().map(successor);
-    for (level, &more) in node.levels.iter_mut().zip(&level_has_more) {
-        let dead_hi = match (&cut, more) {
-            (Some(cut), true) => Some(cut.clone()),
-            _ => hi.clone(),
-        };
-        for seg in level.iter_mut() {
-            if seg.overlaps(&lo, hi.as_deref()) {
-                seg.dead.insert(lo.clone(), dead_hi.clone());
-            }
+    // Everything below the cut has moved to the child.
+    for seg in node.levels.iter_mut().flatten() {
+        if seg.overlaps(&lo, end) {
+            seg.dead.insert(lo.clone(), end.map(Bytes::copy_from_slice));
         }
     }
     node.remove_dead_segments();
     node.pending[p] = match &cut {
-        Some(cut) if level_has_more.iter().any(|&m| m) => node
-            .levels
-            .iter()
-            .flatten()
-            .filter(|s| s.overlaps(cut, hi.as_deref()))
-            .map(|s| s.page.meta.estimate_bytes(cut.max(&s.lo), hi.as_deref()))
-            .sum::<u64>()
-            .max(1),
-        _ => 0,
+        Some(cut) => {
+            let segs: Vec<&Segment> = node.levels.iter().flatten().filter(|s| s.overlaps(cut, hi.as_deref())).collect();
+            buffered_bytes(&segs, cut, hi.as_deref()).max(1)
+        }
+        None => 0,
     };
-    if b.is_empty() {
+    profile::add(&profile::EXTRACT, t);
+    if pages.is_empty() {
         return Ok(());
     }
-    let batch = ctx.finish(b);
+    let batch: Batch = pages.into_iter().map(Segment::whole).collect();
     let child = node.children[p].clone();
-    let pieces = apply_to_child(ctx, child, &batch, &lo, hi.as_ref())?;
+    let pieces = apply_to_child(ctx, child, batch, &lo, hi.as_ref())?;
     replace_child(node, p, pieces);
     Ok(())
 }
 
 /// Applies `batch` to a non-root subtree covering `[lo, hi)` and returns the
 /// viable pieces it became (possibly none, if a leaf emptied).
-fn apply_to_child(
-    ctx: &Ctx,
-    child: Subtree,
-    batch: &Arc<DataPage>,
-    lo: &Bytes,
-    hi: Option<&Bytes>,
-) -> Result<Vec<Piece>> {
+fn apply_to_child(ctx: &Ctx, child: Subtree, batch: Batch, lo: &Bytes, hi: Option<&Bytes>) -> Result<Vec<Piece>> {
     match child {
-        Subtree::Leaf(leaf) => Ok(leaf_pieces(leaf_apply(ctx, Some(&leaf), batch)?, lo)),
+        Subtree::Leaf(leaf) => {
+            let t = std::time::Instant::now();
+            let pieces = leaf_pieces(leaf_apply(ctx, Some(&leaf), &batch)?, lo);
+            profile::add(&profile::LEAF, t);
+            Ok(pieces)
+        }
         Subtree::Node(n) => {
             debug_assert_eq!(&n.pivots[0], lo);
             debug_assert_eq!(n.hi.as_ref(), hi);
             let mut n = (*n).clone();
-            node_apply(ctx, &mut n, batch.clone())?;
+            node_apply(ctx, &mut n, batch)?;
             Ok(split_if_needed(ctx, n)?
                 .into_iter()
                 .map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n))))
@@ -499,9 +563,13 @@ fn apply_to_child(
     }
 }
 
-fn node_apply(ctx: &Ctx, node: &mut Node, batch: Arc<DataPage>) -> Result<()> {
-    add_pending(ctx, node, &batch)?;
+fn node_apply(ctx: &Ctx, node: &mut Node, batch: Batch) -> Result<()> {
+    let t = std::time::Instant::now();
+    add_pending(node, &batch);
+    profile::add(&profile::PENDING, t);
+    let t = std::time::Instant::now();
     buffer_insert(ctx, node, batch)?;
+    profile::add(&profile::INSERT, t);
     flush_if_necessary(ctx, node, false)
 }
 
@@ -553,7 +621,10 @@ fn needs_merge(ctx: &Ctx, child: &Subtree) -> bool {
 /// Merges every undersized child with a sibling.
 fn fix_undersized_children(ctx: &Ctx, node: &mut Node) -> Result<()> {
     let mut i = 0;
+    let mut rounds = 0;
     while i < node.children.len() && node.children.len() >= 2 {
+        rounds += 1;
+        assert!(rounds < 1_000_000, "child merging is not making progress");
         if !needs_merge(ctx, &node.children[i]) {
             i += 1;
             continue;
@@ -638,7 +709,14 @@ fn concat_nodes(a: &Node, b: &Node) -> Node {
 }
 
 /// Splits a node that has too many pivots or segments into viable halves.
-fn split_if_needed(ctx: &Ctx, mut node: Node) -> Result<Vec<Node>> {
+fn split_if_needed(ctx: &Ctx, node: Node) -> Result<Vec<Node>> {
+    let t = std::time::Instant::now();
+    let out = split_if_needed_inner(ctx, node);
+    profile::add(&profile::RESHAPE, t);
+    out
+}
+
+fn split_if_needed_inner(ctx: &Ctx, mut node: Node) -> Result<Vec<Node>> {
     fix_undersized_children(ctx, &mut node)?;
     if node.segment_count() > ctx.cfg.max_segments {
         flush_if_necessary(ctx, &mut node, true)?;
@@ -652,19 +730,32 @@ fn split_if_needed(ctx: &Ctx, mut node: Node) -> Result<Vec<Node>> {
         compact_levels(ctx, &mut node)?;
         return Ok(vec![node]);
     }
-    let (mut left, mut right) = split_node(&node);
-    for half in [&mut left, &mut right] {
-        if half.segment_count() > ctx.cfg.max_segments {
-            compact_levels(ctx, half)?;
+    // Usually two halves; more when one flush grew the node by more than
+    // `max_pivots`, so every piece ends up viable.
+    let n = node.pivots.len();
+    let parts = n.div_ceil(ctx.cfg.max_pivots).max(2);
+    let mut pieces = Vec::with_capacity(parts);
+    let mut rest = node;
+    for k in (1..parts).rev() {
+        // Split off the last piece of `k + 1` balanced pieces.
+        let remaining = rest.pivots.len();
+        let (left, right) = split_node(&rest, remaining - remaining / (k + 1));
+        pieces.push(right);
+        rest = left;
+    }
+    pieces.push(rest);
+    pieces.reverse();
+    for piece in &mut pieces {
+        if piece.segment_count() > ctx.cfg.max_segments {
+            compact_levels(ctx, piece)?;
         }
     }
-    Ok(vec![left, right])
+    Ok(pieces)
 }
 
-/// Splits `node` at its middle pivot. Pages that straddle the split key are
+/// Splits `node` before pivot `s`. Pages that straddle the split key are
 /// shared, each half clipping them to its own range.
-fn split_node(node: &Node) -> (Node, Node) {
-    let s = node.pivots.len() / 2;
+fn split_node(node: &Node, s: usize) -> (Node, Node) {
     let m = node.pivots[s].clone();
     let mut left_levels = Vec::with_capacity(node.levels.len());
     let mut right_levels = Vec::with_capacity(node.levels.len());
@@ -751,6 +842,7 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
     if batch.meta.n_items == 0 {
         return Ok(root.cloned());
     }
+    let batch = vec![Segment::whole(batch)];
     let mut pieces: Vec<Piece> = match root {
         None => leaf_pieces(leaf_apply(ctx, None, &batch)?, &Bytes::new()),
         Some(Subtree::Leaf(leaf)) => leaf_pieces(leaf_apply(ctx, Some(leaf), &batch)?, &Bytes::new()),
@@ -779,7 +871,8 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
     let (_, mut root) = pieces.pop().unwrap();
     // A root with a single child sheds its buffer into that child, then
     // gives way to it.
-    loop {
+    for round in 0.. {
+        assert!(round < 1_000_000, "root shrink is not making progress");
         match root {
             Subtree::Leaf(p) if p.meta.n_items == 0 => return Ok(None),
             Subtree::Node(n) if n.children.len() == 1 => {
@@ -803,6 +896,7 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
             other => return Ok(Some(other)),
         }
     }
+    unreachable!()
 }
 
 /// Looks `key` up in one page.
@@ -1055,8 +1149,23 @@ pub fn write_tree(ctx: &Ctx, root: &Subtree) -> Result<bool> {
     let mut seen = std::collections::HashSet::new();
     collect_unwritten(root, &mut pages, &mut seen);
     let created = if ctx.cfg.parallel {
+        // Buffered writes to one file serialize on its inode lock, so write
+        // each arena file from one thread.
         use rayon::prelude::*;
-        pages.par_iter().map(|p| ctx.io.write(p)).collect::<Result<Vec<bool>>>()?.into_iter().any(|c| c)
+        let mut by_class: std::collections::BTreeMap<u8, Vec<&Arc<DataPage>>> = Default::default();
+        for p in &pages {
+            let class = crate::pagestore::class_for(p.meta.image_len()).unwrap_or(0);
+            by_class.entry(class).or_default().push(p);
+        }
+        let groups: Vec<Vec<&Arc<DataPage>>> = by_class.into_values().collect();
+        let write_group = |group: &Vec<&Arc<DataPage>>| -> Result<bool> {
+            let mut any = false;
+            for p in group {
+                any |= ctx.io.write(p)?;
+            }
+            Ok(any)
+        };
+        groups.par_iter().map(write_group).collect::<Result<Vec<bool>>>()?.into_iter().any(|c| c)
     } else {
         let mut any = false;
         for p in &pages {
