@@ -62,7 +62,7 @@ fn parse_args() -> Args {
         leaf_kb: num("--leaf-kb", 4096),
         chi: num("--chi", 32),
         memtable: get("--memtable").unwrap_or_else(|| "bbtree".into()),
-        max_frozen: num("--max-frozen", 2) as usize,
+        max_frozen: num("--max-frozen", 1) as usize,
         wal_buffer_kb: num("--wal-buffer-kb", 1024) as usize,
         fjall_workers: num("--fjall-workers", 8) as usize,
         fjall_memtable_mb: num("--fjall-memtable-mb", 64),

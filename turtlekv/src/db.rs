@@ -385,16 +385,16 @@ impl Db {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.write(&[WriteOp::put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))], false)
+        self.inner.write(vec![WriteOp::put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))], false)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.write(&[WriteOp::delete(Bytes::copy_from_slice(key))], false)
+        self.inner.write(vec![WriteOp::delete(Bytes::copy_from_slice(key))], false)
     }
 
     /// Applies `ops` atomically. With `sync`, returns once they are durable.
     pub fn write(&self, ops: &[WriteOp], sync: bool) -> Result<()> {
-        self.inner.write(ops, sync)
+        self.inner.write(ops.to_vec(), sync)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -610,11 +610,13 @@ impl Inner {
         self.signal.notify_all();
     }
 
-    fn write(&self, ops: &[WriteOp], sync: bool) -> Result<()> {
+    /// Takes the ops by value so the memtable keeps their buffers as they
+    /// are; a clone of a `Bytes` would add a shared header to every value.
+    fn write(&self, ops: Vec<WriteOp>, sync: bool) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        for op in ops {
+        for op in &ops {
             if op.key.len() > MAX_KEY_LEN || op.value.encoded_len() > MAX_VALUE_LEN {
                 return Err(Error::InvalidArgument("key or value too large".into()));
             }
@@ -628,7 +630,7 @@ impl Inner {
         BODY.with_borrow_mut(|body| {
             // Everything but the sequence number is encoded and checksummed
             // before taking the lock, which keeps the critical section short.
-            body.encode(ops);
+            body.encode(&ops);
             let (mem, seq, shard, flush) = {
                 let mut w = self.writer.lock();
                 self.check_poisoned()?;
@@ -654,8 +656,8 @@ impl Inner {
                 (w.active.clone(), seq, shard, flush)
             };
             let flushed = flush.map_or(Ok(()), |f| f.write());
-            for (i, op) in ops.iter().enumerate() {
-                mem.table.insert(&op.key, op.value.clone(), seq + i as u64);
+            for (i, op) in ops.into_iter().enumerate() {
+                mem.table.insert(&op.key, op.value, seq + i as u64);
             }
             mem.inflight.exit(shard);
             self.poison_on_err(flushed)
