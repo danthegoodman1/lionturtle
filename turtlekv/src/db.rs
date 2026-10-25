@@ -214,13 +214,17 @@ impl Db {
     /// Opens the store in `storage`, creating it if empty, and recovers the
     /// last checkpoint plus every logged write after it.
     pub fn open(storage: Arc<dyn Storage>, opts: Options) -> Result<Self> {
-        let sb = match Superblock::load(&*storage)? {
-            Some(sb) => sb,
-            None => {
+        let sb = match Superblock::load(&*storage) {
+            Ok(Some(sb)) => sb,
+            // Creating the superblock is the first durable step of a new
+            // store. If nothing else exists, a crash interrupted creation.
+            Ok(None) | Err(Error::Corruption(_)) if storage.list()?.iter().all(|n| n == "superblock") => {
                 let sb = Superblock { next_page_id: 1, ..Default::default() };
                 sb.create(&*storage)?;
                 sb
             }
+            Ok(None) => return Err(crate::error::corruption("store files exist without a superblock")),
+            Err(e) => return Err(e),
         };
         let max_image = opts.tree.leaf_size * 2 + (1 << 20);
         // Load the tree through a provisional store, then reopen the arenas
@@ -249,6 +253,10 @@ impl Db {
                 continue;
             }
             let r = wal::replay(&*storage, id, last_seq, |seq, op| replayed.insert(&op, seq))?;
+            // Replay may have read records that only reached the OS cache
+            // (after a process crash). New writes build on them, so they must
+            // be durable before the store accepts any.
+            storage.open(&wal::segment_name(id), false)?.sync_data()?;
             if std::env::var_os("TURTLEKV_DEBUG").is_some() {
                 eprintln!("recovery: sb {sb:?}, segment {id}: {} -> {} {:?}", last_seq, r.last_seq, r.end);
             }
@@ -644,6 +652,9 @@ impl Inner {
             root: root.as_ref().and_then(tree::root_ptr),
         };
         sb.store(&*self.storage)?;
+        if std::env::var_os("TURTLEKV_DEBUG").is_some() {
+            eprintln!("commit {sb:?}");
+        }
 
         let mut live = HashSet::new();
         if let Some(r) = &root {

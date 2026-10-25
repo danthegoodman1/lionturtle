@@ -136,6 +136,9 @@ impl PageStore {
                 a.next - 1
             }
         };
+        if std::env::var_os("TURTLEKV_DEBUG").is_some() {
+            eprintln!("alloc page {id} -> {class}:{slot}");
+        }
         Ok(PagePtr { id, class, slot, len: len as u32, meta_off })
     }
 
@@ -143,6 +146,9 @@ impl PageStore {
     pub fn free(&self, ptrs: impl IntoIterator<Item = PagePtr>) {
         let mut alloc = self.alloc.lock();
         for ptr in ptrs {
+            if std::env::var_os("TURTLEKV_DEBUG").is_some() {
+                eprintln!("free page {} at {}:{}", ptr.id, ptr.class, ptr.slot);
+            }
             let inserted = alloc[ptr.class as usize].free.insert(ptr.slot);
             debug_assert!(inserted, "double free of {ptr:?}");
         }

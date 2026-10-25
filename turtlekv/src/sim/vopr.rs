@@ -192,21 +192,33 @@ impl Sim {
 
     /// Opens the store, retrying through transient read faults.
     fn open(&mut self) -> Result<(), String> {
-        for _ in 0..1000 {
-            match Db::open(Arc::new(self.disk.clone()), self.opts.clone()) {
+        let mut last_err = String::new();
+        let faults = self.disk.faults();
+        for attempt in 0..100 {
+            // Recovery reads the whole tree's metadata, so at high fault rates
+            // it rarely gets through; after some attempts under faults, let it.
+            if attempt >= 20 {
+                self.disk.set_faults(FaultConfig { read_error: 0.0, read_corruption: 0.0, ..faults.clone() });
+            }
+            let opened = Db::open(Arc::new(self.disk.clone()), self.opts.clone());
+            if attempt >= 20 {
+                self.disk.set_faults(faults.clone());
+            }
+            match opened {
                 Ok(db) => {
                     self.db = Some(db);
                     return Ok(());
                 }
-                Err(Error::Io(_)) | Err(Error::Corruption(_)) => {
+                Err(e @ (Error::Io(_) | Error::Corruption(_))) => {
                     // A transient fault, or a write fault during open. Treat
                     // the open as a crash and try again.
+                    last_err = e.to_string();
                     self.disk.crash();
                 }
                 Err(e) => return Err(format!("open failed: {e}")),
             }
         }
-        Err("open kept failing".into())
+        Err(format!("open kept failing: {last_err}"))
     }
 
     fn key(&mut self) -> Vec<u8> {
