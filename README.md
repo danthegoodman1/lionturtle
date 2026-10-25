@@ -10,6 +10,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 - [Performance](#performance)
   - [On EC2 at 400M records](#on-ec2-at-400m-records)
   - [Where it wins and where it pays](#where-it-wins-and-where-it-pays)
+  - [fjall in these runs](#fjall-in-these-runs)
   - [Synchronous writes](#synchronous-writes)
   - [How the benchmark is run](#how-the-benchmark-is-run)
 - [Behavior compared with RocksDB and fjall](#behavior-compared-with-rocksdb-and-fjall)
@@ -74,6 +75,14 @@ Reads at this scale wait on the drives: read p99 on C was 550 µs for turtlekv-r
 - **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs.
 - **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap.
 
+### fjall in these runs
+
+fjall trails here by more than its own benchmarks suggest, because these runs use 16–32 client threads and scan after update phases. Both stress parts of fjall's design:
+
+- **One journal lock.** Every fjall write takes one journal mutex, so loads slow as threads grow. On the workstation at 10M records, fjall loaded 781 thousand inserts per second on one thread, ahead of RocksDB's 681, and 435 thousand on 16.
+- **Version skipping.** A fjall scan steps past a key's older versions one at a time; RocksDB reseeks after eight. Zipfian updates pile versions onto hot keys, so E after A and B scans slowly: on 2M records with one thread, fjall ran 106–125 thousand scans per second after the load and 7.6 thousand after 400 thousand operations of workload A.
+- **Synchronous writes.** fjall persists its journal once per writer, without grouping, so durable throughput stays flat as threads grow.
+
 ### Synchronous writes
 
 `write(.., true)` returns once its batch is durable. Synchronous writers share syncs: one writer at a time writes every buffered record in one direct write and makes it durable, and the others return when a sync covers them. When every earlier log write is already durable, that write is one `pwritev2` with `RWF_DSYNC`; otherwise it is a write and an fsync. The log bypasses the page cache and writes over retired segments, so a sync has no dirty pages to write back and no file size to journal.
@@ -85,11 +94,11 @@ Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB m
 | Workstation NVMe, 1 | 0.5 | 0.2 | 0.5 | 0.5 |
 | Workstation NVMe, 16 | 3.9 | 2.0 | 3.6 | 0.4 |
 | Workstation NVMe, 64 | 15.0 | 6.5 | 11.5 | 0.4 |
-| EC2 instance store, 1 | 35.3 | 11.5 | 30.2 | 29.9 |
-| EC2 instance store, 16 | 164.4 | 75.4 | 143.3 | 26.5 |
-| EC2 instance store, 64 | 274.2 | 192.7 | 295.6 | 19.1 |
+| EC2 instance store, 1 | 35.0 | 11.5 | 30.2 | 29.9 |
+| EC2 instance store, 16 | 166.6 | 75.4 | 143.3 | 26.5 |
+| EC2 instance store, 64 | 343.4 | 192.7 | 299.5 | 19.1 |
 
-The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 28 µs on average for turtlekv-rs on one thread. fjall persists its journal once per writer, without grouping.
+The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 28 µs on average for turtlekv-rs on one thread. The 64-thread EC2 figures for turtlekv-rs and recycled-log RocksDB are means of three alternating runs. fjall persists its journal once per writer, without grouping.
 
 The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit, and with it enabled, a tenth or more of writes wake a CPU from it. Then every engine's one-thread mean rises to 50–110 µs, runs swing by 40%, and no engine passes 43 thousand per second at 16 or 64 threads. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
 
@@ -186,7 +195,8 @@ The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_re
 
 ```mermaid
 flowchart LR
-  W[Writer] -->|encode and checksum, no lock| L[Writer lock: sequence numbers, ticket, append to log buffer]
+  W[Writer] -->|encode and checksum, no lock| Q[Queue the batch]
+  Q --> L[Writer lock: sequence numbers, ticket, append to log buffer, for every queued batch]
   L --> M[Insert into the active memtable]
   M --> C[Commit the ticket and return]
   M -.->|memtable full| F[Freeze; start a new memtable and log segment]
@@ -194,7 +204,7 @@ flowchart LR
   A --> K[Commit stage: fsync, write the superblock, free dead pages, swap in the new tree, retire the log segment]
 ```
 
-Writers hold the lock only to take sequence numbers and append a pre-encoded record. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint.
+Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint.
 
 ### The TurtleTree
 

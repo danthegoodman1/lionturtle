@@ -28,7 +28,8 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
 use std::thread::JoinHandle;
 
 #[derive(Clone, Debug)]
@@ -102,15 +103,18 @@ struct PaddedCount(AtomicUsize);
 struct Inflight([PaddedCount; INFLIGHT_SHARDS]);
 
 impl Inflight {
-    /// Counts a writer in and returns its shard.
-    fn enter(&self) -> usize {
+    /// The calling thread's shard.
+    fn shard() -> usize {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         thread_local! {
             static SHARD: usize = NEXT.fetch_add(1, Relaxed) % INFLIGHT_SHARDS;
         }
-        let shard = SHARD.with(|s| *s);
+        SHARD.with(|s| *s)
+    }
+
+    /// Counts a writer in on `shard`.
+    fn enter(&self, shard: usize) {
         self.0[shard].0.fetch_add(1, SeqCst);
-        shard
     }
 
     fn exit(&self, shard: usize) {
@@ -153,7 +157,7 @@ struct CommitSlot {
 }
 
 /// Batches that may be in flight at once. Each writer thread has at most
-/// one.
+/// one, and a turn at the writer lock registers at most [`TURN_LIMIT`].
 const COMMIT_RING: u64 = 1024;
 
 impl Commits {
@@ -328,6 +332,11 @@ pub struct Version {
 
 struct Writer {
     wal: WalWriter,
+    /// Log bytes some writer has been told to flush; see [`Inner::assign`].
+    flush_claimed: u64,
+    /// Requests a turn left unserved, oldest first, for the next turn; see
+    /// [`Inner::serve`].
+    carried: VecDeque<usize>,
     next_seq: u64,
     /// Commit ticket of the next batch; see [`Commits`].
     next_ticket: u64,
@@ -335,6 +344,45 @@ struct Writer {
     user_bytes: u64,
     wal_bytes: u64,
 }
+
+/// A batch waiting for its sequence numbers. Writers push requests onto
+/// [`Inner::queue`], and whichever writer holds the writer lock serves every
+/// queued request in one turn, so many writers cost one lock handoff. It
+/// lives on its writer's stack, which waits until `done` before reading
+/// `out` or returning.
+struct Request {
+    body: *const wal::Body,
+    ops: u64,
+    entry_bytes: u64,
+    user_bytes: u64,
+    sync: bool,
+    shard: usize,
+    next: AtomicPtr<Request>,
+    out: UnsafeCell<Option<Result<Assigned>>>,
+    done: AtomicBool,
+}
+
+/// What a batch learns from the writer lock.
+struct Assigned {
+    mem: Arc<Mem>,
+    seq: u64,
+    ticket: u64,
+    /// The log and the end of the batch's record, for a synchronous batch.
+    sync_to: Option<(Arc<wal::Log>, u64)>,
+    /// A log whose buffer this batch should flush.
+    flush: Option<Arc<wal::Log>>,
+}
+
+/// Requests one turn at the writer lock serves at most. A turn registers
+/// their tickets while its own batch waits to commit, so it must leave the
+/// commit ring room for them.
+const TURN_LIMIT: usize = COMMIT_RING as usize / 2;
+/// Spins before a waiting writer parks.
+const REQUEST_SPINS: u32 = 200;
+/// How long a parked writer sleeps before checking whether it should take
+/// the writer lock itself. A request queued while a caller other than a
+/// writer holds the lock waits at most this long.
+const REQUEST_PARK: std::time::Duration = std::time::Duration::from_micros(200);
 
 struct Durable {
     sb: Superblock,
@@ -387,6 +435,8 @@ struct Inner {
     /// Serializes version replacements.
     version_lock: Mutex<()>,
     writer: Mutex<Writer>,
+    /// Requests waiting for the writer lock, newest first.
+    queue: AtomicPtr<Request>,
     /// Paired with `signal`: wakes the checkpointer when a memtable freezes
     /// and blocked writers when a checkpoint commits.
     signal_lock: Mutex<()>,
@@ -513,7 +563,8 @@ impl Db {
             io,
             version: ArcSwap::from_pointee(version),
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, next_ticket: 1, active, user_bytes: 0, wal_bytes: 0 }),
+            writer: Mutex::new(Writer { wal, flush_claimed: 0, carried: VecDeque::new(), next_seq: last_seq + 1, next_ticket: 1, active, user_bytes: 0, wal_bytes: 0 }),
+            queue: AtomicPtr::new(std::ptr::null_mut()),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
@@ -781,49 +832,170 @@ impl Inner {
         }
         BODY.with_borrow_mut(|body| {
             // Everything but the sequence number is encoded and checksummed
-            // before taking the lock, which keeps the critical section short.
+            // before queueing, which keeps the writer lock's turns short.
             body.encode(&ops);
-            let (mem, seq, shard, flush, sync_to, ticket) = {
-                let mut w = self.writer.lock();
-                self.check_poisoned()?;
-                if w.active.bytes() >= self.opts.memtable_limit() {
-                    let r = self.rotate(&mut w);
-                    self.poison_on_err(r)?;
-                }
-                let seq = w.next_seq;
-                w.next_seq += ops.len() as u64;
-                w.wal.append_body(body, seq);
-                w.user_bytes += user_bytes;
-                w.wal_bytes += body.record_len() as u64;
-                // A synchronous writer syncs after releasing the lock,
-                // sharing a write and fsync with writers that arrive
-                // meanwhile.
-                let mut flush = None;
-                let mut sync_to = None;
-                if sync {
-                    sync_to = Some((w.wal.log(), w.wal.len()));
-                } else if w.wal.buffered() >= self.opts.wal_buffer_bytes {
-                    flush = Some(w.wal.start_flush());
-                }
-                w.active.last_seq.store(seq + ops.len() as u64 - 1, Relaxed);
-                w.active.bytes.fetch_add(entry_bytes, Relaxed);
-                let shard = w.active.inflight.enter();
-                let ticket = w.next_ticket;
-                w.next_ticket += 1;
-                self.commits.register(ticket, seq + ops.len() as u64 - 1);
-                (w.active.clone(), seq, shard, flush, sync_to, ticket)
+            let request = Request {
+                body,
+                ops: ops.len() as u64,
+                entry_bytes,
+                user_bytes,
+                sync,
+                shard: Inflight::shard(),
+                next: AtomicPtr::new(std::ptr::null_mut()),
+                out: UnsafeCell::new(None),
+                done: AtomicBool::new(false),
             };
+            self.enqueue(&request);
+            self.await_request(&request);
+            // SAFETY: `done` is set, so the writer that served the request
+            // has stored `out` and no longer touches it.
+            let a = unsafe { (*request.out.get()).take() }.expect("served request")?;
             // A synchronous batch becomes visible once it is durable.
-            let flushed = flush
-                .map_or(Ok(()), |f| f.write())
-                .and_then(|()| sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
+            let flushed = a
+                .flush
+                .map_or(Ok(()), |log| log.start_flush().write())
+                .and_then(|()| a.sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
             for (i, op) in ops.into_iter().enumerate() {
-                mem.table.insert(&op.key, op.value, seq + i as u64, ticket);
+                a.mem.table.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
             }
-            self.commits.commit(ticket);
-            mem.inflight.exit(shard);
+            self.commits.commit(a.ticket);
+            a.mem.inflight.exit(request.shard);
             self.poison_on_err(flushed)
         })
+    }
+
+    fn enqueue(&self, request: &Request) {
+        let p = request as *const Request as *mut Request;
+        let mut head = self.queue.load(Relaxed);
+        loop {
+            request.next.store(head, Relaxed);
+            match self.queue.compare_exchange_weak(head, p, Release, Relaxed) {
+                Ok(_) => return,
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    /// Returns once `request` is served: by this thread, if it takes the
+    /// writer lock, or by whichever writer holds it.
+    fn await_request(&self, request: &Request) {
+        let mut spins = 0;
+        loop {
+            if request.done.load(Acquire) {
+                return;
+            }
+            if let Some(mut w) = self.writer.try_lock() {
+                let woken = self.serve(&mut w);
+                let next = w.carried.front().copied().or_else(|| {
+                    let head = self.queue.load(Acquire);
+                    (!head.is_null()).then_some(head as usize)
+                });
+                drop(w);
+                Self::wake(woken);
+                // A request left for the next turn may belong to a parked
+                // writer: wake one to take the turn.
+                if let Some(key) = next {
+                    Self::wake(vec![key]);
+                }
+                continue;
+            }
+            if spins < REQUEST_SPINS {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+            let key = request as *const Request as usize;
+            let deadline = std::time::Instant::now() + REQUEST_PARK;
+            // Park only while the lock is held: whoever releases it then
+            // wakes a waiting writer, after this check runs.
+            let waiting = || !request.done.load(Acquire) && self.writer.is_locked();
+            // SAFETY: the callbacks neither panic nor call into the parking
+            // lot.
+            unsafe {
+                parking_lot_core::park(key, waiting, || {}, |_, _| {}, parking_lot_core::DEFAULT_PARK_TOKEN, Some(deadline));
+            }
+        }
+    }
+
+    /// One turn at the writer lock: serves the requests the last turn left,
+    /// then those queued now, oldest first, and returns their keys for
+    /// [`Self::wake`] once the lock is released.
+    ///
+    /// A turn takes the queue once and serves at most [`TURN_LIMIT`]
+    /// requests, so it ends and lets its own batch commit. A turn rotates the
+    /// memtable only before serving anything: its writer's own batch, once
+    /// served, sits in the memtable a rotation may have to wait to
+    /// checkpoint. A request needing a rotation after that waits for the next
+    /// turn.
+    fn serve(&self, w: &mut Writer) -> Vec<usize> {
+        let mut p = self.queue.swap(std::ptr::null_mut(), Acquire);
+        let mut queued = Vec::new();
+        while !p.is_null() {
+            queued.push(p as usize);
+            // SAFETY: a queued request stays alive until it is done.
+            p = unsafe { (*p).next.load(Relaxed) };
+        }
+        w.carried.extend(queued.into_iter().rev());
+        let mut served = Vec::new();
+        while let Some(&key) = w.carried.front() {
+            if served.len() == TURN_LIMIT || !served.is_empty() && w.active.bytes() >= self.opts.memtable_limit() {
+                break;
+            }
+            w.carried.pop_front();
+            // SAFETY: as above; its writer reads `out` only after `done`.
+            let request = unsafe { &*(key as *const Request) };
+            let out = self.assign(w, request);
+            unsafe { *request.out.get() = Some(out) };
+            request.done.store(true, Release);
+            served.push(key);
+        }
+        served
+    }
+
+    /// Wakes the writers of served requests that parked. Only the keys are
+    /// used: the requests themselves may be gone.
+    fn wake(keys: Vec<usize>) {
+        for key in keys {
+            // SAFETY: the callback neither panics nor calls into the
+            // parking lot.
+            unsafe { parking_lot_core::unpark_one(key, |_| parking_lot_core::DEFAULT_UNPARK_TOKEN) };
+        }
+    }
+
+    /// Gives one batch its sequence numbers, logs it, and registers its
+    /// ticket.
+    fn assign(&self, w: &mut Writer, r: &Request) -> Result<Assigned> {
+        self.check_poisoned()?;
+        if w.active.bytes() >= self.opts.memtable_limit() {
+            let res = self.rotate(w);
+            self.poison_on_err(res)?;
+        }
+        // SAFETY: the request's writer waits, keeping its body alive.
+        let body = unsafe { &*r.body };
+        let seq = w.next_seq;
+        w.next_seq += r.ops;
+        w.wal.append_body(body, seq);
+        w.user_bytes += r.user_bytes;
+        w.wal_bytes += body.record_len() as u64;
+        // A synchronous batch syncs after the lock is released, sharing a
+        // write and fsync with batches that arrive meanwhile. Otherwise one
+        // batch per `wal_buffer_bytes` of log flushes it.
+        let len = w.wal.len();
+        let mut sync_to = None;
+        let mut flush = None;
+        if r.sync {
+            sync_to = Some((w.wal.log(), len));
+        } else if len - w.flush_claimed >= self.opts.wal_buffer_bytes as u64 {
+            w.flush_claimed = len;
+            flush = Some(w.wal.log());
+        }
+        w.active.last_seq.store(seq + r.ops - 1, Relaxed);
+        w.active.bytes.fetch_add(r.entry_bytes, Relaxed);
+        w.active.inflight.enter(r.shard);
+        let ticket = w.next_ticket;
+        w.next_ticket += 1;
+        self.commits.register(ticket, seq + r.ops - 1);
+        Ok(Assigned { mem: w.active.clone(), seq, ticket, sync_to, flush })
     }
 
     /// Freezes the active memtable and starts a new one with a new log
@@ -860,6 +1032,7 @@ impl Inner {
             self.version.store(Arc::new(Version { active: mem.clone(), frozen, tree: v.tree.clone(), _epoch: epoch }));
         }
         w.wal = wal;
+        w.flush_claimed = 0;
         w.active = mem;
         self.notify();
         Ok(())

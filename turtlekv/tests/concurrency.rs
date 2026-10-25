@@ -3,7 +3,7 @@
 //! thread; this exercises the locks, version swaps, and epoch reclamation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use turtlekv::sim::{FaultConfig, SimStorage};
@@ -289,4 +289,129 @@ fn atomic_batches_btree() {
 #[test]
 fn atomic_batches_art() {
     atomic_batches(MemTableKind::Art8);
+}
+
+/// Many writers queue for the writer lock at once, so each turn serves many
+/// requests, while another thread keeps taking the lock for `sync` and
+/// `last_seq`, which serve no requests. Small memtables rotate every few
+/// hundred batches, and the run spans hundreds of commit rings. Every batch
+/// must get its own sequence numbers and land, and a reopen must recover all
+/// of them.
+#[test]
+fn many_writers_share_lock_turns() {
+    const THREADS: u64 = 32;
+    const BATCHES: u64 = 4000;
+    let disk = SimStorage::new(11, FaultConfig::default());
+    let opts = Options {
+        tree: TreeConfig { leaf_size: 16 << 10, max_pivots: 8, min_pivots: 2, max_levels: 3, ..TreeConfig::default() },
+        checkpoint_distance: 2,
+        cache_bytes: 1 << 20,
+        wal_buffer_bytes: 4096,
+        max_frozen: 1,
+        background: true,
+        merge_threads: 2,
+        ..Options::default()
+    };
+    let db = Arc::new(Db::open(Arc::new(disk.clone()), opts.clone()).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let other = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                db.sync().unwrap();
+                let _ = db.last_seq();
+            }
+        })
+    };
+    let writers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut ops_written = 0u64;
+                for b in 0..BATCHES {
+                    // Batches of 1 to 3 ops; every fifth one synchronous.
+                    let ops: Vec<_> = (0..1 + b % 3)
+                        .map(|i| turtlekv::WriteOp::put(format!("t{t:02}-b{b:04}-{i}").into_bytes(), b.to_be_bytes().to_vec()))
+                        .collect();
+                    ops_written += ops.len() as u64;
+                    db.write(&ops, b % 5 == 0).unwrap();
+                }
+                ops_written
+            })
+        })
+        .collect();
+    let total: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    stop.store(true, Ordering::SeqCst);
+    other.join().unwrap();
+    assert_eq!(db.last_seq(), total, "every op took exactly one sequence number");
+    let check = |db: &Db| {
+        for t in 0..THREADS {
+            for b in 0..BATCHES {
+                for i in 0..1 + b % 3 {
+                    let v = db.get(format!("t{t:02}-b{b:04}-{i}").as_bytes()).unwrap();
+                    assert_eq!(v.as_deref(), Some(&b.to_be_bytes()[..]), "writer {t} batch {b} op {i}");
+                }
+            }
+        }
+    };
+    check(&db);
+    drop(Arc::try_unwrap(db).ok().expect("sole owner"));
+    let db = Db::open(Arc::new(disk), opts).unwrap();
+    assert_eq!(db.last_seq(), total);
+    check(&db);
+}
+
+/// Writers on a real directory, as fast as they can go: a turn at the writer
+/// lock always finds requests queued. Each turn must end and let its own
+/// batch commit, or the commit ring fills and every writer stops.
+#[test]
+fn busy_writers_keep_committing() {
+    busy_writers(16, 40_000);
+}
+
+/// More writer threads than the commit ring has slots: a turn that served
+/// every queued request would wait on its own batch to free a slot.
+#[test]
+fn more_writers_than_commit_slots() {
+    busy_writers(1_500, 100);
+}
+
+fn busy_writers(threads: u64, puts: u64) {
+    let dir = std::env::temp_dir().join(format!("turtlekv-busy{threads}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Arc::new(Db::open(Arc::new(FsStorage::new(&dir).unwrap()), Options::default()).unwrap());
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while !finished.load(Ordering::Relaxed) {
+                if started.elapsed() > Duration::from_secs(60) {
+                    eprintln!("writers stalled for 60 s");
+                    std::process::abort();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let start = Arc::new(Barrier::new(threads as usize));
+    let writers: Vec<_> = (0..threads)
+        .map(|t| {
+            let (db, start) = (db.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                for i in 0..puts {
+                    db.put(format!("t{t:04}-{i:06}").as_bytes(), &[7; 120]).unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    finished.store(true, Ordering::SeqCst);
+    watchdog.join().unwrap();
+    assert_eq!(db.last_seq(), threads * puts);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
