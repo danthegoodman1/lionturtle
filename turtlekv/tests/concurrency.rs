@@ -150,3 +150,110 @@ fn concurrent_btree_sim_disk() {
     stress(Arc::new(SimStorage::new(6, FaultConfig::default())), MemTableKind::BTree, 3);
     assert!(started.elapsed() < Duration::from_secs(120));
 }
+
+/// Writers update pairs of keys in one batch while readers check that no
+/// read sees one half of a batch without the other: a get of the second key
+/// after the first, and every iterator and scan, which read one snapshot.
+fn atomic_batches(memtable: MemTableKind) {
+    const PAIRS: u64 = 16;
+    const WRITERS: u64 = 4;
+    let opts = Options {
+        tree: TreeConfig { leaf_size: 4 << 10, max_pivots: 8, min_pivots: 2, max_levels: 3, ..TreeConfig::default() },
+        checkpoint_distance: 2,
+        cache_bytes: 64 << 10,
+        memtable,
+        wal_buffer_bytes: 4096,
+        max_frozen: 2,
+        background: true,
+        merge_threads: 2,
+    };
+    let db = Arc::new(Db::open(Arc::new(SimStorage::new(7, FaultConfig::default())), opts).unwrap());
+    // Pair `p` is keys 2p and 2p + 1; writer `w` owns the pairs with p % WRITERS == w,
+    // so each pair's version only rises. Filler keys sit between the halves of a
+    // batch to widen the window in which a reader could see half of it.
+    let key = |k: u64| k.to_be_bytes();
+    let filler = |w: u64, i: u64| (1u64 << 40 | w << 8 | i).to_be_bytes();
+    let version = |v: Option<bytes::Bytes>| v.map_or(0, |v| u64::from_be_bytes(v[..8].try_into().unwrap()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for w in 0..WRITERS {
+        let (db, stop) = (db.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let p = w + WRITERS * (n % (PAIRS / WRITERS));
+                let v = n.to_be_bytes().to_vec();
+                let mut ops = vec![turtlekv::WriteOp::put(key(2 * p).to_vec(), v.clone())];
+                ops.extend((0..8).map(|i| turtlekv::WriteOp::put(filler(w, i).to_vec(), v.clone())));
+                ops.push(turtlekv::WriteOp::put(key(2 * p + 1).to_vec(), v));
+                db.write(&ops, false).unwrap();
+            }
+        }));
+    }
+    let mut checks = Vec::new();
+    for r in 0..4u64 {
+        let (db, stop) = (db.clone(), stop.clone());
+        checks.push(std::thread::spawn(move || {
+            let mut i = r;
+            let mut torn_free = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let p = (i >> 33) % PAIRS;
+                if r % 2 == 0 {
+                    let first = version(db.get(&key(2 * p)).unwrap());
+                    let second = version(db.get(&key(2 * p + 1)).unwrap());
+                    assert!(second >= first, "pair {p}: saw version {first} of its first key, then {second} of its second");
+                } else {
+                    let rows = db.scan(&key(0), Some(&key(2 * PAIRS)), usize::MAX).unwrap();
+                    let mut it = db.iter(&key(0), Some(&key(2 * PAIRS)));
+                    let mut iterated = Vec::new();
+                    while let Some(row) = it.next().unwrap() {
+                        iterated.push(row);
+                    }
+                    for rows in [rows, iterated] {
+                        let got: HashMap<u64, u64> = rows
+                            .iter()
+                            .map(|(k, v)| (u64::from_be_bytes(k[..].try_into().unwrap()), version(Some(v.clone()))))
+                            .collect();
+                        for p in 0..PAIRS {
+                            let (a, b) = (got.get(&(2 * p)), got.get(&(2 * p + 1)));
+                            assert_eq!(a, b, "pair {p} differs within one snapshot");
+                        }
+                    }
+                }
+                torn_free += 1;
+            }
+            torn_free
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().unwrap();
+    }
+    let reads: u64 = checks.into_iter().map(|t| t.join().unwrap()).sum();
+    let stats = db.stats();
+    eprintln!("{memtable:?}: {reads} atomicity checks, {} checkpoints", stats.checkpoints);
+    assert!(stats.checkpoints > 3, "background checkpoints ran");
+}
+
+#[test]
+fn atomic_batches_bbtree() {
+    atomic_batches(MemTableKind::BBTree);
+}
+
+#[test]
+fn atomic_batches_skiplist() {
+    atomic_batches(MemTableKind::SkipList);
+}
+
+#[test]
+fn atomic_batches_btree() {
+    atomic_batches(MemTableKind::BTree);
+}
+
+#[test]
+fn atomic_batches_art() {
+    atomic_batches(MemTableKind::Art8);
+}

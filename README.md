@@ -66,6 +66,12 @@ Departures from the C++ code:
   once, so the commit's fsync has little left to flush.
 - Writers encode and checksum log records before taking the writer lock;
   each record carries its sequence number last, so the lock only appends it.
+- A batch is atomic to readers as well as to recovery. Writers insert into
+  the memtable outside the writer lock, and memtables keep every version of
+  a key; a batch becomes visible when the store publishes its last sequence
+  number, which happens in sequence order. Each get reads as of the
+  published sequence number, and each iterator keeps the one it started with,
+  so an iterator is a snapshot.
 - Nodes default to 4 buffer levels: scans and point reads gain more than
   write amplification loses at this depth.
 - A scan merges a leaf with every buffer level on its root-to-leaf path, so

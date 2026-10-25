@@ -11,8 +11,8 @@
 //!   `s` with `synced ≤ s ≤ last`, where `synced` is the newest write known
 //!   durable: a prefix of history that keeps every synced write;
 //! - after a clean reopen, nothing is lost;
-//! - long-lived iterators never skip or invent a key that stayed unchanged
-//!   while they ran;
+//! - a long-lived iterator returns exactly the model's entries in its range
+//!   when it was created, whatever is written while it runs;
 //! - tree invariants hold, and no page slot leaks.
 
 use super::{FaultConfig, Rng, SimStorage};
@@ -22,7 +22,8 @@ use crate::memtable::MemTableKind;
 use crate::tree::TreeConfig;
 use crate::types::WriteOp;
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
@@ -90,11 +91,9 @@ impl Model {
 
 struct Iter {
     it: DbIter,
-    start: Vec<u8>,
-    end: Option<Vec<u8>>,
-    last: Option<Vec<u8>>,
-    /// Keys written since the iterator was created.
-    dirty: BTreeSet<Vec<u8>>,
+    /// The model's entries in the iterator's range when it was created, which
+    /// it must return in order.
+    expected: VecDeque<(Vec<u8>, Vec<u8>)>,
 }
 
 struct Sim {
@@ -249,11 +248,6 @@ impl Sim {
         let before = self.db().last_seq();
         let result = self.db().write(&wops, sync);
         let after = self.db().last_seq();
-        for it in &mut self.iters {
-            for (k, _) in &ops {
-                it.dirty.insert(k.clone());
-            }
-        }
         match result {
             Ok(()) => {
                 self.model.apply(&ops);
@@ -441,9 +435,8 @@ impl Sim {
         Err("full scan kept failing".into())
     }
 
-    /// Creates or advances a long-lived iterator. Iterators are not
-    /// snapshots, so keys written after creation may or may not show; every
-    /// other key must appear exactly as the model has it.
+    /// Creates or advances a long-lived iterator, which must return the
+    /// model's entries as they stood when it was created.
     fn step_iter(&mut self) -> Result<(), String> {
         if self.iters.is_empty() || (self.iters.len() < 3 && self.rng.chance(0.3)) {
             let start = self.key();
@@ -452,7 +445,9 @@ impl Sim {
                 crate::tree::io::arm_prefetch();
             }
             let it = self.db().iter(&start, end.as_deref());
-            self.iters.push(Iter { it, start, end, last: None, dirty: BTreeSet::new() });
+            let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+            let expected = self.model.state.range::<Vec<u8>, _>((Bound::Included(start), hi)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.iters.push(Iter { it, expected });
             return Ok(());
         }
         let i = self.rng.below(self.iters.len() as u64) as usize;
@@ -467,36 +462,20 @@ impl Sim {
                 }
                 Err(e) => return Err(format!("iterator failed: {e}")),
             };
-            let after = |k: &Vec<u8>| match &it.last {
-                Some(last) => k > last,
-                None => *k >= it.start,
-            };
-            if let Some((k, _)) = &next
-                && !after(&k.to_vec())
-            {
-                return Err("iterator went backwards or before its start".into());
-            }
-            let upto = next.as_ref().map(|(k, _)| k.to_vec()).or_else(|| it.end.clone());
-            let skipped = self
-                .model
-                .state
-                .keys()
-                .filter(|k| after(k))
-                .take_while(|k| upto.as_ref().is_none_or(|u| *k < u))
-                .find(|k| !it.dirty.contains(*k));
-            if let Some(k) = skipped {
-                return Err(format!("iterator skipped unchanged key {:?}", Bytes::copy_from_slice(k)));
-            }
-            match next {
-                None => {
+            let want = it.expected.pop_front();
+            match (next, want) {
+                (None, None) => {
                     self.iters.remove(i);
                     return Ok(());
                 }
-                Some((k, v)) => {
-                    if !it.dirty.contains(&k[..]) && self.model.state.get(&k[..]).map(|v| &v[..]) != Some(&v[..]) {
-                        return Err(format!("iterator returned a wrong value for {k:?}"));
-                    }
-                    it.last = Some(k.to_vec());
+                (Some((k, v)), Some((wk, wv))) if k[..] == wk[..] && v[..] == wv[..] => {}
+                (got, want) => {
+                    let show = |e: Option<(&[u8], usize)>| e.map(|(k, n)| format!("{:?} ({n} value bytes)", Bytes::copy_from_slice(k)));
+                    return Err(format!(
+                        "iterator returned {:?}, expected {:?} from its snapshot",
+                        show(got.as_ref().map(|(k, v)| (&k[..], v.len()))),
+                        show(want.as_ref().map(|(k, v)| (&k[..], v.len())))
+                    ));
                 }
             }
         }

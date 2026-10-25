@@ -263,6 +263,9 @@ struct Inner {
     poisoned: AtomicBool,
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
+    /// Readers see sequence numbers up to this one. Batches publish in
+    /// sequence order once inserted, so it always ends a whole batch.
+    visible: AtomicU64,
     timing: Timing,
     merge_pool: Option<rayon::ThreadPool>,
 }
@@ -379,6 +382,7 @@ impl Db {
             poisoned: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
+            visible: AtomicU64::new(last_seq),
             timing: Timing::default(),
             merge_pool,
             opts,
@@ -459,8 +463,9 @@ impl Db {
             .collect())
     }
 
-    /// An iterator over live entries with keys in `[start, end)`. It reads
-    /// the memtables lazily, so it sees some writes made after it was created.
+    /// An iterator over live entries with keys in `[start, end)` as of one
+    /// snapshot: it sees every batch written before the call returned and
+    /// none written after.
     pub fn iter(&self, start: &[u8], end: Option<&[u8]>) -> DbIter {
         DbIter::new(self.inner.clone(), start, end)
     }
@@ -672,9 +677,11 @@ impl Inner {
                 (w.active.clone(), seq, shard, flush)
             };
             let flushed = flush.map_or(Ok(()), |f| f.write());
+            let last = seq + ops.len() as u64 - 1;
             for (i, op) in ops.into_iter().enumerate() {
                 mem.table.insert(&op.key, op.value, seq + i as u64);
             }
+            self.publish(seq, last);
             mem.inflight.exit(shard);
             self.poison_on_err(flushed)
         })
@@ -719,13 +726,36 @@ impl Inner {
         Ok(())
     }
 
+    /// Makes sequence numbers `first..=last` visible once every earlier
+    /// batch is, so readers never see part of a batch. Writers insert outside
+    /// the writer lock, so a batch may finish before an earlier one.
+    fn publish(&self, first: u64, last: u64) {
+        let mut spins = 0;
+        while self.visible.load(Acquire) != first - 1 {
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        self.visible.store(last, Release);
+    }
+
+    /// A snapshot for reading `v`. It is taken after loading the version,
+    /// so it covers every batch the version's tree holds.
+    fn snapshot(&self, _v: &Version) -> u64 {
+        self.visible.load(Acquire)
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let v = self.version.load();
-        if let Some(val) = v.active.table.get(key) {
+        let snapshot = self.snapshot(&v);
+        if let Some(val) = v.active.table.get(key, snapshot) {
             return Ok(val.into_put());
         }
         for m in &v.frozen {
-            if let Some(val) = m.table.get(key) {
+            if let Some(val) = m.table.get(key, snapshot) {
                 return Ok(val.into_put());
             }
         }
@@ -918,6 +948,7 @@ pub struct DbIter {
 
 struct MemSource {
     mem: Arc<Mem>,
+    snapshot: u64,
     buf: VecDeque<(Bytes, Value)>,
     start: Bound<Bytes>,
     end: Option<Bytes>,
@@ -942,7 +973,7 @@ impl MemSource {
             Bound::Excluded(k) => Bound::Excluded(&k[..]),
             Bound::Unbounded => Bound::Unbounded,
         };
-        self.mem.table.range(start, self.end.as_deref(), self.chunk, &mut out);
+        self.mem.table.range(start, self.end.as_deref(), self.snapshot, self.chunk, &mut out);
         self.exhausted = out.len() < self.chunk;
         self.chunk = (self.chunk * 2).min(MEM_CHUNK_MAX);
         if let Some((k, _)) = out.last() {
@@ -989,12 +1020,14 @@ impl EntryView<'_> {
 impl DbIter {
     fn new(inner: Arc<Inner>, start: &[u8], end: Option<&[u8]>) -> Self {
         let version = inner.version.load_full();
+        let snapshot = inner.snapshot(&version);
         let end_b = end.map(Bytes::copy_from_slice);
         let start_b = Bytes::copy_from_slice(start);
         let mems = std::iter::once(&version.active)
             .chain(&version.frozen)
             .map(|m| MemSource {
                 mem: m.clone(),
+                snapshot,
                 buf: VecDeque::new(),
                 start: Bound::Included(start_b.clone()),
                 end: end_b.clone(),

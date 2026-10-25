@@ -146,11 +146,11 @@ fn main() {
             let table = new_memtable(kind);
             let ins = run(t, n, |i| table.insert(&mix(i).to_be_bytes(), Value::Put(value.clone()), i));
             let get = run(t, n, |i| {
-                std::hint::black_box(table.get(&mix(mix(i) % n).to_be_bytes()));
+                std::hint::black_box(table.get(&mix(mix(i) % n).to_be_bytes(), u64::MAX));
             });
             let scan = run(t, n / 100, |i| {
                 let mut out = Vec::with_capacity(100);
-                table.range(Bound::Included(&mix(mix(i) % n).to_be_bytes()), None, 100, &mut out);
+                table.range(Bound::Included(&mix(mix(i) % n).to_be_bytes()), None, u64::MAX, 100, &mut out);
                 std::hint::black_box(out);
             });
             println!("{name},{t},{ins:.2},{get:.2},{scan:.3}");
