@@ -26,6 +26,8 @@ pub struct Args {
     pub records: u64,
     pub ops: u64,
     pub threads: usize,
+    /// Client threads for the load phase; RocksDB loads fastest with fewer.
+    pub load_threads: usize,
     pub value_size: usize,
     pub cache_mb: u64,
     pub leaf_kb: u64,
@@ -35,7 +37,6 @@ pub struct Args {
     pub merge_threads: usize,
     pub wal_buffer_kb: usize,
     pub fjall_workers: usize,
-    pub fjall_memtable_mb: u64,
     pub fjall_manual_persist: bool,
     pub max_levels: usize,
     pub filter_bits: u32,
@@ -44,6 +45,14 @@ pub struct Args {
     pub keep: bool,
     /// Finish background work after the load, outside any timed phase.
     pub settle: bool,
+}
+
+impl Args {
+    /// Memtable size for every engine: turtlekv's checkpoint distance in
+    /// leaf-sized batches.
+    pub fn memtable_bytes(&self) -> u64 {
+        self.chi * (self.leaf_kb << 10)
+    }
 }
 
 fn parse_args() -> Args {
@@ -58,6 +67,7 @@ fn parse_args() -> Args {
         records: num("--records", 10_000_000),
         ops: num("--ops", 5_000_000),
         threads: num("--threads", threads as u64) as usize,
+        load_threads: num("--load-threads", num("--threads", threads as u64)) as usize,
         value_size: num("--value-size", 120) as usize,
         cache_mb: num("--cache-mb", 1024),
         leaf_kb: num("--leaf-kb", 4096),
@@ -67,7 +77,6 @@ fn parse_args() -> Args {
         merge_threads: num("--merge-threads", 4) as usize,
         wal_buffer_kb: num("--wal-buffer-kb", 1024) as usize,
         fjall_workers: num("--fjall-workers", 8) as usize,
-        fjall_memtable_mb: num("--fjall-memtable-mb", 64),
         fjall_manual_persist: num("--fjall-manual-persist", 1) == 1,
         max_levels: num("--max-levels", 4) as usize,
         filter_bits: num("--filter-bits", 12) as u32,
@@ -170,7 +179,7 @@ fn new_hists() -> Vec<Histogram<u64>> {
 fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
     let next = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
-    let handles: Vec<_> = (0..args.threads)
+    let handles: Vec<_> = (0..args.load_threads)
         .map(|t| {
             let (engine, next) = (engine.clone(), next.clone());
             let (records, vsize) = (args.records, args.value_size);
@@ -318,7 +327,7 @@ fn main() {
             args.engine,
             args.label,
             phase,
-            args.threads,
+            if phase == "load" { args.load_threads } else { args.threads },
             records.load(Ordering::SeqCst),
             result.ops,
             secs,

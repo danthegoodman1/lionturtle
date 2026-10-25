@@ -8,7 +8,8 @@ pub trait Engine: Send + Sync {
     fn put(&self, key: &[u8], value: &[u8]);
     /// Returns the value's length, if found.
     fn get(&self, key: &[u8]) -> Option<usize>;
-    /// Reads up to `n` entries from `start`; returns how many it read.
+    /// Reads up to `n` entries from `start`, touching every key and value;
+    /// returns how many it read.
     fn scan(&self, start: &[u8], n: usize) -> usize;
     fn stats_json(&self) -> String {
         "{}".into()
@@ -68,7 +69,11 @@ impl Engine for Turtle {
     }
 
     fn scan(&self, start: &[u8], n: usize) -> usize {
-        self.db.scan(start, None, n).unwrap().len()
+        let rows = self.db.scan(start, None, n).unwrap();
+        for (k, v) in &rows {
+            std::hint::black_box(k.len() + v.len());
+        }
+        rows.len()
     }
 
     fn stats_json(&self) -> String {
@@ -111,7 +116,7 @@ impl Fjall {
             .manual_journal_persist(args.fjall_manual_persist)
             .open()
             .unwrap();
-        let memtable = args.fjall_memtable_mb << 20;
+        let memtable = args.memtable_bytes();
         let manual = args.fjall_manual_persist;
         let ks = db
             .keyspace("bench", move || {
@@ -137,7 +142,8 @@ impl Engine for Fjall {
     fn scan(&self, start: &[u8], n: usize) -> usize {
         let mut count = 0;
         for kv in self.ks.range(start..).take(n) {
-            let _ = kv.into_inner().unwrap();
+            let (k, v) = kv.into_inner().unwrap();
+            std::hint::black_box(k.len() + v.len());
             count += 1;
         }
         count
@@ -156,7 +162,7 @@ impl Rocks {
         opts.create_if_missing(true);
         opts.increase_parallelism(args.threads as i32);
         opts.set_max_subcompactions(args.threads as u32);
-        opts.set_write_buffer_size(64 << 20);
+        opts.set_write_buffer_size(args.memtable_bytes() as usize);
         let mut block = rocksdb::BlockBasedOptions::default();
         let cache = rocksdb::Cache::new_lru_cache((args.cache_mb << 20) as usize);
         block.set_block_cache(&cache);
@@ -187,7 +193,10 @@ impl Engine for Rocks {
         let mut it = self.db.raw_iterator();
         it.seek(start);
         let mut count = 0;
-        while it.valid() && count < n {
+        while count < n
+            && let (Some(k), Some(v)) = (it.key(), it.value())
+        {
+            std::hint::black_box(k.len() + v.len());
             count += 1;
             it.next();
         }
