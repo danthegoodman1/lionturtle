@@ -122,6 +122,78 @@ impl Inflight {
     }
 }
 
+/// Batches in flight between taking their sequence numbers, in ticket
+/// order under the writer lock, and becoming visible. A batch becomes
+/// visible once it and every earlier batch are in the memtable, so readers
+/// never see part of a batch. Whichever writer holds the advance lock
+/// publishes every finished batch at once, so publication keeps pace with
+/// many writers rather than passing from each writer to the next.
+struct Publisher {
+    /// Readers see sequence numbers up to this one.
+    visible: AtomicU64,
+    /// The last sequence number of each finished, unpublished batch, by
+    /// ticket modulo the ring size; zero for none.
+    done: Box<[Slot]>,
+    /// The next ticket to publish. Holding the lock is advancing.
+    next: Mutex<u64>,
+}
+
+#[repr(align(128))]
+struct Slot(AtomicU64);
+
+/// Batches that may finish ahead of the oldest unpublished one. Each writer
+/// thread has at most one batch in flight.
+const PUBLISH_RING: u64 = 1024;
+
+impl Publisher {
+    fn new(visible: u64) -> Self {
+        Self {
+            visible: AtomicU64::new(visible),
+            done: (0..PUBLISH_RING).map(|_| Slot(AtomicU64::new(0))).collect(),
+            next: Mutex::new(0),
+        }
+    }
+
+    /// Marks batch `ticket`, ending at sequence number `last`, inserted, and
+    /// returns once it is visible.
+    fn publish(&self, ticket: u64, last: u64) {
+        let slot = &self.done[(ticket % PUBLISH_RING) as usize].0;
+        // The slot frees when the batch a ring earlier publishes.
+        let mut spins = 0;
+        while slot.load(Acquire) != 0 {
+            backoff(&mut spins);
+        }
+        slot.store(last, Release);
+        loop {
+            if let Some(mut next) = self.next.try_lock() {
+                loop {
+                    let s = &self.done[(*next % PUBLISH_RING) as usize].0;
+                    let end = s.load(Acquire);
+                    if end == 0 {
+                        break;
+                    }
+                    self.visible.store(end, Release);
+                    s.store(0, Release);
+                    *next += 1;
+                }
+            }
+            if self.visible.load(Acquire) >= last {
+                return;
+            }
+            backoff(&mut spins);
+        }
+    }
+}
+
+fn backoff(spins: &mut u32) {
+    if *spins < 64 {
+        std::hint::spin_loop();
+        *spins += 1;
+    } else {
+        std::thread::yield_now();
+    }
+}
+
 impl Mem {
     fn new(id: u64, kind: MemTableKind, last_seq: u64) -> Self {
         Self {
@@ -199,6 +271,8 @@ pub struct Version {
 struct Writer {
     wal: WalWriter,
     next_seq: u64,
+    /// Publication order of the next batch; see [`Publisher`].
+    next_ticket: u64,
     active: Arc<Mem>,
     user_bytes: u64,
     wal_bytes: u64,
@@ -265,9 +339,7 @@ struct Inner {
     poisoned: AtomicBool,
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
-    /// Readers see sequence numbers up to this one. Batches publish in
-    /// sequence order once inserted, so it always ends a whole batch.
-    visible: AtomicU64,
+    publisher: Publisher,
     timing: Timing,
     merge_pool: Option<rayon::ThreadPool>,
 }
@@ -375,7 +447,7 @@ impl Db {
             io,
             version: ArcSwap::from_pointee(version),
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, active, user_bytes: 0, wal_bytes: 0 }),
+            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, next_ticket: 0, active, user_bytes: 0, wal_bytes: 0 }),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
@@ -384,7 +456,7 @@ impl Db {
             poisoned: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
-            visible: AtomicU64::new(last_seq),
+            publisher: Publisher::new(last_seq),
             timing: Timing::default(),
             merge_pool,
             opts,
@@ -655,7 +727,7 @@ impl Inner {
             // Everything but the sequence number is encoded and checksummed
             // before taking the lock, which keeps the critical section short.
             body.encode(&ops);
-            let (mem, seq, shard, flush) = {
+            let (mem, seq, shard, flush, ticket) = {
                 let mut w = self.writer.lock();
                 self.check_poisoned()?;
                 if w.active.bytes() >= self.opts.memtable_limit() {
@@ -677,14 +749,16 @@ impl Inner {
                 w.active.last_seq.store(seq + ops.len() as u64 - 1, Relaxed);
                 w.active.bytes.fetch_add(entry_bytes, Relaxed);
                 let shard = w.active.inflight.enter();
-                (w.active.clone(), seq, shard, flush)
+                let ticket = w.next_ticket;
+                w.next_ticket += 1;
+                (w.active.clone(), seq, shard, flush, ticket)
             };
             let flushed = flush.map_or(Ok(()), |f| f.write());
             let last = seq + ops.len() as u64 - 1;
             for (i, op) in ops.into_iter().enumerate() {
                 mem.table.insert(&op.key, op.value, seq + i as u64);
             }
-            self.publish(seq, last);
+            self.publisher.publish(ticket, last);
             mem.inflight.exit(shard);
             self.poison_on_err(flushed)
         })
@@ -729,26 +803,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Makes sequence numbers `first..=last` visible once every earlier
-    /// batch is, so readers never see part of a batch. Writers insert outside
-    /// the writer lock, so a batch may finish before an earlier one.
-    fn publish(&self, first: u64, last: u64) {
-        let mut spins = 0;
-        while self.visible.load(Acquire) != first - 1 {
-            if spins < 64 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                std::thread::yield_now();
-            }
-        }
-        self.visible.store(last, Release);
-    }
-
     /// A snapshot for reading `v`. It is taken after loading the version,
     /// so it covers every batch the version's tree holds.
     fn snapshot(&self, _v: &Version) -> u64 {
-        self.visible.load(Acquire)
+        self.publisher.visible.load(Acquire)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
