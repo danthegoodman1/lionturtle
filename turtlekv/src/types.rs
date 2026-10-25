@@ -1,4 +1,19 @@
 use bytes::Bytes;
+use std::cmp::Ordering;
+
+/// Compares keys lexicographically, taking the first eight bytes as one
+/// integer when both keys have them.
+#[inline]
+pub fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
+    if a.len() >= 8 && b.len() >= 8 {
+        let x = u64::from_be_bytes(a[..8].try_into().unwrap());
+        let y = u64::from_be_bytes(b[..8].try_into().unwrap());
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    a.cmp(b)
+}
 
 /// The newest state of a key: a value or a tombstone.
 #[derive(Clone, Debug, PartialEq, Eq)]

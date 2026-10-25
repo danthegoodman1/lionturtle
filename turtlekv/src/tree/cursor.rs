@@ -13,19 +13,7 @@ use bytes::Bytes;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// Compares keys, taking the first eight bytes as one integer when both
-/// keys have them.
-#[inline]
-pub fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
-    if a.len() >= 8 && b.len() >= 8 {
-        let x = u64::from_be_bytes(a[..8].try_into().unwrap());
-        let y = u64::from_be_bytes(b[..8].try_into().unwrap());
-        if x != y {
-            return x.cmp(&y);
-        }
-    }
-    a.cmp(b)
-}
+pub use crate::types::cmp_keys;
 
 #[inline]
 fn keys_equal(a: &[u8], b: &[u8]) -> bool {

@@ -10,7 +10,7 @@ use crate::pagestore::{PagePtr, PageStore};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use quick_cache::sync::Cache;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -54,7 +54,12 @@ impl DataPage {
         self.ptr.get().is_some()
     }
 
+    /// The in-memory image of a page not yet written. A written page skips
+    /// the lock: once written, its blocks come from the cache or disk.
     fn pinned(&self) -> Option<Bytes> {
+        if self.is_written() {
+            return None;
+        }
         self.pinned.lock().clone()
     }
 
@@ -84,7 +89,38 @@ impl quick_cache::Weighter<(PageId, u32), Cached> for Weigh {
 
 const IMAGE: u32 = u32::MAX;
 
-type Hasher = BuildHasherDefault<std::hash::DefaultHasher>;
+/// Hashes a cache key, a page id and a block number, by folding the words
+/// together and finishing with splitmix64's avalanche. It has no random
+/// seed, so simulated runs replay exactly.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = self.0.rotate_left(32) ^ n;
+    }
+}
+
+type BuildKeyHasher = BuildHasherDefault<KeyHasher>;
 
 #[derive(Default, Debug)]
 pub struct IoCounters {
@@ -93,14 +129,13 @@ pub struct IoCounters {
     pub span_read_bytes: AtomicU64,
     pub pages_written: AtomicU64,
     pub page_bytes_written: AtomicU64,
-    pub cache_hits: AtomicU64,
 }
 
 /// Reads and writes data pages through a byte-weighted cache. The cache
 /// hashes deterministically, so simulated runs replay exactly.
 pub struct PageIo {
     pub store: PageStore,
-    cache: Cache<(PageId, u32), Cached, Weigh, Hasher>,
+    cache: Cache<(PageId, u32), Cached, Weigh, BuildKeyHasher>,
     pub counters: IoCounters,
 }
 
@@ -116,7 +151,7 @@ impl PageIo {
             .expect("valid cache options");
         Self {
             store,
-            cache: Cache::with_options(options, Weigh, Hasher::default(), Default::default()),
+            cache: Cache::with_options(options, Weigh, BuildKeyHasher::default(), Default::default()),
             counters: IoCounters::default(),
         }
     }
@@ -132,11 +167,9 @@ impl PageIo {
         }
         let id = page.id();
         if let Some(Cached::Image(image)) = self.cache.get(&(id, IMAGE)) {
-            self.counters.cache_hits.fetch_add(1, Relaxed);
             return Block::decode_trusted(image.slice(range));
         }
         if let Some(Cached::Block(block)) = self.cache.get(&(id, b as u32)) {
-            self.counters.cache_hits.fetch_add(1, Relaxed);
             return Ok(block);
         }
         let ptr = page.ptr().expect("unpinned page is written");
@@ -158,7 +191,6 @@ impl PageIo {
             return Ok((image.slice(range), false));
         }
         if let Some(Cached::Image(image)) = self.cache.get(&(page.id(), IMAGE)) {
-            self.counters.cache_hits.fetch_add(1, Relaxed);
             return Ok((image.slice(range), false));
         }
         let ptr = page.ptr().expect("unpinned page is written");

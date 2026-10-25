@@ -998,25 +998,57 @@ impl TreeScan {
         Ok(())
     }
 
-    /// The next live entry, skipping tombstones.
-    pub fn next(&mut self, io: &PageIo) -> Result<Option<(Bytes, Bytes)>> {
+    /// Moves to the next live entry, skipping tombstones and opening leaf
+    /// ranges as needed. At a live entry, does nothing.
+    pub fn settle(&mut self, io: &PageIo) -> Result<()> {
         loop {
             if let Some(m) = self.merger.as_mut() {
-                if let Some((key, value)) = m.peek_owned() {
-                    let out = value.map(|v| (key, v));
-                    m.advance(io)?;
-                    match out {
-                        Some(kv) => return Ok(Some(kv)),
-                        None => continue,
+                match m.peek() {
+                    Some(e) if e.value.is_some() => return Ok(()),
+                    Some(_) => {
+                        m.advance(io)?;
+                        continue;
                     }
+                    None => self.merger = None,
                 }
-                self.merger = None;
             }
             match self.next_start.take() {
                 Some(start) => self.open_range(io, start)?,
-                None => return Ok(None),
+                None => return Ok(()),
             }
         }
+    }
+
+    /// The current live entry, after [`TreeScan::settle`].
+    #[inline]
+    pub fn peek(&self) -> Option<(&[u8], &[u8])> {
+        let e = self.merger.as_ref()?.peek()?;
+        Some((e.key, e.value?))
+    }
+
+    /// The current entry as slices sharing its block's buffer.
+    pub fn peek_owned(&self) -> Option<(Bytes, Bytes)> {
+        match self.merger.as_ref()?.peek_owned()? {
+            (k, Some(v)) => Some((k, v)),
+            (_, None) => None,
+        }
+    }
+
+    /// Moves past the current entry. Call [`TreeScan::settle`] before the
+    /// next peek.
+    pub fn advance(&mut self, io: &PageIo) -> Result<()> {
+        match self.merger.as_mut() {
+            Some(m) => m.advance(io),
+            None => Ok(()),
+        }
+    }
+
+    /// The next live entry.
+    pub fn next(&mut self, io: &PageIo) -> Result<Option<(Bytes, Bytes)>> {
+        self.settle(io)?;
+        let out = self.peek_owned();
+        self.advance(io)?;
+        Ok(out)
     }
 }
 

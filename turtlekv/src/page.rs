@@ -22,6 +22,7 @@
 
 use crate::bloom;
 use crate::error::{Result, corruption};
+use crate::types::cmp_keys;
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::ops::Bound;
@@ -203,7 +204,7 @@ impl PageMeta {
         let (mut lo, mut hi) = (0usize, self.n_blocks as usize);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.block_first_key(mid) <= key {
+            if cmp_keys(self.block_first_key(mid), key) != Ordering::Greater {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -226,7 +227,7 @@ impl PageMeta {
                 let (mut l, mut h) = (0usize, n);
                 while l < h {
                     let mid = (l + h) / 2;
-                    if self.block_first_key(mid) < hi {
+                    if cmp_keys(self.block_first_key(mid), hi) == Ordering::Less {
                         l = mid + 1;
                     } else {
                         h = mid;
@@ -364,7 +365,7 @@ impl Block {
         let (mut lo, mut hi) = (0usize, self.count);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            match self.entry(mid).key.cmp(key) {
+            match cmp_keys(self.entry(mid).key, key) {
                 Ordering::Less => lo = mid + 1,
                 Ordering::Greater => hi = mid,
                 Ordering::Equal => return Ok(mid),

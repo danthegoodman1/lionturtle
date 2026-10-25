@@ -39,6 +39,10 @@ pub struct Args {
     pub max_levels: usize,
     pub filter_bits: u32,
     pub label: String,
+    /// Leave the data directory in place after the run.
+    pub keep: bool,
+    /// Finish background work after the load, outside any timed phase.
+    pub settle: bool,
 }
 
 fn parse_args() -> Args {
@@ -66,6 +70,8 @@ fn parse_args() -> Args {
         max_levels: num("--max-levels", 4) as usize,
         filter_bits: num("--filter-bits", 12) as u32,
         label: get("--label").unwrap_or_default(),
+        keep: num("--keep", 0) == 1,
+        settle: num("--settle", 0) == 1,
     }
 }
 
@@ -263,7 +269,10 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
 
 fn main() {
     let args = parse_args();
-    let _ = std::fs::remove_dir_all(&args.dir);
+    // Without a load phase, the run reuses the data a kept run left behind.
+    if args.phases.iter().any(|p| p == "load") {
+        let _ = std::fs::remove_dir_all(&args.dir);
+    }
     std::fs::create_dir_all(&args.dir).unwrap();
     let engine: Arc<dyn Engine> = engines::open(&args);
     let records = Arc::new(AtomicU64::new(0));
@@ -273,6 +282,9 @@ fn main() {
         let result = if phase == "load" {
             let r = run_load(&engine, &args);
             records.store(args.records, Ordering::SeqCst);
+            if args.settle {
+                engine.settle();
+            }
             r
         } else {
             if records.load(Ordering::SeqCst) == 0 {
@@ -321,5 +333,7 @@ fn main() {
         );
     }
     drop(engine);
-    let _ = std::fs::remove_dir_all(&args.dir);
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&args.dir);
+    }
 }

@@ -20,7 +20,7 @@ use crate::pagestore::{PagePtr, PageStore, Superblock};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, PageIo};
 use crate::tree::{self, Ctx, Subtree, TreeConfig, TreeScan};
-use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Value, WriteOp};
+use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Value, WriteOp, cmp_keys};
 use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -190,7 +190,6 @@ pub struct DbStats {
     pub block_reads: u64,
     pub span_reads: u64,
     pub span_read_bytes: u64,
-    pub cache_hits: u64,
     pub cache_bytes: u64,
     pub memtable_bytes: u64,
     pub frozen_memtables: usize,
@@ -369,16 +368,45 @@ impl Db {
     }
 
     /// Up to `limit` live entries with keys in `[start, end)`, in order.
+    ///
+    /// Small entries are copied into one buffer per call. Sharing them would
+    /// make every result touch the reference count of a cached block, and
+    /// threads scanning the same hot blocks contend on those counts.
     pub fn scan(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+        enum Part {
+            Copied(usize, usize, usize),
+            Shared(Bytes, Bytes),
+        }
+        const COPY_LIMIT: usize = 512;
         let mut it = self.iter(start, end);
-        let mut out = Vec::with_capacity(limit.min(1024));
-        while out.len() < limit {
-            match it.next()? {
-                Some(kv) => out.push(kv),
+        let mut buf = Vec::with_capacity(4096);
+        let mut parts = Vec::with_capacity(limit.min(1024));
+        while parts.len() < limit {
+            let part = it.step(|e| {
+                let (k, v) = (e.key(), e.value());
+                if k.len() + v.len() <= COPY_LIMIT {
+                    let at = buf.len();
+                    buf.extend_from_slice(k);
+                    buf.extend_from_slice(v);
+                    Part::Copied(at, k.len(), v.len())
+                } else {
+                    let (k, v) = e.to_owned();
+                    Part::Shared(k, v)
+                }
+            })?;
+            match part {
+                Some(p) => parts.push(p),
                 None => break,
             }
         }
-        Ok(out)
+        let buf = Bytes::from(buf);
+        Ok(parts
+            .into_iter()
+            .map(|p| match p {
+                Part::Copied(at, kl, vl) => (buf.slice(at..at + kl), buf.slice(at + kl..at + kl + vl)),
+                Part::Shared(k, v) => (k, v),
+            })
+            .collect())
     }
 
     /// An iterator over live entries with keys in `[start, end)`. It reads
@@ -462,7 +490,6 @@ impl Db {
             block_reads: c.block_reads.load(Relaxed),
             span_reads: c.span_reads.load(Relaxed),
             span_read_bytes: c.span_read_bytes.load(Relaxed),
-            cache_hits: c.cache_hits.load(Relaxed),
             cache_bytes: inner.io.cache_weight(),
             memtable_bytes: v.active.bytes() + v.frozen.iter().map(|m| m.bytes()).sum::<u64>(),
             frozen_memtables: v.frozen.len(),
@@ -811,8 +838,6 @@ pub struct DbIter {
     /// Newest first; the tree comes last.
     mems: Vec<MemSource>,
     tree: TreeScan,
-    tree_peek: Option<(Bytes, Bytes)>,
-    tree_done: bool,
     _version: Arc<Version>,
 }
 
@@ -821,28 +846,68 @@ struct MemSource {
     buf: VecDeque<(Bytes, Value)>,
     start: Bound<Bytes>,
     end: Option<Bytes>,
+    /// Entries the next refill copies. It starts small and doubles, since
+    /// memtables hold a small share of the data and most scans are short.
+    chunk: usize,
     exhausted: bool,
 }
 
-const MEM_CHUNK: usize = 64;
+const MEM_CHUNK_MIN: usize = 8;
+const MEM_CHUNK_MAX: usize = 512;
 
 impl MemSource {
-    fn peek(&mut self) -> Option<&(Bytes, Value)> {
-        if self.buf.is_empty() && !self.exhausted {
-            let mut out = Vec::with_capacity(MEM_CHUNK);
-            let start = match &self.start {
-                Bound::Included(k) => Bound::Included(&k[..]),
-                Bound::Excluded(k) => Bound::Excluded(&k[..]),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            self.mem.table.range(start, self.end.as_deref(), MEM_CHUNK, &mut out);
-            self.exhausted = out.len() < MEM_CHUNK;
-            if let Some((k, _)) = out.last() {
-                self.start = Bound::Excluded(k.clone());
-            }
-            self.buf.extend(out);
+    /// Refills the buffer if it is empty and the memtable may hold more.
+    fn fill(&mut self) {
+        if !self.buf.is_empty() || self.exhausted {
+            return;
         }
-        self.buf.front()
+        let mut out = Vec::with_capacity(self.chunk);
+        let start = match &self.start {
+            Bound::Included(k) => Bound::Included(&k[..]),
+            Bound::Excluded(k) => Bound::Excluded(&k[..]),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        self.mem.table.range(start, self.end.as_deref(), self.chunk, &mut out);
+        self.exhausted = out.len() < self.chunk;
+        self.chunk = (self.chunk * 2).min(MEM_CHUNK_MAX);
+        if let Some((k, _)) = out.last() {
+            self.start = Bound::Excluded(k.clone());
+        }
+        self.buf.extend(out);
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        self.buf.front().map(|(k, _)| &k[..])
+    }
+}
+
+/// A live entry borrowed from the source that holds it.
+enum EntryView<'a> {
+    Mem(&'a Bytes, &'a Bytes),
+    Tree(&'a TreeScan),
+}
+
+impl EntryView<'_> {
+    fn key(&self) -> &[u8] {
+        match self {
+            EntryView::Mem(k, _) => k,
+            EntryView::Tree(t) => t.peek().expect("settled").0,
+        }
+    }
+
+    fn value(&self) -> &[u8] {
+        match self {
+            EntryView::Mem(_, v) => v,
+            EntryView::Tree(t) => t.peek().expect("settled").1,
+        }
+    }
+
+    /// Handles sharing the source's buffers.
+    fn to_owned(&self) -> (Bytes, Bytes) {
+        match self {
+            EntryView::Mem(k, v) => ((*k).clone(), (*v).clone()),
+            EntryView::Tree(t) => t.peek_owned().expect("settled"),
+        }
     }
 }
 
@@ -850,54 +915,78 @@ impl DbIter {
     fn new(inner: Arc<Inner>, start: &[u8], end: Option<&[u8]>) -> Self {
         let version = inner.version.load_full();
         let end_b = end.map(Bytes::copy_from_slice);
+        let start_b = Bytes::copy_from_slice(start);
         let mems = std::iter::once(&version.active)
             .chain(&version.frozen)
             .map(|m| MemSource {
                 mem: m.clone(),
                 buf: VecDeque::new(),
-                start: Bound::Included(Bytes::copy_from_slice(start)),
+                start: Bound::Included(start_b.clone()),
                 end: end_b.clone(),
+                chunk: MEM_CHUNK_MIN,
                 exhausted: false,
             })
             .collect();
         let tree = TreeScan::new(version.tree.clone(), start, end_b);
-        Self { inner, mems, tree, tree_peek: None, tree_done: false, _version: version }
+        Self { inner, mems, tree, _version: version }
     }
 
     pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        self.step(|e| e.to_owned())
+    }
+
+    /// Finds the next live entry, passes it to `f`, and moves past it.
+    fn step<T>(&mut self, f: impl FnOnce(EntryView<'_>) -> T) -> Result<Option<T>> {
+        let io = &self.inner.io;
         loop {
-            if self.tree_peek.is_none() && !self.tree_done {
-                self.tree_peek = self.tree.next(&self.inner.io)?;
-                self.tree_done = self.tree_peek.is_none();
-            }
-            let mut best: Option<Bytes> = None;
+            self.tree.settle(io)?;
             for m in &mut self.mems {
-                if let Some((k, _)) = m.peek()
-                    && best.as_ref().is_none_or(|b| k < b)
+                m.fill();
+            }
+            // The smallest key wins; on a tie the newest source holds it:
+            // memtables newest first, then the tree.
+            let n = self.mems.len();
+            let mut best: Option<(usize, &[u8])> = None;
+            for (i, m) in self.mems.iter().enumerate() {
+                if let Some(k) = m.key()
+                    && best.is_none_or(|(_, b)| cmp_keys(k, b).is_lt())
                 {
-                    best = Some(k.clone());
+                    best = Some((i, k));
                 }
             }
-            if let Some((k, _)) = &self.tree_peek
-                && best.as_ref().is_none_or(|b| k < b)
+            if let Some((k, _)) = self.tree.peek()
+                && best.is_none_or(|(_, b)| cmp_keys(k, b).is_lt())
             {
-                best = Some(k.clone());
+                best = Some((n, k));
             }
-            let Some(key) = best else { return Ok(None) };
-            let mut winner: Option<Option<Bytes>> = None;
-            for m in &mut self.mems {
-                if m.peek().is_some_and(|(k, _)| *k == key) {
-                    let (_, v) = m.buf.pop_front().unwrap();
-                    winner.get_or_insert(v.into_put());
-                }
+            let Some((w, _)) = best else { return Ok(None) };
+            if w == n {
+                let out = f(EntryView::Tree(&self.tree));
+                self.tree.advance(io)?;
+                return Ok(Some(out));
             }
-            if self.tree_peek.as_ref().is_some_and(|(k, _)| *k == key) {
-                let (_, v) = self.tree_peek.take().unwrap();
-                winner.get_or_insert(Some(v));
+            if let Some((k, Value::Put(v))) = self.mems[w].buf.front() {
+                let out = f(EntryView::Mem(k, v));
+                consume_mem(&mut self.mems, &mut self.tree, io, w)?;
+                return Ok(Some(out));
             }
-            if let Some(Some(v)) = winner {
-                return Ok(Some((key, v)));
-            }
+            consume_mem(&mut self.mems, &mut self.tree, io, w)?;
         }
     }
+}
+
+/// Moves past memtable `w`'s front entry and the older entries for the same
+/// key that it shadows.
+fn consume_mem(mems: &mut [MemSource], tree: &mut TreeScan, io: &PageIo, w: usize) -> Result<()> {
+    for j in w + 1..mems.len() {
+        let (l, r) = mems.split_at_mut(j);
+        if r[0].key() == l[w].key() {
+            r[0].buf.pop_front();
+        }
+    }
+    if tree.peek().is_some_and(|(k, _)| Some(k) == mems[w].key()) {
+        tree.advance(io)?;
+    }
+    mems[w].buf.pop_front();
+    Ok(())
 }

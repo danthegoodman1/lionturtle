@@ -13,6 +13,8 @@ pub trait Engine: Send + Sync {
     fn stats_json(&self) -> String {
         "{}".into()
     }
+    /// Finishes background work the writes so far started.
+    fn settle(&self) {}
 }
 
 pub fn open(args: &Args) -> Arc<dyn Engine> {
@@ -56,6 +58,10 @@ impl Engine for Turtle {
         self.db.put(key, value).unwrap();
     }
 
+    fn settle(&self) {
+        self.db.checkpoint().unwrap();
+    }
+
     fn get(&self, key: &[u8]) -> Option<usize> {
         self.db.get(key).unwrap().map(|v| v.len())
     }
@@ -67,14 +73,13 @@ impl Engine for Turtle {
     fn stats_json(&self) -> String {
         let s = self.db.stats();
         format!(
-            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_hits":{},"cache_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"stage_secs":{:?}}}"#,
+            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"stage_secs":{:?}}}"#,
             s.checkpoints,
             s.page_bytes_written as f64 / 1e6,
             s.pages_written,
             s.block_reads,
             s.span_reads,
             s.span_read_bytes as f64 / 1e6,
-            s.cache_hits,
             s.cache_bytes as f64 / 1e6,
             s.memtable_bytes as f64 / 1e6,
             s.frozen_memtables,
