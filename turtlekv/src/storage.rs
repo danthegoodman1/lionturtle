@@ -15,8 +15,10 @@ pub trait Storage: Send + Sync {
     /// Opens `name`, creating an empty file when `create` is set and none exists.
     fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>>;
     fn remove(&self, name: &str) -> io::Result<()>;
+    /// Renames `from` to `to`, replacing any file named `to`.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()>;
     fn list(&self) -> io::Result<Vec<String>>;
-    /// Makes earlier creations and removals durable.
+    /// Makes earlier creations, removals and renames durable.
     fn sync_dir(&self) -> io::Result<()>;
 }
 
@@ -66,6 +68,10 @@ impl Storage for FsStorage {
 
     fn remove(&self, name: &str) -> io::Result<()> {
         std::fs::remove_file(self.dir.join(name))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        std::fs::rename(self.dir.join(from), self.dir.join(to))
     }
 
     fn list(&self) -> io::Result<Vec<String>> {

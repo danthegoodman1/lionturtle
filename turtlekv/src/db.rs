@@ -400,6 +400,7 @@ struct Inner {
     commits: Commits,
     timing: Timing,
     merge_pool: Option<rayon::ThreadPool>,
+    recycler: wal::Recycler,
 }
 
 /// Cumulative nanoseconds spent in each checkpoint stage, and by writers
@@ -466,6 +467,7 @@ impl Db {
                 storage.remove(&wal::segment_name(id))?;
                 continue;
             }
+            let before = last_seq;
             let r = wal::replay(&*storage, id, last_seq, |seq, op| replayed.insert(&op, seq))?;
             // Replay may have read records that only reached the OS cache
             // (after a process crash). New writes build on them, so they must
@@ -475,7 +477,12 @@ impl Db {
                 eprintln!("recovery: sb {sb:?}, segment {id}: {} -> {} {:?}", last_seq, r.last_seq, r.end);
             }
             last_seq = r.last_seq;
-            if r.end == wal::End::Gap {
+            // A gap after replayed records ends this segment's history like a
+            // torn record: the segment is the last one written before the
+            // crash, and replay always stops at the same place. A gap before
+            // any record means this segment and every later one were written
+            // after the crash point.
+            if r.end == wal::End::Gap && r.last_seq == before {
                 gap = true;
                 storage.remove(&wal::segment_name(id))?;
             }
@@ -487,7 +494,8 @@ impl Db {
             frozen.push(Arc::new(mem));
         }
         let active_id = max_id + 1;
-        let wal = WalWriter::create(&*storage, active_id)?;
+        let recycler = wal::Recycler::open(&*storage, active_id)?;
+        let wal = WalWriter::create(&*storage, active_id, recycler.take())?;
         let active = Arc::new(Mem::new(active_id, opts.memtable, last_seq));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
@@ -517,6 +525,7 @@ impl Db {
             commits: Commits::new(last_seq),
             timing: Timing::default(),
             merge_pool,
+            recycler,
             opts,
         });
         // Two pipeline stages, as in the paper: one thread applies the next
@@ -591,8 +600,12 @@ impl Db {
     /// Makes every completed write durable.
     pub fn sync(&self) -> Result<()> {
         self.inner.check_poisoned()?;
-        let mut w = self.inner.writer.lock();
-        let r = w.wal.sync();
+        let (flush, log_sync, end) = {
+            let mut w = self.inner.writer.lock();
+            let flush = (w.wal.buffered() > 0).then(|| w.wal.start_flush());
+            (flush, w.wal.log_sync(), w.wal.len())
+        };
+        let r = flush.map_or(Ok(()), |f| f.write()).and_then(|()| log_sync.sync_to(end));
         self.inner.poison_on_err(r)
     }
 
@@ -771,7 +784,7 @@ impl Inner {
             // Everything but the sequence number is encoded and checksummed
             // before taking the lock, which keeps the critical section short.
             body.encode(&ops);
-            let (mem, seq, shard, flush, ticket) = {
+            let (mem, seq, shard, flush, sync_to, ticket) = {
                 let mut w = self.writer.lock();
                 self.check_poisoned()?;
                 if w.active.bytes() >= self.opts.memtable_limit() {
@@ -783,10 +796,13 @@ impl Inner {
                 w.wal.append_body(body, seq);
                 w.user_bytes += user_bytes;
                 w.wal_bytes += body.record_len() as u64;
+                // A synchronous writer writes and syncs after releasing the
+                // lock, sharing its fsync with writers that arrive meanwhile.
                 let mut flush = None;
+                let mut sync_to = None;
                 if sync {
-                    let r = w.wal.sync();
-                    self.poison_on_err(r)?;
+                    flush = Some(w.wal.start_flush());
+                    sync_to = Some((w.wal.log_sync(), w.wal.len()));
                 } else if w.wal.buffered() >= self.opts.wal_buffer_bytes {
                     flush = Some(w.wal.start_flush());
                 }
@@ -796,9 +812,12 @@ impl Inner {
                 let ticket = w.next_ticket;
                 w.next_ticket += 1;
                 self.commits.register(ticket, seq + ops.len() as u64 - 1);
-                (w.active.clone(), seq, shard, flush, ticket)
+                (w.active.clone(), seq, shard, flush, sync_to, ticket)
             };
-            let flushed = flush.map_or(Ok(()), |f| f.write());
+            // A synchronous batch becomes visible once it is durable.
+            let flushed = flush
+                .map_or(Ok(()), |f| f.write())
+                .and_then(|()| sync_to.map_or(Ok(()), |(log_sync, end)| log_sync.sync_to(end)));
             for (i, op) in ops.into_iter().enumerate() {
                 mem.table.insert(&op.key, op.value, seq + i as u64, ticket);
             }
@@ -831,7 +850,7 @@ impl Inner {
         // so that recovery always replays a prefix of history.
         w.wal.sync()?;
         let id = w.active.id + 1;
-        let wal = WalWriter::create(&*self.storage, id)?;
+        let wal = WalWriter::create(&*self.storage, id, self.recycler.take())?;
         let mem = Arc::new(Mem::new(id, self.opts.memtable, w.next_seq - 1));
         {
             let _g = self.version_lock.lock();
@@ -1030,7 +1049,7 @@ impl Inner {
         self.checkpoints.fetch_add(1, Relaxed);
         for id in wal::list_segments(&*self.storage)? {
             if id <= mem.id {
-                self.storage.remove(&wal::segment_name(id))?;
+                self.recycler.retire(&*self.storage, id)?;
             }
         }
         Ok(true)

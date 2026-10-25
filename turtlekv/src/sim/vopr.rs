@@ -116,6 +116,8 @@ struct Sim {
     model: Model,
     keys: Vec<Vec<u8>>,
     max_value: usize,
+    /// Every key has one length and every value `max_value` bytes.
+    fixed_size: bool,
     iters: Vec<Iter>,
     snaps: Vec<Snap>,
     report: Report,
@@ -170,22 +172,26 @@ impl Sim {
         let faults = random_faults(&mut rng);
         let disk = SimStorage::new(rng.next_u64(), faults);
         let nkeys = rng.range(8, 3000) as usize;
+        // Fixed-size records line a reused log segment's old records up with
+        // new ones, so a lost record can leave an old one in its place.
+        let fixed_size = rng.chance(0.2);
+        let fixed_len = rng.range(0, 24) as usize;
         let mut keys = BTreeSet::new();
         while keys.len() < nkeys {
-            let len = rng.range(0, 24) as usize;
+            let len = if fixed_size { fixed_len } else { rng.range(0, 24) as usize };
             let mut k = vec![0u8; len];
             // A small alphabet makes shared prefixes and near-collisions common.
             for b in &mut k {
                 *b = b"aab\x00\xff"[rng.below(5) as usize];
             }
-            if rng.chance(0.7) {
+            if fixed_size || rng.chance(0.7) {
                 k.extend_from_slice(format!("{:06}", rng.below(1_000_000)).as_bytes());
             }
             keys.insert(k);
         }
         let max_value = rng.range(0, (opts.tree.leaf_size / 4).max(1)) as usize;
         if verbose {
-            eprintln!("options: {opts:?}\nfaults: {:?}\nkeys: {nkeys}, max value: {max_value}", disk.faults());
+            eprintln!("options: {opts:?}\nfaults: {:?}\nkeys: {nkeys}, max value: {max_value}, fixed size: {fixed_size}", disk.faults());
         }
         Self {
             rng,
@@ -195,6 +201,7 @@ impl Sim {
             model: Model::default(),
             keys: keys.into_iter().collect(),
             max_value,
+            fixed_size,
             iters: Vec::new(),
             snaps: Vec::new(),
             report: Report::default(),
@@ -245,7 +252,11 @@ impl Sim {
     }
 
     fn value(&mut self) -> Vec<u8> {
-        let len = if self.rng.chance(0.1) { self.max_value } else { self.rng.range(0, self.max_value as u64) as usize };
+        let len = if self.fixed_size || self.rng.chance(0.1) {
+            self.max_value
+        } else {
+            self.rng.range(0, self.max_value as u64) as usize
+        };
         let mut v = vec![0u8; len];
         self.rng.fill(&mut v);
         v

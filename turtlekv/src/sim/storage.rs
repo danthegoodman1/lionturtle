@@ -97,6 +97,7 @@ struct Inode {
 enum DirOp {
     Create { name: String },
     Remove { name: String, ino: u64 },
+    Rename { from: String, to: String, ino: u64, replaced: Option<u64> },
 }
 
 struct State {
@@ -216,6 +217,13 @@ impl SimStorage {
                 DirOp::Remove { name, ino } => {
                     state.names.insert(name, ino);
                 }
+                DirOp::Rename { from, to, ino, replaced } => {
+                    match replaced {
+                        Some(r) => state.names.insert(to, r),
+                        None => state.names.remove(&to),
+                    };
+                    state.names.insert(from, ino);
+                }
             }
         }
         state.dir_log.clear();
@@ -294,6 +302,17 @@ impl Storage for SimStorage {
             }
             None => Err(io::Error::new(io::ErrorKind::NotFound, name.to_string())),
         }
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let generation = state.generation;
+        state.check_up(generation)?;
+        state.tick_mutation()?;
+        let ino = state.names.remove(from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, from.to_string()))?;
+        let replaced = state.names.insert(to.to_string(), ino);
+        state.dir_log.push(DirOp::Rename { from: from.to_string(), to: to.to_string(), ino, replaced });
+        Ok(())
     }
 
     fn list(&self) -> io::Result<Vec<String>> {

@@ -45,6 +45,11 @@ pub struct Args {
     pub keep: bool,
     /// Finish background work after the load, outside any timed phase.
     pub settle: bool,
+    /// Make every write in the timed phases durable before it returns. The
+    /// load stays buffered.
+    pub sync: bool,
+    /// RocksDB reuses retired log files, as turtlekv-rs always does.
+    pub rocksdb_recycle_logs: bool,
 }
 
 impl Args {
@@ -83,6 +88,8 @@ fn parse_args() -> Args {
         label: get("--label").unwrap_or_default(),
         keep: num("--keep", 0) == 1,
         settle: num("--settle", 0) == 1,
+        sync: num("--sync", 0) == 1,
+        rocksdb_recycle_logs: num("--rocksdb-recycle-logs", 0) == 1,
     }
 }
 
@@ -195,7 +202,7 @@ fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
                     for i in start..(start + 1024).min(records) {
                         rng.fill(&mut value);
                         let t0 = Instant::now();
-                        engine.put(&key_of(i), &value);
+                        engine.put(&key_of(i), &value, false);
                         hist[2].record(t0.elapsed().as_nanos() as u64).ok();
                     }
                 }
@@ -225,7 +232,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
         .map(|t| {
             let (engine, zipf, records, scanned) = (engine.clone(), zipf.clone(), records.clone(), scanned.clone());
             let mix = mix.clone();
-            let vsize = args.value_size;
+            let (vsize, sync) = (args.value_size, args.sync);
             let seed = phase.as_bytes()[0] as u64 * 1000 + t as u64;
             std::thread::spawn(move || {
                 let mut hist = new_hists();
@@ -244,12 +251,12 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                         }
                         Op::Update => {
                             rng.fill(&mut value);
-                            engine.put(&key_of(item), &value);
+                            engine.put(&key_of(item), &value, sync);
                         }
                         Op::Insert => {
                             let id = records.fetch_add(1, Ordering::Relaxed);
                             rng.fill(&mut value);
-                            engine.put(&key_of(id), &value);
+                            engine.put(&key_of(id), &value, sync);
                         }
                         Op::Scan => {
                             let len = 1 + rng.below(100) as usize;
@@ -258,7 +265,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                         Op::Rmw => {
                             engine.get(&key_of(item));
                             rng.fill(&mut value);
-                            engine.put(&key_of(item), &value);
+                            engine.put(&key_of(item), &value, sync);
                         }
                     }
                     let idx = OPS.iter().position(|o| *o == op).unwrap();

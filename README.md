@@ -59,7 +59,7 @@ Read p99 on workload C was 81 µs for turtlekv-rs, 151 µs for RocksDB and 160 �
 `kvbench` drives every engine with the same keys, values, operation mix, operation counts and client threads.
 
 - Each run is one process in one memory cgroup, with page cache counted against the cap.
-- No engine compresses data, and no engine fsyncs per write. RocksDB buffers its log manually, fjall persists its journal manually, and turtlekv-rs buffers up to 1 MiB of log.
+- No engine compresses data, and no engine fsyncs per write. RocksDB buffers its log manually, fjall persists its journal manually, and turtlekv-rs buffers up to 1 MiB of log. `--sync 1` makes every write in the timed phases durable before it returns; `bench/sync.sh` runs that comparison.
 - RocksDB runs on jemalloc, its production allocator. turtlekv-rs and fjall run on mimalloc.
 - turtlekv-rs's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
 - On machines where RocksDB's write path collapses with many loading threads, `--load-threads` loads it with fewer, in the same process as the read phases.
@@ -88,7 +88,7 @@ Each phase prints one JSON line with throughput, latency percentiles, bytes read
 | Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while one frozen memtable awaits its checkpoint | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 
-- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns after an fsync. Synchronous writers take turns at the fsync. RocksDB groups concurrent synchronous writers into one fsync.
+- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Concurrent synchronous writers share fsyncs: one covers every record written before it began. Retired log segments are reused, so a log fsync writes data and no file-size metadata. RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
 - **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
@@ -99,7 +99,7 @@ turtlekv-rs follows the C++ TurtleTree: buffer levels that fill like a binary co
 
 - **Filters and indexes.** Bloom filters and a sparse block index replace quotient filters and the per-leaf trie.
 - **Flushed keys.** Each buffered segment records the keys flushed out of it as key intervals plus a clip range. Pivot changes leave segment metadata alone, and flushes update it without reading pages.
-- **Durability.** The log, page arenas and superblock are fsynced. The C++ code counts O_DIRECT write completion as durable, which holds on drives whose write cache survives power loss.
+- **Durability.** The log, page arenas and superblock are fsynced. The C++ code counts O_DIRECT write completion as durable, which holds only on drives whose write cache survives power loss. Here the kernel decides per drive: on one that reports a write-through cache, as drives with power-loss protection and EC2 instance store do, fsync sends no cache flush.
 - **Free space.** Free space lives in memory and is rebuilt at open by walking the recovered tree. A freed slot is hole-punched before reuse, returning its space to the file system.
 - **Atomic visibility.** Memtables keep version chains, and batches commit independently, so readers see whole batches and iterators are snapshots.
 - **Defaults.** 4 MiB leaves, 4 buffer levels and a fixed checkpoint distance of 32 leaves (128 MiB). The paper used 32 MB leaves and tuned checkpoint distance per workload.
@@ -150,7 +150,7 @@ flowchart LR
   M --> C[Commit the ticket and return]
   M -.->|memtable full| F[Freeze; start a new memtable and log segment]
   F --> A[Apply stage: merge the frozen memtable into a copy-on-write tree; write its pages]
-  A --> K[Commit stage: fsync, write the superblock, free dead pages, swap in the new tree, delete the log segment]
+  A --> K[Commit stage: fsync, write the superblock, free dead pages, swap in the new tree, retire the log segment]
 ```
 
 Writers hold the lock only to take sequence numbers and append a pre-encoded record. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint.
@@ -170,7 +170,7 @@ Pages are immutable: checksummed 4 KiB blocks, a sparse block index, and a Bloom
 
 ### Visibility
 
-Each batch takes a ticket under the writer lock and registers it. Its versions carry the ticket. Once every op is in the memtable, the writer marks the ticket committed and returns. A get takes the newest version whose batch has committed. Committed tickets fold into a visible prefix of sequence numbers. A snapshot waits until the batches registered before it commit, then reads that prefix. It also holds the version it started from: the memtables and tree root of that moment.
+Each batch takes a ticket under the writer lock and registers it. Its versions carry the ticket. Once every op is in the memtable, the writer marks the ticket committed and returns. A get takes the newest version whose batch has committed. Committed tickets fold into a visible prefix of sequence numbers. A snapshot waits until the batches registered before it commit, then reads that prefix. It also holds the version it started from: the memtables and tree root of that moment. A synchronous batch commits after its fsync, so a snapshot taken meanwhile waits for that fsync; a get does not.
 
 ## Configuration
 

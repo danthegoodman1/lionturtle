@@ -1,11 +1,12 @@
-//! Engine adapters. Each engine runs without a per-write fsync; writes reach
-//! the OS in batches, the same durability for every engine.
+//! Engine adapters. By default no engine fsyncs per write; writes reach the
+//! OS in batches, the same durability for every engine. A synchronous put is
+//! durable when it returns.
 
 use crate::Args;
 use std::sync::Arc;
 
 pub trait Engine: Send + Sync {
-    fn put(&self, key: &[u8], value: &[u8]);
+    fn put(&self, key: &[u8], value: &[u8], sync: bool);
     /// Returns the value's length, if found.
     fn get(&self, key: &[u8]) -> Option<usize>;
     /// Reads up to `n` entries from `start`, touching every key and value;
@@ -56,8 +57,12 @@ impl Turtle {
 }
 
 impl Engine for Turtle {
-    fn put(&self, key: &[u8], value: &[u8]) {
-        self.db.put(key, value).unwrap();
+    fn put(&self, key: &[u8], value: &[u8], sync: bool) {
+        if sync {
+            self.db.write(&[turtlekv::WriteOp::put(key.to_vec(), value.to_vec())], true).unwrap();
+        } else {
+            self.db.put(key, value).unwrap();
+        }
     }
 
     fn settle(&self) {
@@ -104,7 +109,7 @@ impl Engine for Turtle {
 }
 
 struct Fjall {
-    _db: fjall::Database,
+    db: fjall::Database,
     ks: fjall::Keyspace,
 }
 
@@ -126,13 +131,16 @@ impl Fjall {
                     .data_block_compression_policy(fjall::config::CompressionPolicy::all(fjall::CompressionType::None))
             })
             .unwrap();
-        Self { _db: db, ks }
+        Self { db, ks }
     }
 }
 
 impl Engine for Fjall {
-    fn put(&self, key: &[u8], value: &[u8]) {
+    fn put(&self, key: &[u8], value: &[u8], sync: bool) {
         self.ks.insert(key, value).unwrap();
+        if sync {
+            self.db.persist(fjall::PersistMode::SyncData).unwrap();
+        }
     }
 
     fn get(&self, key: &[u8]) -> Option<usize> {
@@ -170,18 +178,21 @@ impl Rocks {
         block.set_cache_index_and_filter_blocks(false);
         opts.set_block_based_table_factory(&block);
         opts.set_compression_type(rocksdb::DBCompressionType::None);
-        // Buffer the log in memory like the other engines; nothing fsyncs
-        // per write.
-        opts.set_manual_wal_flush(true);
+        // Buffer the log in memory like the other engines, unless writes
+        // sync.
+        opts.set_manual_wal_flush(!args.sync);
+        if args.rocksdb_recycle_logs {
+            opts.set_recycle_log_file_num(4);
+        }
         Self { db: rocksdb::DB::open(&opts, &args.dir).unwrap() }
     }
 }
 
 #[cfg(feature = "rocksdb")]
 impl Engine for Rocks {
-    fn put(&self, key: &[u8], value: &[u8]) {
+    fn put(&self, key: &[u8], value: &[u8], sync: bool) {
         let mut wo = rocksdb::WriteOptions::default();
-        wo.set_sync(false);
+        wo.set_sync(sync);
         self.db.put_opt(key, value, &wo).unwrap();
     }
 
