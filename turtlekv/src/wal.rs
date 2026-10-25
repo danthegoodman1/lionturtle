@@ -5,11 +5,13 @@
 //! a sequence of records, one per write batch:
 //!
 //! ```text
-//! crc32c: u32 | len: u32 | first_seq: u64 | count: u32 | op*
+//! crc32c: u32 | len: u32 | count: u32 | op* | first_seq: u64
 //! op = kind: u8 | key_len: u32 | key | (value_len: u32 | value)?   (value only for puts)
 //! ```
 //!
-//! The checksum covers everything after itself. Replay stops at the first
+//! The checksum covers everything after itself. The sequence number comes
+//! last so that writers can encode and checksum the rest of a record before
+//! taking the lock that assigns sequence numbers. Replay stops at the first
 //! record that is truncated, fails its checksum, or breaks the sequence-number
 //! chain: that record and everything after it are the torn tail of the last
 //! unsynced flush.
@@ -18,6 +20,7 @@ use crate::error::Result;
 use crate::storage::{File, Storage};
 use crate::types::{Value, WriteOp};
 use bytes::Bytes;
+use parking_lot::{Mutex, lock_api::ArcMutexGuard};
 use std::sync::Arc;
 
 const HEADER_LEN: usize = 8;
@@ -50,11 +53,48 @@ pub fn encoded_len(ops: &[WriteOp]) -> usize {
             .sum::<usize>()
 }
 
+/// A record without its sequence number: the bytes between the header and
+/// the sequence number, and the checksum of everything before the sequence
+/// number.
+#[derive(Default)]
+pub struct Body {
+    bytes: Vec<u8>,
+    crc: u32,
+}
+
+impl Body {
+    /// Encodes `ops`, reusing this body's buffer.
+    pub fn encode(&mut self, ops: &[WriteOp]) {
+        let buf = &mut self.bytes;
+        buf.clear();
+        buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+        encode_ops(buf, ops);
+        let len = (buf.len() + 8) as u32;
+        self.crc = crc32c::crc32c_append(crc32c::crc32c(&len.to_le_bytes()), buf);
+    }
+
+    /// Bytes the full record occupies in the log.
+    pub fn record_len(&self) -> usize {
+        HEADER_LEN + self.bytes.len() + 8
+    }
+
+    fn append_to(&self, buf: &mut Vec<u8>, first_seq: u64) {
+        let seq = first_seq.to_le_bytes();
+        let crc = crc32c::crc32c_append(self.crc, &seq);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&((self.bytes.len() + 8) as u32).to_le_bytes());
+        buf.extend_from_slice(&self.bytes);
+        buf.extend_from_slice(&seq);
+    }
+}
+
 pub fn encode(buf: &mut Vec<u8>, first_seq: u64, ops: &[WriteOp]) {
-    let start = buf.len();
-    buf.extend_from_slice(&[0; HEADER_LEN]);
-    buf.extend_from_slice(&first_seq.to_le_bytes());
-    buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    let mut body = Body::default();
+    body.encode(ops);
+    body.append_to(buf, first_seq);
+}
+
+fn encode_ops(buf: &mut Vec<u8>, ops: &[WriteOp]) {
     for op in ops {
         match &op.value {
             Value::Put(v) => {
@@ -71,10 +111,6 @@ pub fn encode(buf: &mut Vec<u8>, first_seq: u64, ops: &[WriteOp]) {
             }
         }
     }
-    let len = (buf.len() - start - HEADER_LEN) as u32;
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&len.to_le_bytes()), &buf[start + HEADER_LEN..]);
-    buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
-    buf[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
 }
 
 /// Appends records to one segment. Records accumulate in memory until
@@ -83,10 +119,30 @@ pub struct WalWriter {
     id: u64,
     file: Arc<dyn File>,
     buf: Vec<u8>,
-    /// Bytes written to the file.
+    /// Bytes handed to the file, written or in flight.
     written: u64,
     /// Bytes known durable.
     synced: u64,
+    /// Held while writing to or syncing the file, so a [`Flush`] made under
+    /// the caller's lock completes before any later write or sync.
+    io: Arc<Mutex<()>>,
+}
+
+/// Buffered records taken from a [`WalWriter`] to write without holding the
+/// lock that guards appends. It holds the segment's I/O lock, so writes and
+/// syncs that come after it wait for it.
+pub struct Flush {
+    file: Arc<dyn File>,
+    buf: Vec<u8>,
+    offset: u64,
+    _io: ArcMutexGuard<parking_lot::RawMutex, ()>,
+}
+
+impl Flush {
+    pub fn write(self) -> Result<()> {
+        self.file.write_all_at(&self.buf, self.offset)?;
+        Ok(())
+    }
 }
 
 impl WalWriter {
@@ -94,7 +150,14 @@ impl WalWriter {
     pub fn create(storage: &dyn Storage, id: u64) -> Result<Self> {
         let file = storage.open(&segment_name(id), true)?;
         storage.sync_dir()?;
-        Ok(Self { id, file, buf: Vec::with_capacity(1 << 20), written: 0, synced: 0 })
+        Ok(Self {
+            id,
+            file,
+            buf: Vec::with_capacity(1 << 20),
+            written: 0,
+            synced: 0,
+            io: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn id(&self) -> u64 {
@@ -103,6 +166,11 @@ impl WalWriter {
 
     pub fn append(&mut self, first_seq: u64, ops: &[WriteOp]) {
         encode(&mut self.buf, first_seq, ops);
+    }
+
+    /// Appends a record encoded ahead of time.
+    pub fn append_body(&mut self, body: &Body, first_seq: u64) {
+        body.append_to(&mut self.buf, first_seq);
     }
 
     pub fn buffered(&self) -> usize {
@@ -115,6 +183,11 @@ impl WalWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        let _io = self.io.lock_arc();
+        self.flush_locked()
+    }
+
+    fn flush_locked(&mut self) -> Result<()> {
         if !self.buf.is_empty() {
             self.file.write_all_at(&self.buf, self.written)?;
             self.written += self.buf.len() as u64;
@@ -124,7 +197,8 @@ impl WalWriter {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.flush()?;
+        let _io = self.io.lock_arc();
+        self.flush_locked()?;
         if self.synced < self.written {
             self.file.sync_data()?;
             self.synced = self.written;
@@ -132,25 +206,15 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Takes the buffered records, leaving the buffer empty, so a caller can
-    /// write them without holding the lock that guards appends.
-    pub fn take_buffer(&mut self) -> (Vec<u8>, u64) {
+    /// Takes the buffered records for the caller to write after releasing
+    /// its lock. Call [`Flush::write`] promptly: later writes and syncs of
+    /// this segment wait for it.
+    pub fn start_flush(&mut self) -> Flush {
+        let io = self.io.lock_arc();
         let offset = self.written;
         let buf = std::mem::replace(&mut self.buf, Vec::with_capacity(1 << 20));
         self.written += buf.len() as u64;
-        (buf, offset)
-    }
-
-    pub fn file(&self) -> &Arc<dyn File> {
-        &self.file
-    }
-
-    pub fn mark_synced(&mut self, upto: u64) {
-        self.synced = self.synced.max(upto);
-    }
-
-    pub fn written(&self) -> u64 {
-        self.written
+        Flush { file: self.file.clone(), buf, offset, _io: io }
     }
 }
 
@@ -226,11 +290,11 @@ fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)>
     if crc != expected || len < 12 {
         return None;
     }
-    let first_seq = u64::from_le_bytes(body[0..8].try_into().unwrap());
-    let count = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let first_seq = u64::from_le_bytes(body[len - 8..].try_into().unwrap());
     let mut ops = Vec::with_capacity(count.min(1 << 16));
-    let mut p = body_start + 12;
-    let end = body_start + len;
+    let mut p = body_start + 4;
+    let end = body_start + len - 8;
     let take = |p: &mut usize, n: usize| -> Option<Bytes> {
         if *p + n > end {
             return None;
@@ -260,7 +324,7 @@ fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)>
     if p != end || first_seq == 0 {
         return None;
     }
-    Some((first_seq, ops, end))
+    Some((first_seq, ops, end + 8))
 }
 
 #[cfg(test)]

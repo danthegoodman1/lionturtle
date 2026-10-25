@@ -189,9 +189,15 @@ impl SimStorage {
     }
 
     /// Bytes stored across all files.
+    /// Bytes a sparse file system would allocate: 4 KiB blocks holding any
+    /// nonzero byte.
     pub fn disk_usage(&self) -> u64 {
         let state = self.state.lock();
-        state.names.values().map(|ino| state.inodes[ino].data.len() as u64).sum()
+        state
+            .names
+            .values()
+            .map(|ino| state.inodes[ino].data.chunks(4096).filter(|c| c.iter().any(|&b| b != 0)).count() as u64 * 4096)
+            .sum()
     }
 
     /// Loses power: discards a random subset of unsynced writes (tearing them
@@ -392,6 +398,27 @@ impl File for SimFile {
         let state = self.state.lock();
         state.check_up(self.generation)?;
         Ok(state.inodes.get(&self.ino).map_or(0, |inode| inode.data.len() as u64))
+    }
+
+    /// Zeroes the range like an unsynced write, so a crash may undo it.
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        state.check_up(self.generation)?;
+        state.tick_mutation()?;
+        if state.rng.chance(state.faults.write_error) {
+            return Err(io::Error::other("sim: punch error"));
+        }
+        let inode = state
+            .inodes
+            .get_mut(&self.ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
+        let start = (offset as usize).min(inode.data.len());
+        let end = (offset as usize).saturating_add(len as usize).min(inode.data.len());
+        let old = inode.data[start..end].to_vec();
+        inode.undo.push(Undo { offset: start as u64, len: (end - start) as u64, old });
+        inode.data[start..end].fill(0);
+        Ok(())
     }
 }
 

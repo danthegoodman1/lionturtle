@@ -5,6 +5,7 @@
 //! with `hi = None` extends to +∞; the empty key is the smallest key, so
 //! `lo = ""` starts at -∞.
 
+use crate::types::cmp_keys;
 use bytes::Bytes;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,9 +78,9 @@ impl KeyRanges {
 
     /// The interval containing `key`, if any.
     fn find(&self, key: &[u8]) -> Option<&(Bytes, Option<Bytes>)> {
-        let i = self.ranges.partition_point(|(l, _)| &l[..] <= key);
+        let i = self.ranges.partition_point(|(l, _)| cmp_keys(l, key).is_le());
         let r = self.ranges.get(i.checked_sub(1)?)?;
-        r.1.as_ref().is_none_or(|h| key < &h[..]).then_some(r)
+        r.1.as_ref().is_none_or(|h| cmp_keys(key, h).is_lt()).then_some(r)
     }
 
     pub fn contains(&self, key: &[u8]) -> bool {

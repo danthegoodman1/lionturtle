@@ -29,7 +29,7 @@ use crate::bloom;
 use crate::error::{Result, corruption};
 use crate::page::{EntryRef, PageBuilder, PageId, PageImage};
 use crate::pagestore::PagePtr;
-use crate::types::Value;
+use crate::types::{Value, cmp_keys};
 use bytes::Bytes;
 use codec::{Reader, put_bytes};
 use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source};
@@ -131,20 +131,22 @@ impl Segment {
     /// Smallest key the segment may hold.
     pub fn min_key(&self) -> &[u8] {
         let m = self.page.meta.min_key();
-        if &self.lo[..] > m { &self.lo } else { m }
+        if cmp_keys(&self.lo, m).is_gt() { &self.lo } else { m }
     }
 
     /// Whether `key` lies in the segment's clipped key range.
     pub fn covers_key(&self, key: &[u8]) -> bool {
-        key >= self.min_key() && key <= self.page.meta.max_key() && self.hi.as_ref().is_none_or(|h| key < &h[..])
+        cmp_keys(key, self.min_key()).is_ge()
+            && cmp_keys(key, self.page.meta.max_key()).is_le()
+            && self.hi.as_ref().is_none_or(|h| cmp_keys(key, h).is_lt())
     }
 
     /// Whether the clipped range intersects `[lo, hi)`.
     pub fn overlaps(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
         self.page.meta.n_items > 0
-            && self.page.meta.max_key() >= lo
-            && self.hi.as_ref().is_none_or(|h| &h[..] > lo)
-            && hi.is_none_or(|hi| self.min_key() < hi)
+            && cmp_keys(self.page.meta.max_key(), lo).is_ge()
+            && self.hi.as_ref().is_none_or(|h| cmp_keys(h, lo).is_gt())
+            && hi.is_none_or(|hi| cmp_keys(self.min_key(), hi).is_lt())
     }
 
     fn range_is_empty(&self) -> bool {
@@ -233,7 +235,7 @@ impl Node {
 
     /// The child whose key range holds `key`.
     pub fn find_pivot(&self, key: &[u8]) -> usize {
-        self.pivots[1..].partition_point(|p| &p[..] <= key)
+        self.pivots[1..].partition_point(|p| cmp_keys(p, key).is_le())
     }
 
     pub fn segment_count(&self) -> usize {
@@ -927,7 +929,7 @@ pub fn get(io: &PageIo, root: &Subtree, key: &[u8]) -> Result<Option<Value>> {
             }
             Subtree::Node(n) => {
                 for level in &n.levels {
-                    let i = level.partition_point(|s| s.min_key() <= key);
+                    let i = level.partition_point(|s| cmp_keys(s.min_key(), key).is_le());
                     let Some(seg) = i.checked_sub(1).map(|i| &level[i]) else { continue };
                     if seg.covers_key(key)
                         && !seg.dead.contains(key)

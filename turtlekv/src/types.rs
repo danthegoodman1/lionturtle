@@ -11,6 +11,11 @@ pub fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
         if x != y {
             return x.cmp(&y);
         }
+        let (a, b) = (&a[8..], &b[8..]);
+        if a.is_empty() || b.is_empty() {
+            return a.len().cmp(&b.len());
+        }
+        return a.cmp(b);
     }
     a.cmp(b)
 }

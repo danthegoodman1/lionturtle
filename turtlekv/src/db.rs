@@ -73,11 +73,46 @@ impl Options {
 pub struct Mem {
     pub id: u64,
     table: Box<dyn MemTable>,
+    /// Entry bytes assigned to this memtable. Writers add to it under the
+    /// writer lock.
     bytes: AtomicU64,
     /// Sequence number of the newest op assigned to this memtable.
     last_seq: AtomicU64,
     /// Writers assigned to this memtable that have not finished inserting.
-    inflight: AtomicUsize,
+    inflight: Inflight,
+}
+
+const INFLIGHT_SHARDS: usize = 16;
+
+#[derive(Default)]
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize);
+
+/// A count of writers split across cache lines, so that writers on
+/// different threads update different lines. It only needs to reach zero
+/// once no writer can join.
+#[derive(Default)]
+struct Inflight([PaddedCount; INFLIGHT_SHARDS]);
+
+impl Inflight {
+    /// Counts a writer in and returns its shard.
+    fn enter(&self) -> usize {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static SHARD: usize = NEXT.fetch_add(1, Relaxed) % INFLIGHT_SHARDS;
+        }
+        let shard = SHARD.with(|s| *s);
+        self.0[shard].0.fetch_add(1, SeqCst);
+        shard
+    }
+
+    fn exit(&self, shard: usize) {
+        self.0[shard].0.fetch_sub(1, SeqCst);
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0.iter().all(|c| c.0.load(SeqCst) == 0)
+    }
 }
 
 impl Mem {
@@ -87,7 +122,7 @@ impl Mem {
             table: new_memtable(kind),
             bytes: AtomicU64::new(0),
             last_seq: AtomicU64::new(last_seq),
-            inflight: AtomicUsize::new(0),
+            inflight: Inflight::default(),
         }
     }
 
@@ -158,6 +193,8 @@ struct Writer {
     wal: WalWriter,
     next_seq: u64,
     active: Arc<Mem>,
+    user_bytes: u64,
+    wal_bytes: u64,
 }
 
 struct Durable {
@@ -219,8 +256,6 @@ struct Inner {
     poisoned: AtomicBool,
     shutdown: AtomicBool,
     checkpoints: AtomicU64,
-    user_bytes: AtomicU64,
-    wal_bytes: AtomicU64,
     timing: Timing,
 }
 
@@ -272,6 +307,7 @@ impl Db {
         }
         let live_vec: Vec<PagePtr> = live.iter().copied().collect();
         let io = Arc::new(PageIo::new(PageStore::open(storage.clone(), &live_vec)?, opts.cache_bytes, max_image));
+        io.store.punch_free();
 
         // Replay the log into one memtable.
         let mut last_seq = sb.last_seq;
@@ -319,7 +355,7 @@ impl Db {
             io,
             version: ArcSwap::from_pointee(version),
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, active }),
+            writer: Mutex::new(Writer { wal, next_seq: last_seq + 1, active, user_bytes: 0, wal_bytes: 0 }),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
@@ -328,8 +364,6 @@ impl Db {
             poisoned: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
-            user_bytes: AtomicU64::new(0),
-            wal_bytes: AtomicU64::new(0),
             timing: Timing::default(),
             opts,
         });
@@ -479,12 +513,16 @@ impl Db {
 
     pub fn stats(&self) -> DbStats {
         let inner = &self.inner;
+        let (user_bytes, wal_bytes) = {
+            let w = inner.writer.lock();
+            (w.user_bytes, w.wal_bytes)
+        };
         let v = inner.version.load();
         let c = &inner.io.counters;
         DbStats {
             checkpoints: inner.checkpoints.load(Relaxed),
-            user_bytes: inner.user_bytes.load(Relaxed),
-            wal_bytes: inner.wal_bytes.load(Relaxed),
+            user_bytes,
+            wal_bytes,
             page_bytes_written: c.page_bytes_written.load(Relaxed),
             pages_written: c.pages_written.load(Relaxed),
             block_reads: c.block_reads.load(Relaxed),
@@ -582,37 +620,46 @@ impl Inner {
             }
         }
         self.check_poisoned()?;
-        let (mem, seq) = {
-            let mut w = self.writer.lock();
-            self.check_poisoned()?;
-            if w.active.bytes() >= self.opts.memtable_limit() {
-                let r = self.rotate(&mut w);
-                self.poison_on_err(r)?;
-            }
-            let seq = w.next_seq;
-            w.next_seq += ops.len() as u64;
-            w.wal.append(seq, ops);
-            let r = if sync {
-                w.wal.sync()
-            } else if w.wal.buffered() >= self.opts.wal_buffer_bytes {
-                w.wal.flush()
-            } else {
-                Ok(())
-            };
-            self.poison_on_err(r)?;
-            w.active.last_seq.store(seq + ops.len() as u64 - 1, Relaxed);
-            w.active.inflight.fetch_add(1, SeqCst);
-            (w.active.clone(), seq)
-        };
-        let mut bytes = 0;
-        for (i, op) in ops.iter().enumerate() {
-            mem.insert(op, seq + i as u64);
-            bytes += (op.key.len() + op.value.encoded_len()) as u64;
+        let entry_bytes: u64 = ops.iter().map(|op| entry_size(op.key.len(), op.value.encoded_len())).sum();
+        let user_bytes: u64 = ops.iter().map(|op| (op.key.len() + op.value.encoded_len()) as u64).sum();
+        thread_local! {
+            static BODY: std::cell::RefCell<wal::Body> = Default::default();
         }
-        mem.inflight.fetch_sub(1, SeqCst);
-        self.user_bytes.fetch_add(bytes, Relaxed);
-        self.wal_bytes.fetch_add(wal::encoded_len(ops) as u64, Relaxed);
-        Ok(())
+        BODY.with_borrow_mut(|body| {
+            // Everything but the sequence number is encoded and checksummed
+            // before taking the lock, which keeps the critical section short.
+            body.encode(ops);
+            let (mem, seq, shard, flush) = {
+                let mut w = self.writer.lock();
+                self.check_poisoned()?;
+                if w.active.bytes() >= self.opts.memtable_limit() {
+                    let r = self.rotate(&mut w);
+                    self.poison_on_err(r)?;
+                }
+                let seq = w.next_seq;
+                w.next_seq += ops.len() as u64;
+                w.wal.append_body(body, seq);
+                w.user_bytes += user_bytes;
+                w.wal_bytes += body.record_len() as u64;
+                let mut flush = None;
+                if sync {
+                    let r = w.wal.sync();
+                    self.poison_on_err(r)?;
+                } else if w.wal.buffered() >= self.opts.wal_buffer_bytes {
+                    flush = Some(w.wal.start_flush());
+                }
+                w.active.last_seq.store(seq + ops.len() as u64 - 1, Relaxed);
+                w.active.bytes.fetch_add(entry_bytes, Relaxed);
+                let shard = w.active.inflight.enter();
+                (w.active.clone(), seq, shard, flush)
+            };
+            let flushed = flush.map_or(Ok(()), |f| f.write());
+            for (i, op) in ops.iter().enumerate() {
+                mem.table.insert(&op.key, op.value.clone(), seq + i as u64);
+            }
+            mem.inflight.exit(shard);
+            self.poison_on_err(flushed)
+        })
     }
 
     /// Freezes the active memtable and starts a new one with a new log
@@ -745,7 +792,7 @@ impl Inner {
         let Some(mem) = self.version.load().frozen.iter().rev().find(|m| m.id > applier.last_applied).cloned() else {
             return Ok(false);
         };
-        while mem.inflight.load(SeqCst) > 0 {
+        while !mem.inflight.is_zero() {
             std::thread::yield_now();
         }
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
@@ -815,6 +862,7 @@ impl Inner {
         }
         drop(old_epoch);
         drop(durable);
+        self.io.store.reclaim();
         self.timing.commit_ns.fetch_add(since(t), Relaxed);
         self.checkpoints.fetch_add(1, Relaxed);
         for id in wal::list_segments(&*self.storage)? {

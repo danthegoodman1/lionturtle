@@ -28,6 +28,11 @@ pub trait File: Send + Sync {
     fn len(&self) -> io::Result<u64>;
     /// Hints that reads are random, disabling kernel readahead.
     fn advise_random(&self) {}
+    /// Releases the disk space behind `[offset, offset + len)`, which then
+    /// reads as zeros. The file keeps its length.
+    fn punch_hole(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Storage backed by a directory on the local file system.
@@ -98,5 +103,12 @@ impl File for FsFile {
         unsafe {
             libc::posix_fadvise(self.0.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
         }
+    }
+
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        // SAFETY: fallocate only reads its integer arguments.
+        let r = unsafe { libc::fallocate(self.0.as_raw_fd(), mode, offset as libc::off_t, len as libc::off_t) };
+        if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
 }

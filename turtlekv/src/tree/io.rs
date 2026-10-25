@@ -13,12 +13,16 @@ use quick_cache::sync::Cache;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 pub struct DataPage {
     pub meta: PageMeta,
     ptr: OnceLock<PagePtr>,
     pinned: Mutex<Option<Bytes>>,
+    /// Whether the cache may hold the whole image. Writing caches it; once
+    /// evicted it never returns, so a miss clears this and later reads skip
+    /// the image lookup.
+    image_cached: AtomicBool,
 }
 
 impl std::fmt::Debug for DataPage {
@@ -33,13 +37,13 @@ impl DataPage {
         // image's allocation.
         let mut meta = image.meta;
         meta.detach();
-        Self { meta, ptr: OnceLock::new(), pinned: Mutex::new(Some(image.bytes)) }
+        Self { meta, ptr: OnceLock::new(), pinned: Mutex::new(Some(image.bytes)), image_cached: AtomicBool::new(true) }
     }
 
     pub fn written(meta: PageMeta, ptr: PagePtr) -> Self {
         let lock = OnceLock::new();
         let _ = lock.set(ptr);
-        Self { meta, ptr: lock, pinned: Mutex::new(None) }
+        Self { meta, ptr: lock, pinned: Mutex::new(None), image_cached: AtomicBool::new(false) }
     }
 
     pub fn id(&self) -> PageId {
@@ -156,6 +160,19 @@ impl PageIo {
         }
     }
 
+    fn cached_image(&self, page: &DataPage) -> Option<Bytes> {
+        if !page.image_cached.load(Relaxed) {
+            return None;
+        }
+        match self.cache.get(&(page.id(), IMAGE)) {
+            Some(Cached::Image(image)) => Some(image),
+            _ => {
+                page.image_cached.store(false, Relaxed);
+                None
+            }
+        }
+    }
+
     /// Block `b` of `page`, verified.
     pub fn block(&self, page: &DataPage, b: usize) -> Result<Block> {
         let info = page.meta.block(b);
@@ -166,7 +183,7 @@ impl PageIo {
             return Block::decode_trusted(image.slice(range));
         }
         let id = page.id();
-        if let Some(Cached::Image(image)) = self.cache.get(&(id, IMAGE)) {
+        if let Some(image) = self.cached_image(page) {
             return Block::decode_trusted(image.slice(range));
         }
         if let Some(Cached::Block(block)) = self.cache.get(&(id, b as u32)) {
@@ -190,7 +207,7 @@ impl PageIo {
         if let Some(image) = page.pinned() {
             return Ok((image.slice(range), false));
         }
-        if let Some(Cached::Image(image)) = self.cache.get(&(page.id(), IMAGE)) {
+        if let Some(image) = self.cached_image(page) {
             return Ok((image.slice(range), false));
         }
         let ptr = page.ptr().expect("unpinned page is written");
@@ -207,9 +224,11 @@ impl PageIo {
         let created = self.store.write(&ptr, &image)?;
         self.counters.pages_written.fetch_add(1, Relaxed);
         self.counters.page_bytes_written.fetch_add(image.len() as u64, Relaxed);
+        // Cache the image before publishing the pointer, so a reader that
+        // sees the page written finds the image.
+        self.cache.insert((page.id(), IMAGE), Cached::Image(image));
         page.ptr.set(ptr).expect("page written once");
         *page.pinned.lock() = None;
-        self.cache.insert((page.id(), IMAGE), Cached::Image(image));
         Ok(created)
     }
 

@@ -92,6 +92,9 @@ pub struct PageStore {
     storage: Arc<dyn Storage>,
     files: Mutex<Vec<Option<Arc<dyn File>>>>,
     alloc: Mutex<Vec<ClassAlloc>>,
+    /// Freed slots whose disk space has not been released yet. They become
+    /// allocatable in [`PageStore::reclaim`].
+    freed: Mutex<Vec<PagePtr>>,
 }
 
 impl PageStore {
@@ -120,7 +123,7 @@ impl PageStore {
         for (class, a) in alloc.iter_mut().enumerate() {
             a.free = (0..a.next).filter(|s| !used[class].contains(s)).collect();
         }
-        Ok(Self { storage, files: Mutex::new(files), alloc: Mutex::new(alloc) })
+        Ok(Self { storage, files: Mutex::new(files), alloc: Mutex::new(alloc), freed: Mutex::new(Vec::new()) })
     }
 
     /// Reserves a slot for a page image of `len` bytes.
@@ -143,9 +146,47 @@ impl PageStore {
     }
 
     /// Returns slots to the free pool.
+    /// Releases the disk space of every free slot, which may still hold
+    /// pages from before a restart. Call only on a store opened with the
+    /// complete set of live pages.
+    pub fn punch_free(&self) {
+        let files = self.files.lock().clone();
+        let alloc = self.alloc.lock();
+        for (class, a) in alloc.iter().enumerate() {
+            let Some(file) = &files[class] else { continue };
+            let size = slot_size(class as u8);
+            let mut slots = a.free.iter().copied().peekable();
+            while let Some(first) = slots.next() {
+                let mut last = first;
+                while slots.next_if(|&s| s == last + 1).is_some() {
+                    last += 1;
+                }
+                let _ = file.punch_hole(first as u64 * size, (last - first + 1) as u64 * size);
+            }
+        }
+    }
+
+    /// Queues slots for release. This is cheap, so any thread may call it;
+    /// [`PageStore::reclaim`] does the I/O.
     pub fn free(&self, ptrs: impl IntoIterator<Item = PagePtr>) {
+        self.freed.lock().extend(ptrs);
+    }
+
+    /// Releases the disk space of freed slots, then makes them allocatable.
+    /// Punching before the slot is reusable keeps a hole from landing on a
+    /// newer page. A failed punch only leaves the space allocated.
+    pub fn reclaim(&self) {
+        let freed = std::mem::take(&mut *self.freed.lock());
+        if freed.is_empty() {
+            return;
+        }
+        for ptr in &freed {
+            if let Ok((file, _)) = self.file(ptr.class) {
+                let _ = file.punch_hole(ptr.offset(), slot_size(ptr.class));
+            }
+        }
         let mut alloc = self.alloc.lock();
-        for ptr in ptrs {
+        for ptr in freed {
             if std::env::var_os("TURTLEKV_DEBUG").is_some() {
                 eprintln!("free page {} at {}:{}", ptr.id, ptr.class, ptr.slot);
             }
@@ -203,11 +244,12 @@ impl PageStore {
 
     /// Slots in use per class, for leak checks.
     pub fn allocated(&self) -> Vec<(u8, u32)> {
+        let freed: BTreeSet<(u8, u32)> = self.freed.lock().iter().map(|p| (p.class, p.slot)).collect();
         let alloc = self.alloc.lock();
         let mut out = Vec::new();
         for (class, a) in alloc.iter().enumerate() {
             for slot in 0..a.next {
-                if !a.free.contains(&slot) {
+                if !a.free.contains(&slot) && !freed.contains(&(class as u8, slot)) {
                     out.push((class as u8, slot));
                 }
             }
