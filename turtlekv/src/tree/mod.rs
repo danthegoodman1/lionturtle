@@ -29,7 +29,7 @@ use crate::bloom;
 use crate::error::{Result, corruption};
 use crate::page::{EntryRef, PageBuilder, PageId, PageImage};
 use crate::pagestore::PagePtr;
-use crate::types::{Value, cmp_keys};
+use crate::types::{Value, cmp_keys, key_prefix};
 use bytes::Bytes;
 use codec::{Reader, put_bytes};
 use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source};
@@ -121,11 +121,37 @@ pub struct Segment {
     pub hi: Option<Bytes>,
     /// Keys already flushed to a child.
     pub dead: KeyRanges,
+    /// [`key_prefix`] of [`Segment::min_key`], so that searching a level
+    /// compares integers before reaching into each page's metadata.
+    min_prefix: u64,
 }
 
 impl Segment {
+    pub fn new(page: Arc<DataPage>, lo: Bytes, hi: Option<Bytes>, dead: KeyRanges) -> Self {
+        let mut s = Self { page, lo, hi, dead, min_prefix: 0 };
+        s.min_prefix = key_prefix(s.min_key());
+        s
+    }
+
     pub fn whole(page: Arc<DataPage>) -> Self {
-        Self { page, lo: Bytes::new(), hi: None, dead: KeyRanges::new() }
+        Self::new(page, Bytes::new(), None, KeyRanges::new())
+    }
+
+    /// Moves the clip range's lower end to `lo`.
+    pub fn set_lo(&mut self, lo: Bytes) {
+        self.lo = lo;
+        self.min_prefix = key_prefix(self.min_key());
+    }
+
+    /// Whether the segment's range starts at or before `key`, whose
+    /// [`key_prefix`] is `prefix`.
+    #[inline]
+    fn starts_by(&self, key: &[u8], prefix: u64) -> bool {
+        match self.min_prefix.cmp(&prefix) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => cmp_keys(self.min_key(), key).is_le(),
+        }
     }
 
     /// Smallest key the segment may hold.
@@ -778,7 +804,7 @@ fn split_node(node: &Node, s: usize) -> (Node, Node) {
             if seg.overlaps(&m, node.hi.as_deref()) {
                 let mut c = seg.clone();
                 if c.lo < m {
-                    c.lo = m.clone();
+                    c.set_lo(m.clone());
                 }
                 c.dead = c.dead.clip(&c.lo, c.hi.as_deref());
                 if !c.is_dead() {
@@ -918,6 +944,7 @@ fn lookup_page(io: &PageIo, page: &DataPage, key: &[u8]) -> Result<Option<Value>
 /// tombstone hides it, `None` if the tree has no entry for it.
 pub fn get(io: &PageIo, root: &Subtree, key: &[u8]) -> Result<Option<Value>> {
     let hash = bloom::hash_key(key);
+    let prefix = key_prefix(key);
     let mut cur = root;
     loop {
         match cur {
@@ -929,7 +956,7 @@ pub fn get(io: &PageIo, root: &Subtree, key: &[u8]) -> Result<Option<Value>> {
             }
             Subtree::Node(n) => {
                 for level in &n.levels {
-                    let i = level.partition_point(|s| cmp_keys(s.min_key(), key).is_le());
+                    let i = level.partition_point(|s| s.starts_by(key, prefix));
                     let Some(seg) = i.checked_sub(1).map(|i| &level[i]) else { continue };
                     if seg.covers_key(key)
                         && !seg.dead.contains(key)
@@ -1328,7 +1355,7 @@ fn load_subtree(
     for level in d.levels {
         let mut segs = Vec::with_capacity(level.len());
         for (p, lo, hi, dead) in level {
-            segs.push(Segment { page: load_data_page(io, p, pages)?, lo, hi, dead });
+            segs.push(Segment::new(load_data_page(io, p, pages)?, lo, hi, dead));
         }
         levels.push(segs);
     }

@@ -20,6 +20,16 @@ pub fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
+/// The first eight bytes of `key` as a big-endian integer, zero-padded. Keys
+/// with different prefixes order as their prefixes do.
+#[inline]
+pub fn key_prefix(key: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = key.len().min(8);
+    b[..n].copy_from_slice(&key[..n]);
+    u64::from_be_bytes(b)
+}
+
 /// The newest state of a key: a value or a tombstone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
