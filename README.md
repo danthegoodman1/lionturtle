@@ -9,6 +9,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 - [What sets it apart](#what-sets-it-apart)
 - [Performance](#performance)
   - [On EC2 at 400M records](#on-ec2-at-400m-records)
+  - [Clock speed](#clock-speed)
   - [Where it wins and where it pays](#where-it-wins-and-where-it-pays)
   - [fjall in these runs](#fjall-in-these-runs)
   - [Synchronous writes](#synchronous-writes)
@@ -67,6 +68,23 @@ Read p99 on workload C was 81 µs for turtlekv-rs, 151 µs for RocksDB and 160 �
 | RSS during reads (GB) | 7.0 | 6.0 | 6.6 | |
 
 Reads at this scale wait on the drives: read p99 on C was 550 µs for turtlekv-rs, 577 µs for RocksDB and 588 µs for fjall. Scan p50 on E was 63, 50 and 499 µs. turtlekv-rs ran on a second instance of the same type. In a separate test on one instance, with the page cache dropped before each run, E ran at 101 thousand scans per second for turtlekv-rs and 73 for RocksDB, three runs each.
+
+### Clock speed
+
+The workstation outruns EC2 in the tables above because it holds more of its data in memory and runs faster cores. To measure the cores alone, turtlekv-rs ran 10M records in a 2 GB cache, so every read hit memory, with 16 client threads. It ran at full clock (P-cores up to 5.8 GHz, E-cores up to 4.6 GHz) and with every core capped at 3.2 GHz, the i7ie's all-core turbo, two alternating runs each:
+
+| Workload (thousand ops/s) | Full clock | 3.2 GHz | Full / capped |
+|---|--:|--:|--:|
+| A: 50% read, 50% update | 4,227 | 2,234 | 1.89× |
+| C: 100% read | 20,907 | 17,187 | 1.22× |
+| E: 95% scan of up to 100 keys, 5% insert | 1,358 | 1,082 | 1.25× |
+
+Cached reads gain less than the clock, because much of a 0.7 µs read waits on memory. Updates gain more: mean update latency doubled, from 6.7 to 13.3 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
+
+```console
+echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
+./target/release/kvbench --engine turtlekv --records 10000000 --ops 3000000 --threads 16 --cache-mb 2048 --phases load,a,c,e --settle 1
+```
 
 ### Where it wins and where it pays
 
