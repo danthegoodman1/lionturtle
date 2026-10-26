@@ -102,6 +102,12 @@ The workstation drive (ext4) has a volatile write cache, so every sync waits abo
 
 The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit, and with it enabled, a tenth or more of writes wake a CPU from it. Then every engine's one-thread mean rises to 50–110 µs, runs swing by 40%, and no engine passes 43 thousand per second at 16 or 64 threads. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
 
+The i7ie has two CPU sockets, and writers on different sockets pass the log's state across the link between them. Binding the process to one socket's CPUs raised 64-thread durable throughput by 14% for turtlekv-rs and 12% for RocksDB with recycled logs, at the cost of the other socket's cores for reads and background work:
+
+```console
+taskset -c "$(cat /sys/devices/system/node/node0/cpulist)" <command>
+```
+
 Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cache mode from `/sys/block/<drive>/queue/write_cache` and skips flushes on `write through`. A drive with power-loss protection that reports `write back` still gets flushes, which such drives finish quickly; writing `write through` to that file stops them, and is safe only when the cache really survives power loss.
 
 ### How the benchmark is run
