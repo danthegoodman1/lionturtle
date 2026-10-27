@@ -81,13 +81,21 @@ impl Options {
 pub struct Mem {
     pub id: u64,
     table: Box<dyn MemTable>,
-    /// Entry bytes assigned to this memtable. Writers add to it under the
-    /// writer lock.
-    bytes: AtomicU64,
-    /// Sequence number of the newest op assigned to this memtable.
-    last_seq: AtomicU64,
+    counts: MemCounts,
     /// Writers assigned to this memtable that have not finished inserting.
     inflight: Inflight,
+}
+
+/// Counters the writer lock's holder updates for every batch. They sit on a
+/// cache line of their own: every get and insert loads `Mem::table`, and a
+/// shared line would cost each of them a cache miss after every batch.
+#[derive(Default)]
+#[repr(align(128))]
+struct MemCounts {
+    /// Entry bytes assigned to the memtable.
+    bytes: AtomicU64,
+    /// Sequence number of the newest op assigned to the memtable.
+    last_seq: AtomicU64,
 }
 
 const INFLIGHT_SHARDS: usize = 16;
@@ -261,19 +269,18 @@ impl Mem {
         Self {
             id,
             table: new_memtable(kind),
-            bytes: AtomicU64::new(0),
-            last_seq: AtomicU64::new(last_seq),
+            counts: MemCounts { bytes: AtomicU64::new(0), last_seq: AtomicU64::new(last_seq) },
             inflight: Inflight::default(),
         }
     }
 
     fn insert(&self, op: &WriteOp, seq: u64) {
         self.table.insert(&op.key, op.value.clone(), seq, 0);
-        self.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
+        self.counts.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
     }
 
     pub fn bytes(&self) -> u64 {
-        self.bytes.load(Relaxed)
+        self.counts.bytes.load(Relaxed)
     }
 }
 
@@ -364,7 +371,10 @@ struct Request {
 
 /// What a batch learns from the writer lock.
 struct Assigned {
-    mem: Arc<Mem>,
+    /// The memtable the batch goes into. The batch's writer is counted in
+    /// its `inflight`, and a memtable leaves the store only once that count
+    /// is zero, so it outlives the writer's use without a reference count.
+    mem: *const Mem,
     seq: u64,
     ticket: u64,
     /// The log and the end of the batch's record, for a synchronous batch.
@@ -540,7 +550,8 @@ impl Db {
         storage.sync_dir()?;
         let mut frozen = Vec::new();
         if replayed.table.len() > 0 {
-            let mem = Mem { id: max_id, last_seq: AtomicU64::new(last_seq), ..replayed };
+            replayed.counts.last_seq.store(last_seq, Relaxed);
+            let mem = Mem { id: max_id, ..replayed };
             frozen.push(Arc::new(mem));
         }
         let active_id = max_id + 1;
@@ -855,11 +866,14 @@ impl Inner {
                 .flush
                 .map_or(Ok(()), |log| log.start_flush().write())
                 .and_then(|()| a.sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
+            // SAFETY: see `Assigned::mem`; this writer stays counted in
+            // until the `exit` below, its last use of the memtable.
+            let mem = unsafe { &*a.mem };
             for (i, op) in ops.into_iter().enumerate() {
-                a.mem.table.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
+                mem.table.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
             }
             self.commits.commit(a.ticket);
-            a.mem.inflight.exit(request.shard);
+            mem.inflight.exit(request.shard);
             self.poison_on_err(flushed)
         })
     }
@@ -989,13 +1003,13 @@ impl Inner {
             w.flush_claimed = len;
             flush = Some(w.wal.log());
         }
-        w.active.last_seq.store(seq + r.ops - 1, Relaxed);
-        w.active.bytes.fetch_add(r.entry_bytes, Relaxed);
+        w.active.counts.last_seq.store(seq + r.ops - 1, Relaxed);
+        w.active.counts.bytes.fetch_add(r.entry_bytes, Relaxed);
         w.active.inflight.enter(r.shard);
         let ticket = w.next_ticket;
         w.next_ticket += 1;
         self.commits.register(ticket, seq + r.ops - 1);
-        Ok(Assigned { mem: w.active.clone(), seq, ticket, sync_to, flush })
+        Ok(Assigned { mem: Arc::as_ptr(&w.active), seq, ticket, sync_to, flush })
     }
 
     /// Freezes the active memtable and starts a new one with a new log
@@ -1188,7 +1202,7 @@ impl Inner {
         let t = std::time::Instant::now();
         let sb = Superblock {
             checkpoint_id: durable.sb.checkpoint_id + 1,
-            last_seq: mem.last_seq.load(SeqCst),
+            last_seq: mem.counts.last_seq.load(SeqCst),
             last_memtable_id: mem.id,
             next_page_id: self.next_page_id.load(SeqCst),
             root: root.as_ref().and_then(tree::root_ptr),

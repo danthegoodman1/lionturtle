@@ -71,19 +71,20 @@ Reads at this scale wait on the drives: read p99 on C was 550 µs for turtlekv-r
 
 ### Clock speed
 
-The workstation outruns EC2 in the tables above because it holds more of its data in memory and runs faster cores. To measure the cores alone, turtlekv-rs ran 10M records in a 2 GB cache, so every read hit memory, with 16 client threads. It ran at full clock (P-cores up to 5.8 GHz, E-cores up to 4.6 GHz) and with every core capped at 3.2 GHz, the i7ie's all-core turbo, two alternating runs each:
+The workstation outruns EC2 in the tables above because it holds more of its data in memory and runs faster cores. To measure the cores alone, turtlekv-rs ran 10M records in a 2 GB cache, so every read hit memory, with 16 client threads and checkpoints written to a RAM-backed `null_blk` drive. It ran at full clock (P-cores up to 5.8 GHz, E-cores up to 4.6 GHz) and with every core capped at 3.2 GHz, the i7ie's all-core turbo, three alternating runs each:
 
 | Workload (thousand ops/s) | Full clock | 3.2 GHz | Full / capped |
 |---|--:|--:|--:|
-| A: 50% read, 50% update | 4,227 | 2,234 | 1.89× |
-| C: 100% read | 20,907 | 17,187 | 1.22× |
-| E: 95% scan of up to 100 keys, 5% insert | 1,358 | 1,082 | 1.25× |
+| Load (inserts) | 2,240 | 1,711 | 1.31× |
+| A: 50% read, 50% update | 5,473 | 3,448 | 1.59× |
+| C: 100% read | 22,491 | 18,325 | 1.23× |
+| E: 95% scan of up to 100 keys, 5% insert | 1,202 | 980 | 1.23× |
 
-Cached reads gain less than the clock, because much of a 0.7 µs read waits on memory. Updates gain more: mean update latency doubled, from 6.7 to 13.3 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
+Cached reads gain less than the clock, because much of a 0.6 µs read waits on memory. Writes gain more: capping raised mean update latency from 4.8 to 7.8 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
 
 ```console
 echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
-./target/release/kvbench --engine turtlekv --records 10000000 --ops 3000000 --threads 16 --cache-mb 2048 --phases load,a,c,e --settle 1
+./target/release/kvbench --engine turtlekv --records 10000000 --ops 20000000 --threads 16 --cache-mb 2048 --phases load,a,c,e --settle 1
 ```
 
 ### Where it wins and where it pays
