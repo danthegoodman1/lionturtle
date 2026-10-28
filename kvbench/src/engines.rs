@@ -56,6 +56,7 @@ impl Turtle {
             max_frozen: args.max_frozen,
             background: true,
             merge_threads: args.merge_threads,
+            pace_checkpoints: args.pace,
         };
         let storage = Arc::new(turtlekv::storage::FsStorage::new(&args.dir).unwrap());
         Self { db: turtlekv::Db::open(storage, opts).unwrap() }

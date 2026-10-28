@@ -44,6 +44,7 @@ fn stress(storage: Arc<dyn turtlekv::storage::Storage>, memtable: MemTableKind, 
         max_frozen: 2,
         background: true,
         merge_threads: 2,
+        pace_checkpoints: true,
     };
     let db = Arc::new(Db::open(storage.clone(), opts.clone()).unwrap());
     // Highest version each key has been written with (published after the
@@ -167,6 +168,7 @@ fn atomic_batches(memtable: MemTableKind) {
         max_frozen: 2,
         background: true,
         merge_threads: 2,
+        pace_checkpoints: true,
     };
     let db = Arc::new(Db::open(Arc::new(SimStorage::new(7, FaultConfig::default())), opts).unwrap());
     // Pair `p` is keys 2p and 2p + 1; writer `w` owns the pairs with p % WRITERS == w,
