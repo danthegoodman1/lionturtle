@@ -154,12 +154,75 @@ pub struct IoCounters {
     pub page_bytes_written: AtomicU64,
 }
 
+/// A checkpoint's I/O schedule: `expected` bytes of merge reads and page
+/// writes spread over `target`, or sooner as `progress` (the share of the
+/// active memtable filled, 0 to 1) reaches `fill`.
+pub struct Pace {
+    pub expected: u64,
+    pub target: std::time::Duration,
+    pub progress: Box<dyn Fn() -> f64 + Send + Sync>,
+    pub fill: f64,
+}
+
+/// Spreads a checkpoint's I/O over the time it has before writers would
+/// wait on it, so client reads find the device idle more often.
+#[derive(Default)]
+pub struct Pacer {
+    state: Mutex<Option<(Pace, std::time::Instant, u64)>>,
+    /// Nanoseconds checkpoint I/O has waited on the schedule.
+    pub waited_ns: AtomicU64,
+}
+
+impl Pacer {
+    pub fn start(&self, pace: Pace) {
+        *self.state.lock() = Some((pace, std::time::Instant::now(), 0));
+    }
+
+    /// Lets the running checkpoint's I/O proceed at full speed.
+    pub fn stop(&self) {
+        *self.state.lock() = None;
+    }
+
+    /// Accounts for `bytes` of checkpoint I/O about to start, first waiting
+    /// while the checkpoint is ahead of its schedule. Returns whether the
+    /// checkpoint is paced: then no writer waits on it, and a write should
+    /// reach the device before the next starts, so reads queue behind at
+    /// most a write per thread rather than a whole checkpoint's.
+    pub fn take(&self, bytes: u64) -> bool {
+        let mut state = self.state.lock();
+        if let Some((_, _, done)) = state.as_mut() {
+            *done += bytes;
+        }
+        loop {
+            let Some((pace, started, done)) = state.as_ref() else { return false };
+            if *done >= pace.expected {
+                // Past the estimate, go as fast as bounded writes allow.
+                return true;
+            }
+            let elapsed = started.elapsed();
+            let share = (elapsed.as_secs_f64() / pace.target.as_secs_f64()).max((pace.progress)() / pace.fill);
+            if *done as f64 <= pace.expected as f64 * share {
+                return true;
+            }
+            // The time at which the schedule allows `done` bytes; re-check at
+            // least every 10 ms, since faster filling or a stop allows more.
+            let due = pace.target.mul_f64(*done as f64 / pace.expected as f64);
+            let wait = due.saturating_sub(elapsed).min(std::time::Duration::from_millis(10));
+            drop(state);
+            std::thread::sleep(wait);
+            self.waited_ns.fetch_add(wait.as_nanos() as u64, Relaxed);
+            state = self.state.lock();
+        }
+    }
+}
+
 /// Reads and writes data pages through a byte-weighted cache. The cache
 /// hashes deterministically, so simulated runs replay exactly.
 pub struct PageIo {
     pub store: PageStore,
     cache: Cache<(PageId, u32), Cached, Weigh, BuildKeyHasher>,
     pub counters: IoCounters,
+    pub pacer: Pacer,
 }
 
 impl PageIo {
@@ -176,6 +239,7 @@ impl PageIo {
             store,
             cache: Cache::with_options(options, Weigh, BuildKeyHasher::default(), Default::default()),
             counters: IoCounters::default(),
+            pacer: Pacer::default(),
         }
     }
 
@@ -275,6 +339,7 @@ impl PageIo {
         let ptr = page.ptr().expect("unpinned page is written");
         self.counters.span_reads.fetch_add(1, Relaxed);
         self.counters.span_read_bytes.fetch_add(len, Relaxed);
+        self.pacer.take(len);
         Ok((self.store.read(&ptr, off, len)?, true))
     }
 
@@ -283,7 +348,7 @@ impl PageIo {
     pub fn write(&self, page: &DataPage) -> Result<bool> {
         let image = page.pinned().expect("unwritten page is pinned");
         let ptr = self.store.allocate(page.id(), image.len() as u64, page.meta.meta_off)?;
-        let created = self.store.write(&ptr, &image)?;
+        let created = self.store.write(&ptr, &image, &|n| self.pacer.take(n))?;
         self.counters.pages_written.fetch_add(1, Relaxed);
         self.counters.page_bytes_written.fetch_add(image.len() as u64, Relaxed);
         // Cache the image before publishing the pointer, so a reader that
@@ -321,5 +386,42 @@ impl PageIo {
     /// page ids are never reused.
     pub fn evict(&self, page: PageId) {
         self.cache.remove(&(page, IMAGE));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn pace(expected: u64, target_ms: u64, progress: f64) -> Pace {
+        Pace { expected, target: Duration::from_millis(target_ms), progress: Box::new(move || progress), fill: 0.5 }
+    }
+
+    #[test]
+    fn waits_while_ahead_until_stopped() {
+        let pacer = Pacer::default();
+        assert!(!pacer.take(1 << 20), "nothing to pace");
+        pacer.start(pace(1000, 200, 0.0));
+        let t = Instant::now();
+        assert!(pacer.take(500), "paced");
+        assert!(t.elapsed() >= Duration::from_millis(80), "half the bytes at once must wait; waited {:?}", t.elapsed());
+        pacer.stop();
+        let t = Instant::now();
+        assert!(!pacer.take(400));
+        assert!(t.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn filling_memtable_and_overrun_lift_the_pace() {
+        let pacer = Pacer::default();
+        // The next memtable is already as full as the pace's fill share.
+        pacer.start(pace(1000, 60_000, 0.5));
+        let t = Instant::now();
+        assert!(pacer.take(999));
+        // Past the estimate, I/O no longer waits.
+        pacer.start(pace(100, 60_000, 0.0));
+        assert!(pacer.take(150));
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 }

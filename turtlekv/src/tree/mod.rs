@@ -12,8 +12,9 @@
 //!
 //! Nodes are immutable once shared (`Arc`), so applying batches builds a new
 //! tree that shares untouched subtrees with the old one. New pages stay in
-//! memory until the next checkpoint writes them; pages that a later batch
-//! supersedes before then are never written at all.
+//! memory until their checkpoint writes them, when it ends or, once they
+//! pass half the cache, between batches; a page that a later batch
+//! supersedes while still in memory is never written at all.
 //!
 //! A segment records what part of its page belongs to the node: a clip range
 //! `[lo, hi)` (set when a node split leaves one page shared by both halves)
@@ -1364,7 +1365,7 @@ fn write_nodes(ctx: &Ctx, t: &Subtree) -> Result<bool> {
     let id = ctx.new_page_id();
     let raw = encode_node(n, id);
     let ptr = ctx.io.store.allocate(id, raw.len() as u64, raw.len() as u32)?;
-    created |= ctx.io.store.write(&ptr, &raw)?;
+    created |= ctx.io.store.write(&ptr, &raw, &|n| ctx.io.pacer.take(n))?;
     n.ptr.set(ptr).expect("node written once");
     Ok(created)
 }

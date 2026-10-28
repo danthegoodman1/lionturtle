@@ -147,6 +147,7 @@ fn random_options(rng: &mut Rng) -> Options {
         max_frozen: rng.range(1, 3) as usize,
         background: false,
         merge_threads: 0,
+        pace_checkpoints: false,
     }
 }
 

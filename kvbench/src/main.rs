@@ -8,7 +8,9 @@
 //!
 //! With `--rate`, client threads issue operations on a fixed schedule rather
 //! than back to back, and each latency counts from the operation's scheduled
-//! start, so time spent queued behind a stalled operation counts too.
+//! start, so time spent queued behind a stalled operation counts too. A rate
+//! of `10000:20,40000:10` cycles through 10,000 operations per second for 20
+//! seconds and 40,000 for 10.
 //! `--timeline <file>` writes each second's throughput and latency
 //! percentiles there.
 
@@ -58,9 +60,11 @@ pub struct Args {
     pub sync: bool,
     /// RocksDB reuses retired log files, as turtlekv-rs always does.
     pub rocksdb_recycle_logs: bool,
-    /// Operations per second across all client threads in the timed phases;
-    /// 0 issues them back to back.
-    pub rate: u64,
+    /// Operations per second across all client threads in the timed phases,
+    /// as a cycle of (rate, seconds) segments; empty issues them back to back.
+    pub rate: Vec<(f64, f64)>,
+    /// Pace turtlekv-rs checkpoints.
+    pub pace: bool,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
     pub timeline: Option<String>,
@@ -72,6 +76,30 @@ impl Args {
     pub fn memtable_bytes(&self) -> u64 {
         self.chi * (self.leaf_kb << 10)
     }
+}
+
+/// Parses `rate[:seconds],...`; a lone rate holds for the whole phase.
+fn parse_rate(s: &str) -> Vec<(f64, f64)> {
+    s.split(',')
+        .map(|seg| match seg.split_once(':') {
+            Some((r, secs)) => (r.parse().expect("--rate"), secs.parse().expect("--rate")),
+            None => (seg.parse().expect("--rate"), f64::INFINITY),
+        })
+        .filter(|(r, _)| *r > 0.0)
+        .collect()
+}
+
+/// The rate `elapsed` into a cycling schedule.
+fn rate_at(schedule: &[(f64, f64)], elapsed: f64) -> f64 {
+    let cycle: f64 = schedule.iter().map(|(_, secs)| secs).sum();
+    let mut t = if cycle.is_finite() { elapsed % cycle } else { elapsed };
+    for &(rate, secs) in schedule {
+        if t < secs {
+            return rate;
+        }
+        t -= secs;
+    }
+    schedule[0].0
 }
 
 fn parse_args() -> Args {
@@ -104,7 +132,8 @@ fn parse_args() -> Args {
         settle: num("--settle", 0) == 1,
         sync: num("--sync", 0) == 1,
         rocksdb_recycle_logs: num("--rocksdb-recycle-logs", 0) == 1,
-        rate: num("--rate", 0),
+        rate: get("--rate").map_or_else(Vec::new, |r| parse_rate(&r)),
+        pace: num("--pace", 1) == 1,
         uniform: num("--uniform", 0) == 1,
         timeline: get("--timeline"),
     }
@@ -155,10 +184,12 @@ fn io_counters() -> (u64, u64) {
     (field("read_bytes:"), field("write_bytes:"))
 }
 
-fn rss_bytes() -> u64 {
+/// A memory figure from /proc/self/status: `VmRSS:` now, `VmHWM:` the peak
+/// so far.
+fn status_bytes(field: &str) -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     s.lines()
-        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .find_map(|l| l.strip_prefix(field))
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         .map_or(0, |kb| kb * 1024)
 }
@@ -306,9 +337,6 @@ fn run_phase(
     // Scans touch up to 100 entries each; like the paper, run a tenth as many.
     let ops = if phase == "e" { args.ops / 10 } else { args.ops };
     let per_thread = ops / args.threads as u64;
-    // Each thread's operations start `interval` apart, offset from the other
-    // threads' by `t / rate`.
-    let interval = (args.rate > 0).then(|| Duration::from_secs_f64(args.threads as f64 / args.rate as f64));
     let started = Instant::now();
     let scanned = Arc::new(AtomicU64::new(0));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -330,7 +358,8 @@ fn run_phase(
             let (engine, zipf, records, scanned) = (engine.clone(), zipf.clone(), records.clone(), scanned.clone());
             let timeline = timeline.clone();
             let mix = mix.clone();
-            let (vsize, sync, uniform, rate) = (args.value_size, args.sync, args.uniform, args.rate);
+            let (vsize, sync, uniform, threads) = (args.value_size, args.sync, args.uniform, args.threads as f64);
+            let schedule = args.rate.clone();
             let seed = phase.as_bytes()[0] as u64 * 1000 + t as u64;
             std::thread::spawn(move || {
                 // Wake from sleeps within microseconds of the schedule:
@@ -344,21 +373,22 @@ fn run_phase(
                 let mut rng = Rng::new(seed);
                 let mut value = vec![0u8; vsize];
                 let mut local_scanned = 0u64;
-                let mut next = started + interval.map_or(Duration::ZERO, |_| Duration::from_secs_f64(t as f64 / rate as f64));
+                // Each thread's operations start `threads / rate` apart,
+                // offset from the other threads' by `t / rate`.
+                let mut next = started + schedule.first().map_or(Duration::ZERO, |&(rate, _)| Duration::from_secs_f64(t as f64 / rate));
                 for _ in 0..per_thread {
                     let r = rng.unit();
                     let mut acc = 0.0;
                     let op = mix.iter().find(|(_, p)| { acc += p; r < acc }).map_or(mix[0].0, |(op, _)| *op);
                     let n = records.load(Ordering::Relaxed).max(1);
                     let item = if uniform { rng.below(n) } else { zipf.next_scrambled(&mut rng) % n };
-                    let t0 = match interval {
-                        Some(i) => {
-                            std::thread::sleep(next.saturating_duration_since(Instant::now()));
-                            let t0 = next;
-                            next += i;
-                            t0
-                        }
-                        None => Instant::now(),
+                    let t0 = if schedule.is_empty() {
+                        Instant::now()
+                    } else {
+                        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                        let t0 = next;
+                        next += Duration::from_secs_f64(threads / rate_at(&schedule, (next - started).as_secs_f64()));
+                        t0
                     };
                     match op {
                         Op::Read => {
@@ -465,7 +495,7 @@ fn main() {
         }
         let written_user: u64 = result.hist[1].len() + result.hist[2].len() + result.hist[4].len();
         println!(
-            r#"{{"engine":"{}","label":"{}","phase":"{}","threads":{},"records":{},"ops":{},"secs":{:.3},"kops":{:.1},"read_mb":{:.1},"write_mb":{:.1},"waf":{:.2},"scanned":{},"rss_mb":{:.0},"cgroup_peak_mb":{:.0},"disk_mb":{:.0},"engine_stats":{}{}}}"#,
+            r#"{{"engine":"{}","label":"{}","phase":"{}","threads":{},"records":{},"ops":{},"secs":{:.3},"kops":{:.1},"read_mb":{:.1},"write_mb":{:.1},"waf":{:.2},"scanned":{},"rss_mb":{:.0},"peak_rss_mb":{:.0},"cgroup_peak_mb":{:.0},"disk_mb":{:.0},"engine_stats":{}{}}}"#,
             args.engine,
             args.label,
             phase,
@@ -478,7 +508,8 @@ fn main() {
             (w1 - w0) as f64 / 1e6,
             if written_user == 0 { 0.0 } else { (w1 - w0) as f64 / (written_user * user_entry) as f64 },
             result.scanned,
-            rss_bytes() as f64 / 1e6,
+            status_bytes("VmRSS:") as f64 / 1e6,
+            status_bytes("VmHWM:") as f64 / 1e6,
             cgroup_peak_bytes() as f64 / 1e6,
             dir_bytes(std::path::Path::new(&args.dir)) as f64 / 1e6,
             engine.stats_json(),

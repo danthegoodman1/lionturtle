@@ -13,6 +13,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
   - [Where it wins and where it pays](#where-it-wins-and-where-it-pays)
   - [fjall in these runs](#fjall-in-these-runs)
   - [Synchronous writes](#synchronous-writes)
+  - [Reads during sustained writes](#reads-during-sustained-writes)
   - [How the benchmark is run](#how-the-benchmark-is-run)
 - [Behavior compared with RocksDB and fjall](#behavior-compared-with-rocksdb-and-fjall)
 - [Differences from the C++ TurtleKV](#differences-from-the-c-turtlekv)
@@ -92,7 +93,7 @@ echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
 - **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. Loads lead by 1.43×, and the mixed workloads A and F by 1.25–1.38×.
 - **Point reads.** A get checks the memtables, skipping any whose Bloom filter rules the key out, then walks root to leaf. At each node it checks one Bloom filter per buffer level and reads at most one 4 KiB block. Page metadata (block index and filters) stays in memory, so a miss in the cache costs one device read.
 - **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs.
-- **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap.
+- **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint, and a checkpoint holds the pages it creates until it writes them, up to half the cache. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap.
 
 ### fjall in these runs
 
@@ -129,6 +130,28 @@ taskset -c "$(cat /sys/devices/system/node/node0/cpulist)" <command>
 
 Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cache mode from `/sys/block/<drive>/queue/write_cache` and skips flushes on `write through`. A drive with power-loss protection that reports `write back` still gets flushes, which such drives finish quickly; writing `write through` to that file stops them, and is safe only when the cache really survives power loss.
 
+### Reads during sustained writes
+
+A checkpoint reads and writes several times its memtable: about 1.2 GB for each 128 MiB memtable of uniform 1 KB updates. On a drive with little bandwidth to spare, client reads queue behind that I/O. So turtlekv-rs paces each checkpoint to finish within three quarters of the time its memtable took to fill, or sooner if the next memtable fills faster. While paced, a checkpoint writes pages in 256 KiB chunks, each reaching the drive before the next starts, so a read waits behind at most one chunk per writing thread. A checkpoint runs at full speed when writers wait on it or waited on the one before, when another frozen memtable waits behind it, when a caller asks for it, and after the store opens, before it has an estimate of a checkpoint's I/O.
+
+`bench/steady-writes.sh` follows the SILK paper (ATC '19): workload A with uniform keys at a fixed rate for five minutes, on 5M records of 1 KB with a 256 MB cache and a 3 GB memory cap. The drive, from `bench/slow-drive.sh`, is RAM-backed and throttled to 200 MB/s with 100 µs latency, like the SATA SSD in that paper. Each latency counts from the operation's scheduled start, so an operation stuck behind another counts its wait:
+
+| Offered load | Pacing | Read mean | Read p99 | Seconds with read p99 over 10 ms |
+|---|---|--:|--:|--:|
+| 15k ops/s | on | 0.7 ms | 15 ms | 13 of 300 |
+| | off | 4.3 ms | 63 ms | 98 |
+| 22k ops/s | on | 3.4 ms | 119 ms | 56 |
+| | off | 34.5 ms | 226 ms | 163 |
+| 10k ops/s for 20 s, then 30k for 10 s | on | 25 ms | 522 ms | 90 |
+| | off | 62 ms | 565 ms | 120 |
+
+No run stalled a writer, and median read latency stayed at 113–131 µs. In bursts, the next memtable's faster filling pulls a paced checkpoint's deferred I/O into the burst, so p99 changes little while the mean halves. Where writers outrun checkpoints and wait on them, as in the closed-loop tables above, checkpoints run unpaced. RocksDB with the benchmark's settings, which leave its rate limiter off, had a read p99 of 1.5 s at 15k ops/s; at 22k its reads fell up to 10.7 s behind.
+
+```console
+sudo bench/slow-drive.sh /mnt/slow
+bench/steady-writes.sh /mnt/slow/data
+```
+
 ### How the benchmark is run
 
 `kvbench` drives every engine with the same keys, values, operation mix, operation counts and client threads.
@@ -138,7 +161,7 @@ Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cac
 - RocksDB runs on jemalloc, its production allocator. turtlekv-rs and fjall run on mimalloc.
 - turtlekv-rs's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
 - On machines where RocksDB's write path collapses with many loading threads, `--load-threads` loads it with fewer, in the same process as the read phases.
-- Each client thread issues its next operation when the last returns. `--rate` instead schedules operations at a fixed total rate and counts each latency from the scheduled start, so time queued behind a slow operation counts too. `--uniform 1` picks keys uniformly rather than by scrambled Zipfian, and `--timeline <file>` writes each second's throughput, latency percentiles and turtlekv-rs's writer stall time.
+- Each client thread issues its next operation when the last returns. `--rate` instead schedules operations at a fixed total rate, or a cycle such as `10000:20,30000:10`, and counts each latency from the scheduled start, so time queued behind a slow operation counts too. `--uniform 1` picks keys uniformly rather than by scrambled Zipfian, `--timeline <file>` writes each second's throughput, latency percentiles and turtlekv-rs's writer stall time, and `--pace 0` turns off turtlekv-rs's checkpoint pacing.
 
 ```console
 cargo build --release -p kvbench --features rocksdb
@@ -230,7 +253,7 @@ flowchart LR
   A --> K[Commit stage: fsync, write the superblock, free dead pages, swap in the new tree, retire the log segment]
 ```
 
-Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint.
+Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint. A checkpoint cuts its memtable into batches on one thread while another applies them, writes its new pages early once they pass half the cache, and paces its I/O; see [Reads during sustained writes](#reads-during-sustained-writes).
 
 ### The TurtleTree
 
@@ -256,12 +279,13 @@ Each batch takes a ticket under the writer lock and registers it. Its versions c
 | Field | Default | Effect |
 |---|---|---|
 | `checkpoint_distance` | 32 | Memtable size in leaf-sized batches (χ). Larger cuts write amplification and costs memory. |
-| `cache_bytes` | 1 GiB | Block and page-image cache |
+| `cache_bytes` | 1 GiB | Block and page-image cache. A checkpoint writes its new pages early once they pass half this. |
 | `memtable` | `BBTree` | Memtable implementation: `BBTree`, `SkipList`, `BTree`, or `Art8` (8-byte keys) |
 | `max_frozen` | 1 | Frozen memtables allowed to await checkpointing before writers wait |
 | `wal_buffer_bytes` | 1 MiB | Log bytes buffered before a write to the file |
 | `merge_threads` | 4 | Threads for parallel merges and page writes; 0 uses the caller's rayon pool |
 | `background` | true | Checkpoint on background threads; with false, callers drive `checkpoint_step` |
+| `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
