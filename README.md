@@ -138,6 +138,7 @@ Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cac
 - RocksDB runs on jemalloc, its production allocator. turtlekv-rs and fjall run on mimalloc.
 - turtlekv-rs's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
 - On machines where RocksDB's write path collapses with many loading threads, `--load-threads` loads it with fewer, in the same process as the read phases.
+- Each client thread issues its next operation when the last returns. `--rate` instead schedules operations at a fixed total rate and counts each latency from the scheduled start, so time queued behind a slow operation counts too. `--uniform 1` picks keys uniformly rather than by scrambled Zipfian, and `--timeline <file>` writes each second's throughput, latency percentiles and turtlekv-rs's writer stall time.
 
 ```console
 cargo build --release -p kvbench --features rocksdb

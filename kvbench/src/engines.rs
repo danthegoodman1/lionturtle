@@ -18,6 +18,11 @@ pub trait Engine: Send + Sync {
     /// Finishes background work the writes so far started: turtlekv-rs
     /// checkpoints its memtables, and the LSM engines flush and compact fully.
     fn settle(&self) {}
+    /// Total seconds writers have waited for background work, where the
+    /// engine counts them.
+    fn stall_secs(&self) -> f64 {
+        0.0
+    }
 }
 
 pub fn open(args: &Args) -> Arc<dyn Engine> {
@@ -68,6 +73,10 @@ impl Engine for Turtle {
 
     fn settle(&self) {
         self.db.checkpoint().unwrap();
+    }
+
+    fn stall_secs(&self) -> f64 {
+        self.db.stats().stage_secs[5]
     }
 
     fn get(&self, key: &[u8]) -> Option<usize> {

@@ -5,6 +5,12 @@
 //! of `a b c e f` runs `--ops` operations with scrambled-Zipfian key choice.
 //! Prints one JSON object per phase with throughput, per-operation latency
 //! percentiles, and the bytes the process read from and wrote to storage.
+//!
+//! With `--rate`, client threads issue operations on a fixed schedule rather
+//! than back to back, and each latency counts from the operation's scheduled
+//! start, so time spent queued behind a stalled operation counts too.
+//! `--timeline <file>` writes each second's throughput and latency
+//! percentiles there.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -14,6 +20,8 @@ mod ycsb;
 
 use engines::Engine;
 use hdrhistogram::Histogram;
+use parking_lot::Mutex;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -50,6 +58,12 @@ pub struct Args {
     pub sync: bool,
     /// RocksDB reuses retired log files, as turtlekv-rs always does.
     pub rocksdb_recycle_logs: bool,
+    /// Operations per second across all client threads in the timed phases;
+    /// 0 issues them back to back.
+    pub rate: u64,
+    /// Choose keys uniformly instead of by scrambled Zipfian.
+    pub uniform: bool,
+    pub timeline: Option<String>,
 }
 
 impl Args {
@@ -90,6 +104,9 @@ fn parse_args() -> Args {
         settle: num("--settle", 0) == 1,
         sync: num("--sync", 0) == 1,
         rocksdb_recycle_logs: num("--rocksdb-recycle-logs", 0) == 1,
+        rate: num("--rate", 0),
+        uniform: num("--uniform", 0) == 1,
+        timeline: get("--timeline"),
     }
 }
 
@@ -183,6 +200,59 @@ fn new_hists() -> Vec<Histogram<u64>> {
     OPS.iter().map(|_| Histogram::new_with_bounds(1, 60_000_000_000, 3).unwrap()).collect()
 }
 
+/// Latencies by second of the phase, merged from every client thread.
+struct Timeline {
+    secs: Mutex<Vec<Vec<Histogram<u64>>>>,
+    /// The engine's cumulative write-stall seconds, sampled once a second.
+    stalls: Mutex<Vec<f64>>,
+}
+
+impl Timeline {
+    fn new() -> Self {
+        Self { secs: Mutex::new(Vec::new()), stalls: Mutex::new(Vec::new()) }
+    }
+
+    fn add(&self, sec: usize, hist: &[Histogram<u64>]) {
+        let mut secs = self.secs.lock();
+        while secs.len() <= sec {
+            secs.push(OPS.iter().map(|_| Histogram::new_with_bounds(1, 60_000_000_000, 2).unwrap()).collect());
+        }
+        for (a, b) in secs[sec].iter_mut().zip(hist) {
+            a.add(b).unwrap();
+        }
+    }
+
+    fn write(&self, path: &str, args: &Args, phase: &str) {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let stalls = self.stalls.lock();
+        for (sec, hists) in self.secs.lock().iter().enumerate() {
+            let ops: u64 = hists.iter().map(|h| h.len()).sum();
+            let stall = stalls.get(sec + 1).zip(stalls.get(sec)).map_or(0.0, |(b, a)| b - a);
+            let mut line = format!(
+                r#"{{"engine":"{}","label":"{}","phase":"{}","sec":{},"kops":{:.1},"stall_s":{:.3}"#,
+                args.engine,
+                args.label,
+                phase,
+                sec,
+                ops as f64 / 1e3,
+                stall
+            );
+            for (op, h) in OPS.iter().zip(hists) {
+                if !h.is_empty() {
+                    line.push_str(&format!(
+                        r#","{}":{{"p50_us":{:.1},"p99_us":{:.1},"max_us":{:.1}}}"#,
+                        op_name(*op),
+                        h.value_at_quantile(0.5) as f64 / 1e3,
+                        h.value_at_quantile(0.99) as f64 / 1e3,
+                        h.max() as f64 / 1e3
+                    ));
+                }
+            }
+            writeln!(f, "{line}}}").unwrap();
+        }
+    }
+}
+
 fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
     let next = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
@@ -219,32 +289,77 @@ fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
     PhaseResult { ops: args.records, elapsed: started.elapsed(), hist, scanned: 0 }
 }
 
-fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<AtomicU64>) -> PhaseResult {
+unsafe extern "C" {
+    fn prctl(option: i32, ...) -> i32;
+}
+
+fn run_phase(
+    engine: &Arc<dyn Engine>,
+    args: &Args,
+    phase: &str,
+    records: &Arc<AtomicU64>,
+    timeline: &Arc<Timeline>,
+) -> PhaseResult {
     let mix = mix(phase);
     let n = records.load(Ordering::SeqCst);
     let zipf = Arc::new(Zipfian::new(n, 0.99));
     // Scans touch up to 100 entries each; like the paper, run a tenth as many.
     let ops = if phase == "e" { args.ops / 10 } else { args.ops };
     let per_thread = ops / args.threads as u64;
+    // Each thread's operations start `interval` apart, offset from the other
+    // threads' by `t / rate`.
+    let interval = (args.rate > 0).then(|| Duration::from_secs_f64(args.threads as f64 / args.rate as f64));
     let started = Instant::now();
     let scanned = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let (engine, timeline, done) = (engine.clone(), timeline.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut next = started;
+            while !done.load(Ordering::Relaxed) {
+                timeline.stalls.lock().push(engine.stall_secs());
+                next += Duration::from_secs(1);
+                while !done.load(Ordering::Relaxed) && Instant::now() < next {
+                    std::thread::park_timeout(next.saturating_duration_since(Instant::now()));
+                }
+            }
+        })
+    };
     let handles: Vec<_> = (0..args.threads)
         .map(|t| {
             let (engine, zipf, records, scanned) = (engine.clone(), zipf.clone(), records.clone(), scanned.clone());
+            let timeline = timeline.clone();
             let mix = mix.clone();
-            let (vsize, sync) = (args.value_size, args.sync);
+            let (vsize, sync, uniform, rate) = (args.value_size, args.sync, args.uniform, args.rate);
             let seed = phase.as_bytes()[0] as u64 * 1000 + t as u64;
             std::thread::spawn(move || {
+                // Wake from sleeps within microseconds of the schedule:
+                // PR_SET_TIMERSLACK to 1 ns, from the default 50 µs.
+                // SAFETY: prctl with these arguments changes only this
+                // thread's timer slack.
+                unsafe { prctl(29, 1u64) };
                 let mut hist = new_hists();
+                let mut sec_hist = new_hists();
+                let mut sec = 0usize;
                 let mut rng = Rng::new(seed);
                 let mut value = vec![0u8; vsize];
                 let mut local_scanned = 0u64;
+                let mut next = started + interval.map_or(Duration::ZERO, |_| Duration::from_secs_f64(t as f64 / rate as f64));
                 for _ in 0..per_thread {
                     let r = rng.unit();
                     let mut acc = 0.0;
                     let op = mix.iter().find(|(_, p)| { acc += p; r < acc }).map_or(mix[0].0, |(op, _)| *op);
-                    let item = zipf.next_scrambled(&mut rng) % records.load(Ordering::Relaxed).max(1);
-                    let t0 = Instant::now();
+                    let n = records.load(Ordering::Relaxed).max(1);
+                    let item = if uniform { rng.below(n) } else { zipf.next_scrambled(&mut rng) % n };
+                    let t0 = match interval {
+                        Some(i) => {
+                            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                            let t0 = next;
+                            next += i;
+                            t0
+                        }
+                        None => Instant::now(),
+                    };
                     match op {
                         Op::Read => {
                             engine.get(&key_of(item));
@@ -269,8 +384,18 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                         }
                     }
                     let idx = OPS.iter().position(|o| *o == op).unwrap();
-                    hist[idx].record(t0.elapsed().as_nanos() as u64).ok();
+                    let end = Instant::now();
+                    let ns = end.saturating_duration_since(t0).as_nanos() as u64;
+                    hist[idx].record(ns).ok();
+                    let s = end.duration_since(started).as_secs() as usize;
+                    if s != sec {
+                        timeline.add(sec, &sec_hist);
+                        sec_hist.iter_mut().for_each(Histogram::reset);
+                        sec = s;
+                    }
+                    sec_hist[idx].record(ns).ok();
                 }
+                timeline.add(sec, &sec_hist);
                 scanned.fetch_add(local_scanned, Ordering::Relaxed);
                 hist
             })
@@ -282,7 +407,12 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
             a.add(b).unwrap();
         }
     }
-    PhaseResult { ops: per_thread * args.threads as u64, elapsed: started.elapsed(), hist, scanned: scanned.load(Ordering::Relaxed) }
+    let elapsed = started.elapsed();
+    done.store(true, Ordering::Relaxed);
+    sampler.thread().unpark();
+    sampler.join().unwrap();
+    timeline.stalls.lock().push(engine.stall_secs());
+    PhaseResult { ops: per_thread * args.threads as u64, elapsed, hist, scanned: scanned.load(Ordering::Relaxed) }
 }
 
 fn main() {
@@ -308,7 +438,12 @@ fn main() {
             if records.load(Ordering::SeqCst) == 0 {
                 records.store(args.records, Ordering::SeqCst);
             }
-            run_phase(&engine, &args, &phase, &records)
+            let timeline = Arc::new(Timeline::new());
+            let r = run_phase(&engine, &args, &phase, &records, &timeline);
+            if let Some(path) = &args.timeline {
+                timeline.write(path, &args, &phase);
+            }
+            r
         };
         let (r1, w1) = io_counters();
         let secs = result.elapsed.as_secs_f64();
