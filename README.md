@@ -14,6 +14,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
   - [fjall in these runs](#fjall-in-these-runs)
   - [Synchronous writes](#synchronous-writes)
   - [Reads during sustained writes](#reads-during-sustained-writes)
+  - [Compared with ScyllaDB's published tail latency](#compared-with-scylladbs-published-tail-latency)
   - [How the benchmark is run](#how-the-benchmark-is-run)
 - [Behavior compared with RocksDB and fjall](#behavior-compared-with-rocksdb-and-fjall)
 - [Differences from the C++ TurtleKV](#differences-from-the-c-turtlekv)
@@ -31,6 +32,7 @@ A VOPR-style deterministic simulator checks it: seeded runs crash the store, cor
 - **Fewer bytes written.** Each full memtable becomes one checkpoint of a Bε-tree, so a key overwritten within one checkpoint reaches disk once. Loading 50M records wrote 5.9 bytes per user byte, against RocksDB's 7.7 and fjall's 8.5.
 - **Batches are atomic to readers.** A batch survives a crash whole or not at all, and no reader sees half of one. Writers commit independently, so one slow insert delays no other writer.
 - **Explicit snapshots.** `Db::snapshot` returns a handle that any number of reads and iterators can share, and every read through it sees the same batches. Each iterator is a snapshot too: it sees every batch written before it was created and none after.
+- **Short read tails under sustained writes.** Checkpoints pace their I/O after the [SILK](https://www.usenix.org/conference/atc19/presentation/balmau) paper: each gets only the bandwidth it needs to finish before writers would wait on it, and full bandwidth once they would. On a drive throttled to 200 MB/s at 15k ops/s, read p99 was 16 ms, against 344 ms for RocksDB with its auto-tuned rate limiter. See [Reads during sustained writes](#reads-during-sustained-writes).
 - **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 - **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through writes, reads, iterators, checkpoints, crashes, torn writes, read errors and bit flips on a simulated disk. A failing seed replays exactly. See [Testing](#testing).
 
@@ -132,24 +134,72 @@ Power-loss protection needs no turtlekv-rs setting. Linux reads each drive's cac
 
 ### Reads during sustained writes
 
-A checkpoint reads and writes several times its memtable: about 1.2 GB for each 128 MiB memtable of uniform 1 KB updates. On a drive with little bandwidth to spare, client reads queue behind that I/O. So turtlekv-rs paces each checkpoint to finish within three quarters of the time its memtable took to fill, or sooner if the next memtable fills faster. While paced, a checkpoint writes pages in 256 KiB chunks, each reaching the drive before the next starts, so a read waits behind at most one chunk per writing thread. A checkpoint runs at full speed when writers wait on it or waited on the one before, when another frozen memtable waits behind it, when a caller asks for it, and after the store opens, before it has an estimate of a checkpoint's I/O.
+A checkpoint reads and writes several times its memtable: about 1.2 GB for each 128 MiB memtable of uniform 1 KB updates. On a drive with little bandwidth to spare, client reads queue behind that I/O. The [SILK](https://www.usenix.org/conference/atc19/presentation/balmau) paper (ATC '19) traced an LSM tree's latency spikes to the same contention, and to flushes stuck behind compactions until writes stop. turtlekv-rs paces checkpoints on SILK's two lessons: background I/O gets only the bandwidth it needs to finish before writers would wait on it, and full bandwidth once they would.
 
-`bench/steady-writes.sh` follows the SILK paper (ATC '19): workload A with uniform keys at a fixed rate for five minutes, on 5M records of 1 KB with a 256 MB cache and a 3 GB memory cap. The drive, from `bench/slow-drive.sh`, is RAM-backed and throttled to 200 MB/s with 100 µs latency, like the SATA SSD in that paper. Each latency counts from the operation's scheduled start, so an operation stuck behind another counts its wait:
+Each checkpoint finishes within three quarters of the time its memtable took to fill, or sooner if the next memtable fills faster. While paced, a checkpoint writes pages in 256 KiB chunks, each reaching the drive before the next starts, so a read waits behind at most one chunk per writing thread. A checkpoint runs at full speed when writers wait on it or waited on the one before, when another frozen memtable waits behind it, when a caller asks for it, and after the store opens, before it has an estimate of a checkpoint's I/O.
 
-| Offered load | Pacing | Read mean | Read p99 | Seconds with read p99 over 10 ms |
-|---|---|--:|--:|--:|
-| 15k ops/s | on | 0.7 ms | 15 ms | 13 of 300 |
-| | off | 4.3 ms | 63 ms | 98 |
-| 22k ops/s | on | 3.4 ms | 119 ms | 56 |
-| | off | 34.5 ms | 226 ms | 163 |
-| 10k ops/s for 20 s, then 30k for 10 s | on | 25 ms | 522 ms | 90 |
-| | off | 62 ms | 565 ms | 120 |
+`bench/steady-writes.sh` runs SILK's experiment: workload A with uniform keys at a fixed rate for five minutes, on 5M records of 1 KB with a 256 MB cache and a 3 GB memory cap. The drive, from `bench/slow-drive.sh`, is RAM-backed and throttled to 200 MB/s with 100 µs latency, like the SATA SSD in that paper. Each latency counts from the operation's scheduled start, so an operation stuck behind another counts its wait:
 
-No run stalled a writer, and median read latency stayed at 113–131 µs. In bursts, the next memtable's faster filling pulls a paced checkpoint's deferred I/O into the burst, so p99 changes little while the mean halves. Where writers outrun checkpoints and wait on them, as in the closed-loop tables above, checkpoints run unpaced. RocksDB with the benchmark's settings, which leave its rate limiter off, had a read p99 of 1.5 s at 15k ops/s; at 22k its reads fell up to 10.7 s behind.
+| Offered load | Engine | Read mean | Read p99 | Read max | Seconds with read p99 over 10 ms |
+|---|---|--:|--:|--:|--:|
+| 15k ops/s | turtlekv-rs, paced | 0.7 ms | 16 ms | 161 ms | 14 of 300 |
+| | turtlekv-rs, unpaced | 5.3 ms | 78 ms | 177 ms | 106 |
+| | RocksDB, rate limiter | 18 ms | 344 ms | 709 ms | 97 |
+| | RocksDB | 128 ms | 1.5 s | 2.0 s | 114 |
+| 22k ops/s | turtlekv-rs, paced | 2.7 ms | 91 ms | 265 ms | 56 |
+| | turtlekv-rs, unpaced | 38 ms | 241 ms | 398 ms | 170 |
+| | RocksDB, rate limiter | 767 ms | 8.8 s | 10.6 s | 164 |
+| | RocksDB | 2.4 s | 7.8 s | 8.4 s | 210 |
+| 10k ops/s for 20 s, then 30k for 10 s | turtlekv-rs, paced | 33 ms | 644 ms | 1.0 s | 96 |
+| | turtlekv-rs, unpaced | 74 ms | 603 ms | 931 ms | 125 |
+| | RocksDB, rate limiter | 952 ms | 12.3 s | 14.7 s | 155 |
+| | RocksDB | 886 ms | 7.8 s | 8.8 s | 137 |
+
+RocksDB ran with the benchmark's settings: 16 background jobs and subcompactions, 128 MiB memtables, a 256 MB block cache, 10-bit Bloom filters, no compression and jemalloc. "Rate limiter" adds its auto-tuned rate limiter, which caps flush and compaction writes at between 10 and 200 MB/s and moves the cap with recent demand; 200 MB/s is the drive's bandwidth.
+
+The limiter shields reads from compaction, but it throttles flushes too. When two full memtables wait on a throttled flush, RocksDB stops all writes, and each client thread queues behind its stopped write. At 22k ops/s that left 39 seconds in which no operation finished. Without the limiter, RocksDB fell behind the 22k schedule and its median read waited 1.8 s.
+
+turtlekv-rs wrote 5.7 bytes per user byte in every run, paced or not; no run stalled a writer, and median read latency stayed at 113–137 µs. The limiter cut RocksDB's write amplification from 6.1 to 3.5 at 15k ops/s by deferring compaction, and the deferred work came due. Over 20 minutes at 15k ops/s, RocksDB with the limiter fell up to 15 s behind in minutes 8 through 10, and its median per-second read p99 stayed above 130 ms for the rest of the run.
+
+| 20 minutes at 15k ops/s | Read mean | Read p99 | Read max | Seconds with read p99 over 10 ms | Write amplification |
+|---|--:|--:|--:|--:|--:|
+| turtlekv-rs, paced | 0.3 ms | 8 ms | 139 ms | 38 of 1,200 | 5.7 |
+| RocksDB, rate limiter | 756 ms | 14.1 s | 15.7 s | 850 of 1,200 | 7.7 |
+
+In bursts, the next memtable's faster filling pulls a paced checkpoint's deferred I/O into the burst, so p99 changes little while the mean halves. Where writers outrun checkpoints and wait on them, as in the closed-loop tables above, checkpoints run unpaced. Nine of turtlekv-rs's 14 slow seconds at 15k ops/s fell in the first minute, while the first checkpoint after opening ran unpaced.
 
 ```console
+cargo build --release -p kvbench --features rocksdb
 sudo bench/slow-drive.sh /mnt/slow
 bench/steady-writes.sh /mnt/slow/data
+```
+
+### Compared with ScyllaDB's published tail latency
+
+ScyllaDB reports single-digit-millisecond p99s while it compacts. On one i4i.4xlarge node at about half its peak load, a 50/50 read/write workload over a 3 TB dataset, mostly read from disk, held read p99 at 6.06 ms and write p99 at 1.52 ms through a major compaction ([ScyllaDB 5.0 on i4i](https://www.scylladb.com/2022/09/07/benchmarking-scylladb-5-0-on-aws-i4i-4xlarge/)). At petabyte scale its read p99 stayed between 3.7 and 6.5 ms ([petabyte benchmark](https://www.scylladb.com/2022/07/14/benchmarking-petabyte-scale-nosql-workloads-with-scylladb/)).
+
+The nearest kvbench run is workload A with uniform keys on 20M records of 1 KB (20 GB against a 3 GB memory cap) on the workstation's NVMe drive, at 52k ops/s for five minutes. That is about half turtlekv-rs's closed-loop peak of 106k ops/s on the same data, and 40% of RocksDB's 131k:
+
+| 52k ops/s for five minutes | Read p99 in the median second | Seconds with read p99 over 10 ms | Seconds with no operation finished | Read p99 over five minutes |
+|---|--:|--:|--:|--:|
+| turtlekv-rs, first run | 2.8 ms | 69 of 299 | 3 | 4.1 s |
+| turtlekv-rs, second run | 2.1 ms | 56 | 0 | 1.2 s |
+| RocksDB | 7.7 ms | 130 | 6 | 8.3 s |
+| RocksDB, rate limiter (2,000 MB/s bound) | 12.3 ms | 171 | 13 | 5.3 s |
+
+In a typical second, turtlekv-rs's read p99 sits under ScyllaDB's 6 ms; over five minutes it does not. Writers waited on running checkpoints for 5.5 s in the first run and 1.1 s in the second, and each client thread's reads queued behind its waiting write. RocksDB went longer with no operation finishing. ScyllaDB's published p99 covers its whole run, so it holds the tail that both embedded engines give up in those episodes.
+
+The setups differ:
+
+- **Drive.** AWS built the i4i's Nitro SSDs for low latency variability ([I4i](https://aws.amazon.com/ec2/instance-types/i4i/)); the workstation has a Micron client drive. Power-loss protection would change little here: turtlekv-rs syncs a few times per checkpoint, and those syncs took 0.9 s of each five-minute run.
+- **I/O scheduling.** ScyllaDB's Seastar scheduler dispatches only as much I/O as `iotune` measured the drive can serve within a latency goal, and divides it among queries, compaction and flushes by shares. turtlekv-rs paces each checkpoint's total rate and leaves queue depth to the kernel.
+- **Clients.** ScyllaDB's figures come from cassandra-stress over the network. kvbench calls the engine in-process from 16 threads that each run their schedule in order, so one blocked write delays every operation behind it on that thread.
+
+```console
+run="systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 ./target/release/kvbench --engine turtlekv
+  --records 20000000 --value-size 1000 --cache-mb 256 --threads 16 --dir /data/turtlekv"
+$run --phases load --settle 1 --keep 1
+$run --phases a --uniform 1 --rate 52000 --ops 15600000 --keep 1 --timeline timeline.jsonl
 ```
 
 ### How the benchmark is run
@@ -160,8 +210,9 @@ bench/steady-writes.sh /mnt/slow/data
 - No engine compresses data, and no engine fsyncs per write. RocksDB buffers its log manually, fjall persists its journal manually, and turtlekv-rs buffers up to 1 MiB of log. `--sync 1` makes every write in the timed phases durable before it returns; `bench/sync.sh` runs that comparison.
 - RocksDB runs on jemalloc, its production allocator. turtlekv-rs and fjall run on mimalloc.
 - turtlekv-rs's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
+- Latency runs need a quiet drive. Each read of an NVMe drive's temperature in `/sys/class/hwmon` sends the drive a SMART log request, and the workstation's drive holds reads about 3.4 ms behind each one; monitoring agents that poll every second put a floor under every second's p99. Eight ClickHouse processes, polling together, made that floor about 40 ms.
 - On machines where RocksDB's write path collapses with many loading threads, `--load-threads` loads it with fewer, in the same process as the read phases.
-- Each client thread issues its next operation when the last returns. `--rate` instead schedules operations at a fixed total rate, or a cycle such as `10000:20,30000:10`, and counts each latency from the scheduled start, so time queued behind a slow operation counts too. `--uniform 1` picks keys uniformly rather than by scrambled Zipfian, `--timeline <file>` writes each second's throughput, latency percentiles and turtlekv-rs's writer stall time, and `--pace 0` turns off turtlekv-rs's checkpoint pacing.
+- Each client thread issues its next operation when the last returns. `--rate` instead schedules operations at a fixed total rate, or a cycle such as `10000:20,30000:10`, and counts each latency from the scheduled start, so time queued behind a slow operation counts too. `--uniform 1` picks keys uniformly rather than by scrambled Zipfian, `--timeline <file>` writes each second's throughput, latency percentiles and turtlekv-rs's and RocksDB's writer stall time, `--pace 0` turns off turtlekv-rs's checkpoint pacing, and `--rocksdb-rate-mb <MB/s>` turns on RocksDB's auto-tuned rate limiter with that upper bound.
 
 ```console
 cargo build --release -p kvbench --features rocksdb
@@ -253,7 +304,7 @@ flowchart LR
   A --> K[Commit stage: fsync, write the superblock, free dead pages, swap in the new tree, retire the log segment]
 ```
 
-Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint. A checkpoint cuts its memtable into batches on one thread while another applies them, writes its new pages early once they pass half the cache, and paces its I/O; see [Reads during sustained writes](#reads-during-sustained-writes).
+Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when a frozen memtable still awaits its checkpoint. A checkpoint cuts its memtable into batches on one thread while another applies them, writes its new pages early once they pass half the cache, and paces its I/O after the SILK paper; see [Reads during sustained writes](#reads-during-sustained-writes).
 
 ### The TurtleTree
 
