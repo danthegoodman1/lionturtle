@@ -437,6 +437,9 @@ struct Applied {
     mem: Arc<Mem>,
     root: Option<Subtree>,
     created_files: bool,
+    /// Pages written before the checkpoint finished applying. Any that a
+    /// later batch superseded are garbage no committed tree references.
+    early: Vec<PagePtr>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -800,6 +803,8 @@ impl Db {
             if let Some(r) = &a.root {
                 tree::reachable(r, &mut expected);
             }
+            // Its superseded early pages stay allocated until it commits.
+            expected.extend(a.early.iter().copied());
         }
         let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
         assert!(live.is_subset(&allocated), "a live page is not allocated");
@@ -1142,26 +1147,29 @@ impl Inner {
         self.version.load().frozen.iter().rev().find(|m| m.id > last).cloned()
     }
 
-    /// Cuts a frozen memtable into sorted batches of about one leaf each.
-    fn build_batches(&self, mem: &Mem) -> Vec<Arc<DataPage>> {
+    /// Cuts a frozen memtable into sorted batches of about one leaf each and
+    /// hands each to `send`, stopping early if it returns false.
+    fn build_batches(&self, mem: &Mem, send: &mut dyn FnMut(Arc<DataPage>) -> bool) {
         let limit = self.opts.tree.leaf_size;
         let bits = self.opts.tree.filter_bits;
         let capacity = (limit + limit / 16) as usize + 4096;
-        let mut batches = Vec::new();
         let mut b = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
+        let mut open = true;
         mem.table.for_each(&mut |key, value| {
+            if !open {
+                return;
+            }
             let e = EntryRef { key, value: value.as_put().map(|v| &v[..]) };
             if !b.is_empty() && b.data_bytes() + e.size() > limit {
                 let next = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
                 let full = std::mem::replace(&mut b, next);
-                batches.push(Arc::new(DataPage::unwritten(full.finish(bits))));
+                open = send(Arc::new(DataPage::unwritten(full.finish(bits))));
             }
             b.push(e);
         });
-        if !b.is_empty() {
-            batches.push(Arc::new(DataPage::unwritten(b.finish(bits))));
+        if open && !b.is_empty() {
+            send(Arc::new(DataPage::unwritten(b.finish(bits))));
         }
-        batches
     }
 
     fn checkpoint_step(&self) -> Result<bool> {
@@ -1183,31 +1191,54 @@ impl Inner {
             std::thread::yield_now();
         }
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
-        let t = std::time::Instant::now();
-        let batches = self.build_batches(&mem);
-        self.timing.build_ns.fetch_add(since(t), Relaxed);
-        let apply = || -> Result<(Option<Subtree>, bool)> {
+        let apply = |batches: std::sync::mpsc::Receiver<Arc<DataPage>>| -> Result<(Option<Subtree>, bool, Vec<PagePtr>)> {
             let mut root = applier.root.clone();
-            let t = std::time::Instant::now();
+            let mut created_files = false;
+            let mut early = Vec::new();
             for batch in batches {
+                let t = std::time::Instant::now();
                 root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
+                self.timing.apply_ns.fetch_add(since(t), Relaxed);
+                // Pages a checkpoint has yet to write count against half the
+                // cache: past that, write the new pages below the root now
+                // rather than hold them all until the checkpoint ends. A
+                // later batch may still supersede one, wasting its write,
+                // so a large cache keeps them all in memory.
+                if let Some(r) = &root {
+                    let pages = tree::unwritten_below_root(r);
+                    if pages.iter().map(|p| p.meta.image_len()).sum::<u64>() > self.opts.cache_bytes / 2 {
+                        let t = std::time::Instant::now();
+                        created_files |= tree::write_pages(&ctx, &pages)?;
+                        early.extend(pages.iter().filter_map(|p| p.ptr()));
+                        self.timing.write_ns.fetch_add(since(t), Relaxed);
+                    }
+                }
             }
-            self.timing.apply_ns.fetch_add(since(t), Relaxed);
             let t = std::time::Instant::now();
-            let created_files = match &root {
-                Some(r) => tree::write_tree(&ctx, r)?,
-                None => false,
-            };
+            if let Some(r) = &root {
+                created_files |= tree::write_tree(&ctx, r)?;
+            }
             self.timing.write_ns.fetch_add(since(t), Relaxed);
-            Ok((root, created_files))
+            Ok((root, created_files, early))
         };
-        let (root, created_files) = match &self.merge_pool {
-            Some(pool) => pool.install(apply)?,
-            None => apply()?,
-        };
+        // Another thread cuts the batches while this one applies them, one
+        // batch ahead, so the checkpoint never holds a copy of the memtable.
+        let (root, created_files, early) = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let frozen = &*mem;
+            scope.spawn(move || {
+                let t = std::time::Instant::now();
+                self.build_batches(frozen, &mut |batch| tx.send(batch).is_ok());
+                self.timing.build_ns.fetch_add(since(t), Relaxed);
+            });
+            match &self.merge_pool {
+                Some(pool) => pool.install(|| apply(rx)),
+                None => apply(rx),
+            }
+        })?;
         applier.root = root.clone();
         applier.last_applied = mem.id;
-        self.pending.lock().push_back(Applied { mem, root, created_files });
+        self.pending.lock().push_back(Applied { mem, root, created_files, early });
         Ok(true)
     }
 
@@ -1216,7 +1247,7 @@ impl Inner {
     fn commit_step(&self) -> Result<bool> {
         self.check_poisoned()?;
         let mut durable = self.durable.lock();
-        let Some(Applied { mem, root, created_files }) = self.pending.lock().pop_front() else {
+        let Some(Applied { mem, root, created_files, early }) = self.pending.lock().pop_front() else {
             return Ok(false);
         };
         let t = std::time::Instant::now();
@@ -1242,7 +1273,8 @@ impl Inner {
         if let Some(r) = &root {
             tree::reachable(r, &mut live);
         }
-        let garbage: Vec<PagePtr> = durable.live.difference(&live).copied().collect();
+        let mut garbage: Vec<PagePtr> = durable.live.difference(&live).copied().collect();
+        garbage.extend(early.into_iter().filter(|p| !live.contains(p)));
         let epoch = Arc::new(Epoch::new(self.io.clone()));
         let old_epoch = std::mem::replace(&mut durable.epoch, epoch.clone());
         durable.live = live;

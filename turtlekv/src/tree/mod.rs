@@ -1281,12 +1281,33 @@ pub fn write_tree(ctx: &Ctx, root: &Subtree) -> Result<bool> {
     let mut pages: Vec<Arc<DataPage>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     collect_unwritten(root, &mut pages, &mut seen);
-    let created = if ctx.cfg.parallel {
+    let created = write_pages(ctx, &pages)?;
+    Ok(write_nodes(ctx, root)? | created)
+}
+
+/// The unwritten data pages below the root's own buffer: those of every
+/// child subtree. A later batch of the same checkpoint rewrites the root's
+/// buffer far more often than anything below it.
+pub fn unwritten_below_root(root: &Subtree) -> Vec<Arc<DataPage>> {
+    let mut pages = Vec::new();
+    if let Subtree::Node(n) = root {
+        let mut seen = std::collections::HashSet::new();
+        for c in &n.children {
+            collect_unwritten(c, &mut pages, &mut seen);
+        }
+    }
+    pages
+}
+
+/// Writes data pages, in parallel when configured. Returns whether an
+/// arena file was created.
+pub fn write_pages(ctx: &Ctx, pages: &[Arc<DataPage>]) -> Result<bool> {
+    Ok(if ctx.cfg.parallel {
         // Buffered writes to one file serialize on its inode lock, so write
         // each arena file from one thread.
         use rayon::prelude::*;
         let mut by_class: std::collections::BTreeMap<u8, Vec<&Arc<DataPage>>> = Default::default();
-        for p in &pages {
+        for p in pages {
             let class = crate::pagestore::class_for(p.meta.image_len()).unwrap_or(0);
             by_class.entry(class).or_default().push(p);
         }
@@ -1301,12 +1322,11 @@ pub fn write_tree(ctx: &Ctx, root: &Subtree) -> Result<bool> {
         groups.par_iter().map(write_group).collect::<Result<Vec<bool>>>()?.into_iter().any(|c| c)
     } else {
         let mut any = false;
-        for p in &pages {
+        for p in pages {
             any |= ctx.io.write(p)?;
         }
         any
-    };
-    Ok(write_nodes(ctx, root)? | created)
+    })
 }
 
 fn collect_unwritten(t: &Subtree, out: &mut Vec<Arc<DataPage>>, seen: &mut std::collections::HashSet<PageId>) {
