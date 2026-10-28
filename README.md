@@ -75,12 +75,12 @@ The workstation outruns EC2 in the tables above because it holds more of its dat
 
 | Workload (thousand ops/s) | Full clock | 3.2 GHz | Full / capped |
 |---|--:|--:|--:|
-| Load (inserts) | 2,240 | 1,711 | 1.31× |
-| A: 50% read, 50% update | 5,473 | 3,448 | 1.59× |
-| C: 100% read | 22,491 | 18,325 | 1.23× |
-| E: 95% scan of up to 100 keys, 5% insert | 1,202 | 980 | 1.23× |
+| Load (inserts) | 2,224 | 1,700 | 1.31× |
+| A: 50% read, 50% update | 5,342 | 3,402 | 1.57× |
+| C: 100% read | 23,195 | 19,044 | 1.22× |
+| E: 95% scan of up to 100 keys, 5% insert | 1,203 | 977 | 1.23× |
 
-Cached reads gain less than the clock, because much of a 0.6 µs read waits on memory. Writes gain more: capping raised mean update latency from 4.8 to 7.8 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
+Cached reads gain less than the clock, because much of a 0.6 µs read waits on memory. Writes gain more: capping raised mean update latency from 5.0 to 8.1 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
 
 ```console
 echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
@@ -90,7 +90,7 @@ echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
 ### Where it wins and where it pays
 
 - **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. Loads lead by 1.43×, and the mixed workloads A and F by 1.25–1.38×.
-- **Point reads.** A get checks the memtables, then walks root to leaf. At each node it checks one Bloom filter per buffer level and reads at most one 4 KiB block. Page metadata (block index and filters) stays in memory, so a miss in the cache costs one device read.
+- **Point reads.** A get checks the memtables, skipping any whose Bloom filter rules the key out, then walks root to leaf. At each node it checks one Bloom filter per buffer level and reads at most one 4 KiB block. Page metadata (block index and filters) stays in memory, so a miss in the cache costs one device read.
 - **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs.
 - **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap.
 
@@ -239,7 +239,7 @@ Pages are immutable: checksummed 4 KiB blocks, a sparse block index, and a Bloom
 
 ### Reads
 
-- **Get:** the active memtable, then the frozen one, then the tree, at each node checking each buffer level's segment that covers the key.
+- **Get:** the active memtable, then the frozen one, then the tree, at each node checking each buffer level's segment that covers the key. Each memtable keeps a Bloom filter of its keys, one bit per 8 bytes of memtable (2 MiB for 128 MiB), and a get searches only the memtables whose filter admits the key. Searching a large memtable misses the CPU cache at every level of it; on 10M cached records with uniform keys, the filters raised read throughput by 21%. A writer sets its keys' bits before inserting them, which adds about 0.2 µs to a write of a new key.
 - **Scan:** a merge of the memtables with the tree, one leaf's key range at a time. Each range merges the leaf with the buffer levels of every node on its path.
 - **Reverse scan:** the same merge run backward one window at a time. Each window is merged forward and returned in reverse. The first spans one leaf block, and each next one doubles, up to 32 blocks. On 4.2M cached entries, a full reverse pass takes 89 ns per entry against 62 forward; a 100-entry scan takes 25 µs against 13.
 - **Cache:** a byte-weighted cache of blocks. A freshly written page enters whole, for the next merge to read. Point reads and scans read from such an image without keeping it resident, so under skewed reads the cache holds hot blocks rather than whole pages.

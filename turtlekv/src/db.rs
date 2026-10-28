@@ -13,6 +13,7 @@
 //! references return to the allocator once every reader of an older version
 //! is gone (see [`Epoch`]).
 
+use crate::bloom::{self, SharedFilter};
 use crate::error::{Error, Result};
 use crate::memtable::{MemTable, MemTableKind, View, new_memtable};
 use crate::page::{EntryRef, PageBuilder, entry_size};
@@ -77,10 +78,17 @@ impl Options {
     }
 }
 
+/// Memtable bytes per bit of its filter: 16 bits per key for 128-byte
+/// entries.
+const MEM_BYTES_PER_FILTER_BIT: u64 = 8;
+
 /// A memtable and the log segment that shares its id.
 pub struct Mem {
     pub id: u64,
     table: Box<dyn MemTable>,
+    /// The keys inserted, so a get of a key the memtable lacks skips the
+    /// search: in a large memtable, a cache miss at every level.
+    filter: SharedFilter,
     counts: MemCounts,
     /// Writers assigned to this memtable that have not finished inserting.
     inflight: Inflight,
@@ -265,18 +273,35 @@ fn backoff(spins: &mut u32) {
 }
 
 impl Mem {
-    fn new(id: u64, kind: MemTableKind, last_seq: u64) -> Self {
+    fn new(id: u64, opts: &Options, last_seq: u64) -> Self {
         Self {
             id,
-            table: new_memtable(kind),
+            table: new_memtable(opts.memtable),
+            filter: SharedFilter::new((opts.memtable_limit() / MEM_BYTES_PER_FILTER_BIT / 8) as usize),
             counts: MemCounts { bytes: AtomicU64::new(0), last_seq: AtomicU64::new(last_seq) },
             inflight: Inflight::default(),
         }
     }
 
-    fn insert(&self, op: &WriteOp, seq: u64) {
-        self.table.insert(&op.key, op.value.clone(), seq, 0);
+    fn replay(&self, op: &WriteOp, seq: u64) {
+        self.insert(&op.key, op.value.clone(), seq, 0);
         self.counts.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
+    }
+
+    /// Adds the version of `key` written at `seq` by batch `ticket`. The
+    /// filter takes the key first, so a get that can see the version finds
+    /// the key in the filter.
+    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
+        self.filter.insert(bloom::hash_key(key));
+        self.table.insert(key, value, seq, ticket);
+    }
+
+    /// The newest value of the key hashing to `hash` that `view` sees.
+    fn get(&self, key: &[u8], hash: u64, view: View) -> Option<Value> {
+        if !self.filter.may_contain(hash) {
+            return None;
+        }
+        self.table.get(key, view)
     }
 
     pub fn bytes(&self) -> u64 {
@@ -516,7 +541,7 @@ impl Db {
         // Replay the log into one memtable.
         let mut last_seq = sb.last_seq;
         let mut max_id = sb.last_memtable_id;
-        let replayed = Mem::new(0, opts.memtable, last_seq);
+        let replayed = Mem::new(0, &opts, last_seq);
         let segments = wal::list_segments(&*storage)?;
         let mut gap = false;
         for &id in &segments {
@@ -528,7 +553,7 @@ impl Db {
                 continue;
             }
             let before = last_seq;
-            let r = wal::replay(&*storage, id, last_seq, |seq, op| replayed.insert(&op, seq))?;
+            let r = wal::replay(&*storage, id, last_seq, |seq, op| replayed.replay(&op, seq))?;
             // Replay may have read records that only reached the OS cache
             // (after a process crash). New writes build on them, so they must
             // be durable before the store accepts any.
@@ -557,7 +582,7 @@ impl Db {
         let active_id = max_id + 1;
         let recycler = wal::Recycler::open(&*storage, active_id)?;
         let wal = WalWriter::create(&*storage, active_id, recycler.take())?;
-        let active = Arc::new(Mem::new(active_id, opts.memtable, last_seq));
+        let active = Arc::new(Mem::new(active_id, &opts, last_seq));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
         let version = Version { active: active.clone(), frozen, tree: root, _epoch: epoch.clone() };
@@ -870,7 +895,7 @@ impl Inner {
             // until the `exit` below, its last use of the memtable.
             let mem = unsafe { &*a.mem };
             for (i, op) in ops.into_iter().enumerate() {
-                mem.table.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
+                mem.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
             }
             self.commits.commit(a.ticket);
             mem.inflight.exit(request.shard);
@@ -1036,7 +1061,7 @@ impl Inner {
         w.wal.sync()?;
         let id = w.active.id + 1;
         let wal = WalWriter::create(&*self.storage, id, self.recycler.take())?;
-        let mem = Arc::new(Mem::new(id, self.opts.memtable, w.next_seq - 1));
+        let mem = Arc::new(Mem::new(id, &self.opts, w.next_seq - 1));
         {
             let _g = self.version_lock.lock();
             let v = self.version.load();
@@ -1062,16 +1087,17 @@ impl Inner {
     /// The value of `key` in version `v`, reading the memtables through
     /// `view`. The tree holds only committed batches.
     fn get_in(&self, v: &Version, key: &[u8], view: View) -> Result<Option<Bytes>> {
-        if let Some(val) = v.active.table.get(key, view) {
+        let hash = bloom::hash_key(key);
+        if let Some(val) = v.active.get(key, hash, view) {
             return Ok(val.into_put());
         }
         for m in &v.frozen {
-            if let Some(val) = m.table.get(key, view) {
+            if let Some(val) = m.get(key, hash, view) {
                 return Ok(val.into_put());
             }
         }
         match &v.tree {
-            Some(t) => Ok(tree::get(&self.io, t, key)?.and_then(Value::into_put)),
+            Some(t) => Ok(tree::get(&self.io, t, key, hash)?.and_then(Value::into_put)),
             None => Ok(None),
         }
     }

@@ -52,7 +52,7 @@ impl Harness {
         assert!(got == self.model, "scan differs from model");
         for _ in 0..50 {
             let k = key(rng.below(2000));
-            let v = get(&self.io, root, &k).unwrap().and_then(Value::into_put).map(|b| b.to_vec());
+            let v = get(&self.io, root, &k, crate::bloom::hash_key(&k)).unwrap().and_then(Value::into_put).map(|b| b.to_vec());
             assert_eq!(v.as_ref(), self.model.get(&k), "get {:?}", String::from_utf8_lossy(&k));
         }
         let start = key(rng.below(2000));

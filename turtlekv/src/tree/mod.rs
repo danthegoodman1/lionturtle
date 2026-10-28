@@ -25,7 +25,6 @@ pub mod cursor;
 pub mod io;
 pub mod ranges;
 
-use crate::bloom;
 use crate::error::{Result, corruption};
 use crate::page::{EntryRef, PageBuilder, PageId, PageImage};
 use crate::pagestore::PagePtr;
@@ -940,10 +939,10 @@ fn lookup_page(io: &PageIo, page: &DataPage, key: &[u8]) -> Result<Option<Value>
     })
 }
 
-/// The newest state of `key` in the tree: `Some(Value::Delete)` if a buffered
-/// tombstone hides it, `None` if the tree has no entry for it.
-pub fn get(io: &PageIo, root: &Subtree, key: &[u8]) -> Result<Option<Value>> {
-    let hash = bloom::hash_key(key);
+/// The newest state of `key`, whose [`crate::bloom::hash_key`] is `hash`, in the
+/// tree: `Some(Value::Delete)` if a buffered tombstone hides it, `None` if
+/// the tree has no entry for it.
+pub fn get(io: &PageIo, root: &Subtree, key: &[u8], hash: u64) -> Result<Option<Value>> {
     let prefix = key_prefix(key);
     let mut cur = root;
     loop {
