@@ -200,6 +200,9 @@ impl Rocks {
         if args.rocksdb_recycle_logs {
             opts.set_recycle_log_file_num(4);
         }
+        if args.rocksdb_rate_mb > 0 {
+            opts.set_auto_tuned_ratelimiter((args.rocksdb_rate_mb << 20) as i64, 100_000, 10);
+        }
         Self { db: rocksdb::DB::open(&opts, &args.dir).unwrap() }
     }
 }
@@ -219,6 +222,28 @@ impl Engine for Rocks {
 
     fn get(&self, key: &[u8]) -> Option<usize> {
         self.db.get_pinned(key).unwrap().map(|v| v.len())
+    }
+
+    fn stats_json(&self) -> String {
+        use rocksdb::properties::{ESTIMATE_PENDING_COMPACTION_BYTES, num_files_at_level};
+        let pending = self.db.property_int_value(ESTIMATE_PENDING_COMPACTION_BYTES).unwrap();
+        let l0_files = self.db.property_int_value(num_files_at_level(0)).unwrap();
+        format!(
+            r#"{{"pending_compaction_mb":{:.1},"l0_files":{},"stall_secs":{:.1}}}"#,
+            pending.unwrap_or(0) as f64 / 1e6,
+            l0_files.unwrap_or(0),
+            self.stall_secs()
+        )
+    }
+
+    fn stall_secs(&self) -> f64 {
+        // "Cumulative stall: 00:00:1.234 H:M:S, 0.1 percent"
+        let stats = self.db.property_value(rocksdb::properties::DBSTATS).unwrap().unwrap_or_default();
+        let Some(line) = stats.lines().find_map(|l| l.strip_prefix("Cumulative stall: ")) else {
+            return 0.0;
+        };
+        let hms = line.split_whitespace().next().unwrap_or_default();
+        hms.split(':').fold(0.0, |t, x| t * 60.0 + x.parse::<f64>().unwrap_or(0.0))
     }
 
     fn scan(&self, start: &[u8], n: usize) -> usize {

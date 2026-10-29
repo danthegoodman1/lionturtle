@@ -60,6 +60,9 @@ pub struct Args {
     pub sync: bool,
     /// RocksDB reuses retired log files, as turtlekv-rs always does.
     pub rocksdb_recycle_logs: bool,
+    /// Upper bound in MB/s for RocksDB's auto-tuned limiter on flush and
+    /// compaction writes; 0 leaves it off.
+    pub rocksdb_rate_mb: u64,
     /// Operations per second across all client threads in the timed phases,
     /// as a cycle of (rate, seconds) segments; empty issues them back to back.
     pub rate: Vec<(f64, f64)>,
@@ -132,6 +135,7 @@ fn parse_args() -> Args {
         settle: num("--settle", 0) == 1,
         sync: num("--sync", 0) == 1,
         rocksdb_recycle_logs: num("--rocksdb-recycle-logs", 0) == 1,
+        rocksdb_rate_mb: num("--rocksdb-rate-mb", 0),
         rate: get("--rate").map_or_else(Vec::new, |r| parse_rate(&r)),
         pace: num("--pace", 1) == 1,
         uniform: num("--uniform", 0) == 1,
