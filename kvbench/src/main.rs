@@ -63,6 +63,8 @@ pub struct Args {
     /// Upper bound in MB/s for RocksDB's auto-tuned limiter on flush and
     /// compaction writes; 0 leaves it off.
     pub rocksdb_rate_mb: u64,
+    /// ScyllaDB node the scylla engine connects to.
+    pub scylla_host: String,
     /// Operations per second across all client threads in the timed phases,
     /// as a cycle of (rate, seconds) segments; empty issues them back to back.
     pub rate: Vec<(f64, f64)>,
@@ -123,7 +125,7 @@ fn parse_args() -> Args {
         leaf_kb: num("--leaf-kb", 4096),
         chi: num("--chi", 32),
         memtable: get("--memtable").unwrap_or_else(|| "bbtree".into()),
-        max_frozen: num("--max-frozen", 1) as usize,
+        max_frozen: num("--max-frozen", 2) as usize,
         merge_threads: num("--merge-threads", 4) as usize,
         wal_buffer_kb: num("--wal-buffer-kb", 1024) as usize,
         fjall_workers: num("--fjall-workers", 8) as usize,
@@ -136,6 +138,7 @@ fn parse_args() -> Args {
         sync: num("--sync", 0) == 1,
         rocksdb_recycle_logs: num("--rocksdb-recycle-logs", 0) == 1,
         rocksdb_rate_mb: num("--rocksdb-rate-mb", 0),
+        scylla_host: get("--scylla-host").unwrap_or_else(|| "127.0.0.1:9042".into()),
         rate: get("--rate").map_or_else(Vec::new, |r| parse_rate(&r)),
         pace: num("--pace", 1) == 1,
         uniform: num("--uniform", 0) == 1,

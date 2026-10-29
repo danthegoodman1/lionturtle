@@ -31,6 +31,8 @@ pub fn open(args: &Args) -> Arc<dyn Engine> {
         "fjall" => Arc::new(Fjall::open(args)),
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Arc::new(Rocks::open(args)),
+        #[cfg(feature = "scylla")]
+        "scylla" => Arc::new(Scylla::open(args)),
         e => panic!("unknown engine {e}"),
     }
 }
@@ -256,6 +258,66 @@ impl Engine for Rocks {
             std::hint::black_box(k.len() + v.len());
             count += 1;
             it.next();
+        }
+        count
+    }
+}
+
+/// A ScyllaDB node over CQL, called synchronously from each client thread.
+/// Writes rely on ScyllaDB's periodic commitlog sync, like the other
+/// engines' buffered logs.
+#[cfg(feature = "scylla")]
+struct Scylla {
+    rt: tokio::runtime::Runtime,
+    session: scylla::client::session::Session,
+    insert: scylla::statement::prepared::PreparedStatement,
+    select: scylla::statement::prepared::PreparedStatement,
+    scan: scylla::statement::prepared::PreparedStatement,
+}
+
+#[cfg(feature = "scylla")]
+impl Scylla {
+    fn open(args: &Args) -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let (session, insert, select, scan) = rt.block_on(async {
+            let session =
+                scylla::client::session_builder::SessionBuilder::new().known_node(&args.scylla_host).build().await.unwrap();
+            for q in [
+                "CREATE KEYSPACE IF NOT EXISTS kvbench WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}",
+                "CREATE TABLE IF NOT EXISTS kvbench.kv (k blob PRIMARY KEY, v blob) WITH compression = {'sstable_compression': ''}",
+            ] {
+                session.query_unpaged(q, ()).await.unwrap();
+            }
+            let insert = session.prepare("INSERT INTO kvbench.kv (k, v) VALUES (?, ?)").await.unwrap();
+            let select = session.prepare("SELECT v FROM kvbench.kv WHERE k = ?").await.unwrap();
+            let scan = session.prepare("SELECT k, v FROM kvbench.kv WHERE token(k) >= token(?) LIMIT ?").await.unwrap();
+            (session, insert, select, scan)
+        });
+        Self { rt, session, insert, select, scan }
+    }
+}
+
+#[cfg(feature = "scylla")]
+impl Engine for Scylla {
+    fn put(&self, key: &[u8], value: &[u8], _sync: bool) {
+        self.rt.block_on(self.session.execute_unpaged(&self.insert, (key, value))).unwrap();
+    }
+
+    fn get(&self, key: &[u8]) -> Option<usize> {
+        let r = self.rt.block_on(self.session.execute_unpaged(&self.select, (key,))).unwrap();
+        let rows = r.into_rows_result().unwrap();
+        rows.maybe_first_row::<(&[u8],)>().unwrap().map(|(v,)| v.len())
+    }
+
+    /// Reads `n` rows in token order from `start`'s token.
+    fn scan(&self, start: &[u8], n: usize) -> usize {
+        let r = self.rt.block_on(self.session.execute_unpaged(&self.scan, (start, n as i32))).unwrap();
+        let rows = r.into_rows_result().unwrap();
+        let mut count = 0;
+        for row in rows.rows::<(&[u8], &[u8])>().unwrap() {
+            let (k, v) = row.unwrap();
+            std::hint::black_box(k.len() + v.len());
+            count += 1;
         }
         count
     }

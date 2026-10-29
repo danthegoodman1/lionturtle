@@ -32,7 +32,7 @@ use crate::pagestore::PagePtr;
 use crate::types::{Value, cmp_keys, key_prefix};
 use bytes::Bytes;
 use codec::{Reader, put_bytes};
-use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source};
+use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source, merge_span};
 use io::{DataPage, PageIo};
 use ranges::KeyRanges;
 use std::collections::HashMap;
@@ -345,6 +345,21 @@ impl Run<'_> {
         })
     }
 
+    /// Starts reading this run's first span in `[lo, hi)`, so a merge opening
+    /// several sources overlaps their first reads.
+    fn prefetch(&self, ctx: &Ctx, lo: &[u8], hi: Option<&[u8]>) {
+        let page = match self {
+            Run::Page(p) => Some(*p),
+            Run::Level(l) => l.iter().find(|s| s.overlaps(lo, hi)).map(|s| &s.page),
+        };
+        if let Some(page) = page {
+            let blocks = page.meta.blocks_for_range(lo, hi);
+            if !blocks.is_empty() {
+                ctx.io.prefetch_span(page, merge_span(&page.meta, blocks.start, hi, ctx.cfg.merge_readahead));
+            }
+        }
+    }
+
     /// Keys inside `(lo, hi)` that cut this run into pieces of about `every`
     /// bytes, taken from the block index without reading data.
     fn split_keys(&self, lo: &[u8], hi: Option<&[u8]>, every: u64, out: &mut Vec<Bytes>) {
@@ -392,6 +407,11 @@ fn merge_runs(ctx: &Ctx, runs: &[Run], lo: &[u8], hi: Option<&[u8]>, drop_tombst
     ranges.push((start, hi.map(Bytes::copy_from_slice)));
     let target = balanced_target(total.div_ceil(ranges.len() as u64), limit);
     let merge = |(a, b): &(Bytes, Option<Bytes>)| -> Result<Vec<Arc<DataPage>>> {
+        if runs.len() > 1 {
+            for r in runs {
+                r.prefetch(ctx, a, b.as_deref());
+            }
+        }
         let sources = runs.iter().map(|r| r.source(ctx, a, b.as_deref())).collect::<Result<Vec<_>>>()?;
         build_pages(ctx, &mut Merger::new(sources), target, drop_tombstones)
     };

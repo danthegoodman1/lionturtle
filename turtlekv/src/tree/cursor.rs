@@ -8,7 +8,7 @@ use super::Segment;
 use super::io::{DataPage, PageIo};
 use super::ranges::KeyRanges;
 use crate::error::Result;
-use crate::page::{Block, EntryRef};
+use crate::page::{Block, EntryRef, PageMeta};
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -27,6 +27,19 @@ fn keys_equal(a: &[u8], b: &[u8]) -> bool {
 pub enum ReadMode {
     Cached,
     Span(u64),
+}
+
+/// The blocks a merge reads in one span from block `b`: up to `limit`
+/// bytes, ending at the last block that may hold keys below `hi`.
+pub fn merge_span(meta: &PageMeta, b: usize, hi: Option<&[u8]>, limit: u64) -> std::ops::Range<usize> {
+    let end_block = meta.blocks_for_range(meta.block_first_key(b), hi).end.max(b + 1);
+    let mut end = b + 1;
+    let mut bytes = meta.block(b).len as u64;
+    while end < end_block && bytes + meta.block(end).len as u64 <= limit {
+        bytes += meta.block(end).len as u64;
+        end += 1;
+    }
+    b..end
 }
 
 /// The live entries of one page within `[lo, hi)`, skipping keys in `dead`.
@@ -83,15 +96,16 @@ impl PageCursor {
             ReadMode::Span(limit) => {
                 if !self.span_blocks.contains(&b) {
                     let hi = self.hi.as_deref();
-                    let end_block = meta.blocks_for_range(meta.block_first_key(b), hi).end.max(b + 1);
-                    let mut end = b + 1;
-                    let mut bytes = meta.block(b).len as u64;
-                    while end < end_block && bytes + meta.block(end).len as u64 <= limit {
-                        bytes += meta.block(end).len as u64;
-                        end += 1;
+                    let span = merge_span(meta, b, hi, limit);
+                    (self.span, self.span_from_disk) = io.span(&self.page, span.clone())?;
+                    // Start reading the next span while this one merges.
+                    if self.span_from_disk
+                        && span.end < meta.n_blocks as usize
+                        && hi.is_none_or(|h| meta.block_first_key(span.end) < h)
+                    {
+                        io.prefetch_span(&self.page, merge_span(meta, span.end, hi, limit));
                     }
-                    (self.span, self.span_from_disk) = io.span(&self.page, b..end)?;
-                    self.span_blocks = b..end;
+                    self.span_blocks = span;
                 }
                 let base = meta.block(self.span_blocks.start).offset;
                 let info = meta.block(b);

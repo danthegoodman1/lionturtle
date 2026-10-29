@@ -184,25 +184,22 @@ impl Pacer {
     }
 
     /// Accounts for `bytes` of checkpoint I/O about to start, first waiting
-    /// while the checkpoint is ahead of its schedule. Returns whether the
-    /// checkpoint is paced: then no writer waits on it, and a write should
-    /// reach the device before the next starts, so reads queue behind at
-    /// most a write per thread rather than a whole checkpoint's.
-    pub fn take(&self, bytes: u64) -> bool {
+    /// while the checkpoint is ahead of its schedule.
+    pub fn take(&self, bytes: u64) {
         let mut state = self.state.lock();
         if let Some((_, _, done)) = state.as_mut() {
             *done += bytes;
         }
         loop {
-            let Some((pace, started, done)) = state.as_ref() else { return false };
+            let Some((pace, started, done)) = state.as_ref() else { return };
             if *done >= pace.expected {
-                // Past the estimate, go as fast as bounded writes allow.
-                return true;
+                // Past the estimate, go at full speed.
+                return;
             }
             let elapsed = started.elapsed();
             let share = (elapsed.as_secs_f64() / pace.target.as_secs_f64()).max((pace.progress)() / pace.fill);
             if *done as f64 <= pace.expected as f64 * share {
-                return true;
+                return;
             }
             // The time at which the schedule allows `done` bytes; re-check at
             // least every 10 ms, since faster filling or a stop allows more.
@@ -323,6 +320,18 @@ impl PageIo {
         }
     }
 
+    /// Starts reading `blocks` of a written page into the page cache without
+    /// waiting, so a merge's later span read of them waits less.
+    pub fn prefetch_span(&self, page: &DataPage, blocks: Range<usize>) {
+        if blocks.is_empty() || page.image_cached.load(Relaxed) {
+            return;
+        }
+        if let Some(ptr) = page.ptr() {
+            let (off, len) = page.meta.span(blocks);
+            self.store.prefetch(&ptr, off, len);
+        }
+    }
+
     /// The bytes of `blocks`, contiguous, for sequential reading, and whether
     /// they came from disk (so their checksums need verifying). The first
     /// returned byte is the start of `blocks.start`. Reads from disk bypass
@@ -401,14 +410,16 @@ mod tests {
     #[test]
     fn waits_while_ahead_until_stopped() {
         let pacer = Pacer::default();
-        assert!(!pacer.take(1 << 20), "nothing to pace");
+        let t = Instant::now();
+        pacer.take(1 << 20);
+        assert!(t.elapsed() < Duration::from_millis(50), "nothing to pace");
         pacer.start(pace(1000, 200, 0.0));
         let t = Instant::now();
-        assert!(pacer.take(500), "paced");
+        pacer.take(500);
         assert!(t.elapsed() >= Duration::from_millis(80), "half the bytes at once must wait; waited {:?}", t.elapsed());
         pacer.stop();
         let t = Instant::now();
-        assert!(!pacer.take(400));
+        pacer.take(400);
         assert!(t.elapsed() < Duration::from_millis(50));
     }
 
@@ -418,10 +429,10 @@ mod tests {
         // The next memtable is already as full as the pace's fill share.
         pacer.start(pace(1000, 60_000, 0.5));
         let t = Instant::now();
-        assert!(pacer.take(999));
+        pacer.take(999);
         // Past the estimate, I/O no longer waits.
         pacer.start(pace(100, 60_000, 0.0));
-        assert!(pacer.take(150));
+        pacer.take(150);
         assert!(t.elapsed() < Duration::from_millis(50));
     }
 }

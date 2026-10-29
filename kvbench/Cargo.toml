@@ -15,6 +15,9 @@ hdrhistogram = "7"
 mimalloc = { version = "0.1", default-features = false }
 turtlekv = { path = "../turtlekv" }
 rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4"] }
+scylla = { version = "1.9", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [features]
 rocksdb = ["dep:rocksdb"]
+scylla = ["dep:scylla", "dep:tokio"]

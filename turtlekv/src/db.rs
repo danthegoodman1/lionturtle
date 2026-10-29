@@ -44,6 +44,8 @@ pub struct Options {
     /// Write buffered log records to the file once this many bytes accumulate.
     pub wal_buffer_bytes: usize,
     /// Frozen memtables allowed to await checkpointing before writers block.
+    /// A second one lets a checkpoint run past the next memtable's filling,
+    /// as when the drive slows for a few seconds, without stopping writers.
     pub max_frozen: usize,
     /// Checkpoint on a background thread. Without it, callers drive
     /// checkpoints through [`Db::checkpoint_step`], and a writer that finds no
@@ -73,7 +75,7 @@ impl Default for Options {
             cache_bytes: 1 << 30,
             memtable: MemTableKind::BBTree,
             wal_buffer_bytes: 1 << 20,
-            max_frozen: 1,
+            max_frozen: 2,
             background: true,
             merge_threads: 4,
             pace_checkpoints: true,

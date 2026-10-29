@@ -23,9 +23,9 @@ use std::sync::{Arc, OnceLock};
 
 pub const MIN_SLOT: u64 = 4096;
 pub const CLASSES: usize = 20;
-/// Bytes per write of a page image. While a checkpoint is paced, each chunk
-/// reaches the device before the next starts, so a read queues behind at
-/// most one chunk per writing thread.
+/// Bytes per write of a page image. Each chunk reaches the device before
+/// the next starts, so a read queues behind at most one chunk per writing
+/// thread rather than the many megabytes writeback would otherwise queue.
 const WRITE_CHUNK: usize = 256 << 10;
 
 /// Where a page image lives on disk.
@@ -218,22 +218,17 @@ impl PageStore {
         Ok((slot.get_or_init(|| f), true))
     }
 
-    /// Writes a page image to its slot in chunks, asking `pace` before each
-    /// whether to bound the write. If so, the chunk reaches the device before
-    /// the next starts; otherwise its writeback only starts. Returns true if
-    /// this created an arena file.
-    pub fn write(&self, ptr: &PagePtr, image: &[u8], pace: &dyn Fn(u64) -> bool) -> Result<bool> {
+    /// Writes a page image to its slot in chunks, calling `pace` before each
+    /// and waiting for each to reach the device. Returns true if this created
+    /// an arena file.
+    pub fn write(&self, ptr: &PagePtr, image: &[u8], pace: &dyn Fn(u64)) -> Result<bool> {
         debug_assert_eq!(image.len(), ptr.len as usize);
         let (file, created) = self.file(ptr.class)?;
         let mut at = ptr.offset();
         for chunk in image.chunks(WRITE_CHUNK) {
-            let bound = pace(chunk.len() as u64);
+            pace(chunk.len() as u64);
             file.write_all_at(chunk, at)?;
-            if bound {
-                file.write_back(at, chunk.len() as u64);
-            } else {
-                file.start_writeback(at, chunk.len() as u64);
-            }
+            file.write_back(at, chunk.len() as u64);
             at += chunk.len() as u64;
         }
         Ok(created)
