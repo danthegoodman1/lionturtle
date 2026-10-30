@@ -764,6 +764,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lionturtle-c"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "lionturtle",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

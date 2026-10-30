@@ -79,7 +79,16 @@ secret — the workflow mints a token per run via
   GitHub release → call `release.yml`.
 - **release.yml** (tag push / called / manual): `fmt` + `clippy` + `cargo test`
   on Linux x86_64 and arm64 and macOS arm64 → verify tag matches `lionturtle/Cargo.toml` → skip
-  if the version is already on crates.io → OIDC auth → `cargo publish -p lionturtle`.
+  if the version is already on crates.io → OIDC auth → `cargo publish -p lionturtle`
+  → build `lionturtle-c` on Ubuntu 22.04 (x86_64 and arm64) and macOS arm64 and
+  attach `lionturtle-c-vX.Y.Z-<target>.tar.gz` to the GitHub release.
+
+## The C API
+
+`cargo-semver-checks` reads only the Rust API. A merge that changes an existing
+declaration in `lionturtle-c/include/lionturtle.h`, such as adding a field to
+`lt_options`, breaks C programs built against the old header, so its message
+needs `#minor`.
 
 ## First release checklist
 

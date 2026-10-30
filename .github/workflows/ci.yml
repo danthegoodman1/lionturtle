@@ -57,6 +57,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  c-api:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: lionturtle-c/tests/run.sh
+      # The script the release uses to attach the libraries to it.
+      - run: lionturtle-c/package.sh ci "$RUNNER_TEMP"
+
+  c-header:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      # The committed header must match the bindings.
+      - run: cbindgen --config lionturtle-c/cbindgen.toml --crate lionturtle-c --output lionturtle-c/include/lionturtle.h
+      - run: git diff --exit-code lionturtle-c/include/lionturtle.h
+
   vopr:
     runs-on: ubuntu-latest
     timeout-minutes: 20
