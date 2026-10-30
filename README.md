@@ -1,5 +1,9 @@
 # lionturtle
 
+[![crates.io](https://img.shields.io/crates/v/lionturtle.svg)](https://crates.io/crates/lionturtle)
+[![docs.rs](https://img.shields.io/docsrs/lionturtle)](https://docs.rs/lionturtle)
+[![CI](https://github.com/danthegoodman1/lionturtle/actions/workflows/ci.yml/badge.svg)](https://github.com/danthegoodman1/lionturtle/actions/workflows/ci.yml)
+
 lionturtle is an embedded key-value store in Rust for Linux. It is a modified version of [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)): it keeps TurtleKV's TurtleTree, paces its background I/O after [SILK](https://www.usenix.org/conference/atc19/presentation/balmau), and borrows group commit and log recycling from LSM stores such as RocksDB, to keep throughput high and tail latency low.
 
 The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
