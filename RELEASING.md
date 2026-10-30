@@ -78,7 +78,7 @@ secret — the workflow mints a token per run via
   `cargo test --workspace` → escalate version with `cargo-semver-checks` → commit + tag +
   GitHub release → call `release.yml`.
 - **release.yml** (tag push / called / manual): `fmt` + `clippy` + `cargo test`
-  on Linux x86_64 and arm64 → verify tag matches `lionturtle/Cargo.toml` → skip
+  on Linux x86_64 and arm64 and macOS arm64 → verify tag matches `lionturtle/Cargo.toml` → skip
   if the version is already on crates.io → OIDC auth → `cargo publish -p lionturtle`.
 
 ## First release checklist

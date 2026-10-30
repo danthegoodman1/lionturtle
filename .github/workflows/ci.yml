@@ -23,7 +23,13 @@ jobs:
       - run: cargo fmt --check
 
   clippy:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The file layer has Linux and macOS code paths; each is linted on
+        # its own system.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,15 +39,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # kvbench's RocksDB and ScyllaDB drivers compile only with their
       # features, and RocksDB's bindings need libclang.
-      - run: sudo apt-get update -q && sudo apt-get install -y -q libclang-dev
-      - run: cargo clippy -p kvbench --all-features --all-targets -- -D warnings
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libclang-dev
+      - if: runner.os == 'Linux'
+        run: cargo clippy -p kvbench --all-features --all-targets -- -D warnings
 
   test:
     strategy:
       fail-fast: false
       matrix:
-        # lionturtle runs on Linux; both architectures run the suite.
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        # Linux on x86_64 and arm64, and macOS on Apple silicon.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
