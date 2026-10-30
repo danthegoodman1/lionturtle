@@ -688,12 +688,12 @@ dependencies = [
  "crossbeam-skiplist",
  "fjall",
  "hdrhistogram",
+ "lionturtle",
  "mimalloc",
  "parking_lot",
  "rocksdb",
  "scylla",
  "tokio",
- "turtlekv",
 ]
 
 [[package]]
@@ -741,6 +741,27 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "lionturtle"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bbtree",
+ "boxcar",
+ "bytes",
+ "congee",
+ "crc32c",
+ "crossbeam-skiplist",
+ "libc",
+ "mimalloc",
+ "parking_lot",
+ "parking_lot_core",
+ "quick_cache",
+ "rayon",
+ "thiserror",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "lock_api"
@@ -1455,27 +1476,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "turtlekv"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bbtree",
- "boxcar",
- "bytes",
- "congee",
- "crc32c",
- "crossbeam-skiplist",
- "libc",
- "mimalloc",
- "parking_lot",
- "parking_lot_core",
- "quick_cache",
- "rayon",
- "thiserror",
- "xxhash-rust",
 ]
 
 [[package]]

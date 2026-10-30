@@ -1,6 +1,6 @@
-# turtlekv-rs
+# lionturtle
 
-An embedded key-value store in Rust, built on the TurtleTree from [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)). The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. turtlekv-rs writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable.
+An embedded key-value store in Rust, built on the TurtleTree from [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)). The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable.
 
 ## Features
 
@@ -24,7 +24,7 @@ These runs used an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive). [
 
 YCSB on 50M records of 128 bytes, with 16 client threads under a 4 GB memory cap, in thousand ops/s:
 
-| Workload | turtlekv-rs | RocksDB | fjall |
+| Workload | lionturtle | RocksDB | fjall |
 |---|--:|--:|--:|
 | Load | 1,417 | 867 | 382 |
 | A: 50% read, 50% update | 1,180 | 958 | 511 |
@@ -37,13 +37,13 @@ Durable writes: workload A on 20M records of 1 KB, with 128 client threads under
 
 | Durable ops/s | Engine | Read p99 | Read p999 | Update p99 | Update p999 |
 |---|---|--:|--:|--:|--:|
-| 70k | turtlekv-rs | 0.23 ms | 1.0 ms | 0.25 ms | 1.4 ms |
+| 70k | lionturtle | 0.23 ms | 1.0 ms | 0.25 ms | 1.4 ms |
 | | RocksDB | 4.4 ms | 399 ms | 6.8 ms | 403 ms |
 | | ScyllaDB | 9.3 ms | 31 ms | 9.3 ms | 30 ms |
-| 150k | turtlekv-rs | 0.35 ms | 7.6 ms | 0.45 ms | 8.7 ms |
+| 150k | lionturtle | 0.35 ms | 7.6 ms | 0.45 ms | 8.7 ms |
 | | RocksDB | 603 ms | 1.4 s | 610 ms | 1.4 s |
 
-ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 10 minutes or more, sustained throughput was 226k ops/s for turtlekv-rs, 206k for RocksDB and 88k for ScyllaDB.
+ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 10 minutes or more, sustained throughput was 226k ops/s for lionturtle, 206k for RocksDB and 88k for ScyllaDB.
 
 ### Trade-offs
 
@@ -55,8 +55,8 @@ ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over
 
 ```rust
 use std::sync::Arc;
-use turtlekv::storage::FsStorage;
-use turtlekv::{Db, Options, WriteOp};
+use lionturtle::storage::FsStorage;
+use lionturtle::{Db, Options, WriteOp};
 
 let db = Db::open(Arc::new(FsStorage::new("data")?), Options::default())?;
 db.put(b"apple", b"red")?;
@@ -75,7 +75,7 @@ db.sync()?;
 ```
 
 ```console
-cargo run --release -p turtlekv --example quickstart
+cargo run --release -p lionturtle --example quickstart
 ```
 
 The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. Keys run to 64 KiB and values to 16 MiB.
@@ -101,7 +101,7 @@ The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_re
 
 ## Compared with RocksDB and fjall
 
-| | turtlekv-rs | RocksDB | fjall 3 |
+| | lionturtle | RocksDB | fjall 3 |
 |---|---|---|---|
 | Structure | Bε-tree, checkpointed once per memtable | Leveled LSM tree | Leveled LSM tree |
 | Atomic batches | To recovery and to readers | `WriteBatch` | Batches across keyspaces |
@@ -116,7 +116,7 @@ The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_re
 ## Documentation
 
 - [BENCHMARKS.md](BENCHMARKS.md): every benchmark result, how each ran, and the commands to reproduce it.
-- [DESIGN.md](DESIGN.md): the write path, the TurtleTree, reads and visibility; durability guarantees; how turtlekv-rs differs from the C++ TurtleKV; and what the tests check.
+- [DESIGN.md](DESIGN.md): the write path, the TurtleTree, reads and visibility; durability guarantees; how lionturtle differs from the C++ TurtleKV; and what the tests check.
 
 ## Development
 
@@ -124,7 +124,7 @@ The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_re
 cargo test --release                                   # unit, model and threaded tests
 cargo run --release --bin vopr -- --seeds 1000         # 1,000 simulation seeds from a random start
 cargo run --release --bin vopr -- --seed 42 --verbose  # replay one seed
-cargo run --release -p kvbench --features rocksdb -- --engine turtlekv --records 10000000
+cargo run --release -p kvbench --features rocksdb -- --engine lionturtle --records 10000000
 cargo run --release -p kvbench --bin indexbench        # bbtree vs ART vs skip list
 cargo run --release --bin simperf                      # deterministic write amplification across χ
 ```

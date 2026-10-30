@@ -2,13 +2,13 @@
 //! whose background thread checkpoints continuously. The VOPR runs on one
 //! thread; this exercises the locks, version swaps, and epoch reclamation.
 
+use lionturtle::sim::{FaultConfig, SimStorage};
+use lionturtle::storage::FsStorage;
+use lionturtle::{Db, MemTableKind, Options, TreeConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-use turtlekv::sim::{FaultConfig, SimStorage};
-use turtlekv::storage::FsStorage;
-use turtlekv::{Db, MemTableKind, Options, TreeConfig};
 
 const WRITERS: usize = 4;
 const KEYS_PER_WRITER: u64 = 400;
@@ -27,7 +27,7 @@ fn version_of(v: &[u8]) -> u64 {
     std::str::from_utf8(&v[..10]).unwrap().parse().unwrap()
 }
 
-fn stress(storage: Arc<dyn turtlekv::storage::Storage>, memtable: MemTableKind, secs: u64) {
+fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind, secs: u64) {
     let opts = Options {
         tree: TreeConfig { leaf_size: 8 << 10, max_pivots: 8, min_pivots: 2, max_segments: 12, max_levels: 4, ..TreeConfig::default() },
         checkpoint_distance: 4,
@@ -131,7 +131,7 @@ fn concurrent_bbtree_sim_disk() {
 
 #[test]
 fn concurrent_skiplist_real_disk() {
-    let dir = std::env::temp_dir().join(format!("turtlekv-stress-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lionturtle-stress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     stress(Arc::new(FsStorage::new(&dir).unwrap()), MemTableKind::SkipList, 4);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -179,9 +179,9 @@ fn atomic_batches(memtable: MemTableKind) {
                 n += 1;
                 let p = w + WRITERS * (n % (PAIRS / WRITERS));
                 let v = n.to_be_bytes().to_vec();
-                let mut ops = vec![turtlekv::WriteOp::put(key(2 * p).to_vec(), v.clone())];
-                ops.extend((0..8).map(|i| turtlekv::WriteOp::put(filler(w, i).to_vec(), v.clone())));
-                ops.push(turtlekv::WriteOp::put(key(2 * p + 1).to_vec(), v));
+                let mut ops = vec![lionturtle::WriteOp::put(key(2 * p).to_vec(), v.clone())];
+                ops.extend((0..8).map(|i| lionturtle::WriteOp::put(filler(w, i).to_vec(), v.clone())));
+                ops.push(lionturtle::WriteOp::put(key(2 * p + 1).to_vec(), v));
                 db.write(&ops, false).unwrap();
             }
         }));
@@ -206,7 +206,7 @@ fn atomic_batches(memtable: MemTableKind) {
                         })
                         .collect()
                 };
-                let drain = |mut it: turtlekv::DbIter| {
+                let drain = |mut it: lionturtle::DbIter| {
                     let mut rows = Vec::new();
                     while let Some(row) = it.next().unwrap() {
                         rows.push(row);
@@ -323,7 +323,7 @@ fn many_writers_share_lock_turns() {
                 for b in 0..BATCHES {
                     // Batches of 1 to 3 ops; every fifth one synchronous.
                     let ops: Vec<_> = (0..1 + b % 3)
-                        .map(|i| turtlekv::WriteOp::put(format!("t{t:02}-b{b:04}-{i}").into_bytes(), b.to_be_bytes().to_vec()))
+                        .map(|i| lionturtle::WriteOp::put(format!("t{t:02}-b{b:04}-{i}").into_bytes(), b.to_be_bytes().to_vec()))
                         .collect();
                     ops_written += ops.len() as u64;
                     db.write(&ops, b % 5 == 0).unwrap();
@@ -369,7 +369,7 @@ fn more_writers_than_commit_slots() {
 }
 
 fn busy_writers(threads: u64, puts: u64) {
-    let dir = std::env::temp_dir().join(format!("turtlekv-busy{threads}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("lionturtle-busy{threads}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let db = Arc::new(Db::open(Arc::new(FsStorage::new(&dir).unwrap()), Options::default()).unwrap());
     let finished = Arc::new(AtomicBool::new(false));

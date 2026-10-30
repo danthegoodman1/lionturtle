@@ -58,7 +58,7 @@ pub struct Args {
     /// Make every write in the timed phases durable before it returns. The
     /// load stays buffered.
     pub sync: bool,
-    /// RocksDB reuses retired log files, as turtlekv-rs always does.
+    /// RocksDB reuses retired log files, as lionturtle always does.
     pub rocksdb_recycle_logs: bool,
     /// Upper bound in MB/s for RocksDB's auto-tuned limiter on flush and
     /// compaction writes; 0 leaves it off.
@@ -68,7 +68,7 @@ pub struct Args {
     /// Operations per second across all client threads in the timed phases,
     /// as a cycle of (rate, seconds) segments; empty issues them back to back.
     pub rate: Vec<(f64, f64)>,
-    /// Pace turtlekv-rs checkpoints.
+    /// Pace lionturtle checkpoints.
     pub pace: bool,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
@@ -76,7 +76,7 @@ pub struct Args {
 }
 
 impl Args {
-    /// Memtable size for every engine: turtlekv's checkpoint distance in
+    /// Memtable size for every engine: lionturtle's checkpoint distance in
     /// leaf-sized batches.
     pub fn memtable_bytes(&self) -> u64 {
         self.chi * (self.leaf_kb << 10)
@@ -113,7 +113,7 @@ fn parse_args() -> Args {
     let num = |name: &str, default: u64| get(name).map(|v| v.parse().expect(name)).unwrap_or(default);
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     Args {
-        engine: get("--engine").unwrap_or_else(|| "turtlekv".into()),
+        engine: get("--engine").unwrap_or_else(|| "lionturtle".into()),
         dir: get("--dir").unwrap_or_else(|| "bench-data".into()),
         phases: get("--phases").unwrap_or_else(|| "load,a,b,c,e,f".into()).split(',').map(String::from).collect(),
         records: num("--records", 10_000_000),

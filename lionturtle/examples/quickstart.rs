@@ -1,14 +1,14 @@
 //! Opens a store, writes a key and an atomic batch, then reads them back
 //! through iterators and a snapshot.
 //!
-//! `cargo run --release -p turtlekv --example quickstart`
+//! `cargo run --release -p lionturtle --example quickstart`
 
+use lionturtle::storage::FsStorage;
+use lionturtle::{Db, Options, WriteOp};
 use std::sync::Arc;
-use turtlekv::storage::FsStorage;
-use turtlekv::{Db, Options, WriteOp};
 
-fn main() -> turtlekv::Result<()> {
-    let dir = std::env::temp_dir().join("turtlekv-quickstart");
+fn main() -> lionturtle::Result<()> {
+    let dir = std::env::temp_dir().join("lionturtle-quickstart");
     let db = Db::open(Arc::new(FsStorage::new(&dir)?), Options::default())?;
 
     db.put(b"apple", b"red")?;

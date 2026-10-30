@@ -8,7 +8,7 @@
 set -u
 dir=$1; bin=${2:-./target/release/kvbench}
 jemalloc=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
-for engine in turtlekv rocksdb rocksdb-recycle fjall; do
+for engine in lionturtle rocksdb rocksdb-recycle fjall; do
   for threads in 1 16 64; do
     args=(--engine ${engine%-recycle} --records 3000000 --cache-mb 256 --phases load,w --sync 1 --settle 1
           --threads $threads --ops $((threads * 4000 > 40000 ? threads * 4000 : 40000)) --label sync-$engine)

@@ -5,13 +5,13 @@
 # waits a minute for the drive to settle. A rate of "-" runs closed-loop.
 # Results append to ~/results/phases.jsonl and timeline.jsonl.
 # Load a store first, for example:
-#   kvbench --engine turtlekv --records 20000000 --value-size 1000 --threads 16 \
-#     --cache-mb 256 --dir /mnt/data/keep-turtlekv --phases load --settle 1 --keep 1
+#   kvbench --engine lionturtle --records 20000000 --value-size 1000 --threads 16 \
+#     --cache-mb 256 --dir /mnt/data/keep-lionturtle --phases load --settle 1 --keep 1
 # Usage: run.sh <engine> <label> <rate|-> <ops> [kvbench args]
 set -u
 B=/mnt/data; R=~/results
 e=$1 label=$2 rate=$3 ops=$4; shift 4
-bin=${BIN:-$HOME/turtlekv-rs/target/release/kvbench}
+bin=${BIN:-$HOME/lionturtle/target/release/kvbench}
 mkdir -p $R
 rm -rf $B/run
 sudo fstrim /mnt/data

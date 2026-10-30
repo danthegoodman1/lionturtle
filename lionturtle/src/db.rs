@@ -629,7 +629,7 @@ impl Db {
         let merge_pool = (opts.tree.parallel && opts.merge_threads > 0).then(|| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(opts.merge_threads)
-                .thread_name(|i| format!("turtlekv-merge-{i}"))
+                .thread_name(|i| format!("lionturtle-merge-{i}"))
                 .build()
                 .expect("build merge pool")
         });
@@ -669,7 +669,7 @@ impl Db {
         // frozen memtable while the other syncs and commits the last one.
         let mut workers = Vec::new();
         if inner.opts.background {
-            for (name, stage) in [("turtlekv-apply", Stage::Apply), ("turtlekv-commit", Stage::Commit)] {
+            for (name, stage) in [("lionturtle-apply", Stage::Apply), ("lionturtle-commit", Stage::Commit)] {
                 let inner = inner.clone();
                 workers.push(
                     std::thread::Builder::new().name(name.into()).spawn(move || inner.stage_loop(stage)).expect("spawn checkpoint thread"),

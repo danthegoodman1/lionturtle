@@ -3,8 +3,8 @@
 //! or, without `--seed`, at a random one (100 seeds by default). Stops at the
 //! first failure, printing the seed that reproduces it.
 
+use lionturtle::sim::vopr;
 use std::time::Instant;
-use turtlekv::sim::vopr;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

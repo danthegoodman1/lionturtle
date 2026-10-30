@@ -2,7 +2,7 @@
 //! and data set size, on the simulated disk. Same arguments, same numbers.
 //! Usage: simperf [records,records,...] [chi,chi,...] [leaf_kb]
 
-use turtlekv::sim::perf::{PerfConfig, run};
+use lionturtle::sim::perf::{PerfConfig, run};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

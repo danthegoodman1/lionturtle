@@ -3,8 +3,8 @@
 //! Usage: mem_footprint <bbtree|art|skiplist|btree>
 
 use bytes::Bytes;
-use turtlekv::memtable::{MemTableKind, new_memtable};
-use turtlekv::types::Value;
+use lionturtle::memtable::{MemTableKind, new_memtable};
+use lionturtle::types::Value;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

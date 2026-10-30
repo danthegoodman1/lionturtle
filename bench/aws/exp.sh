@@ -5,7 +5,7 @@
 # Usage: exp.sh <engine> <label> [kvbench args...]
 set -u
 engine=$1; label=$2; shift 2
-cd ~/turtlekv-rs; OUT=~/results; mkdir -p $OUT
+cd ~/lionturtle; OUT=~/results; mkdir -p $OUT
 out=$OUT/ycsb-$label.jsonl; err=$OUT/ycsb-$label.err
 pre=""; [ $engine = rocksdb ] && pre="env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
 iostat -x -m md0 10 > $OUT/iostat-$label.txt 2>&1 &

@@ -1,12 +1,12 @@
 # Design
 
-How turtlekv-rs stores, reads and checkpoints data, what it guarantees, and how it is tested.
+How lionturtle stores, reads and checkpoints data, what it guarantees, and how it is tested.
 
 ## Contents
 
 - [How it works](#how-it-works)
 - [Guarantees](#guarantees)
-- [Differences from the C++ TurtleKV](#differences-from-the-c-turtlekv)
+- [Differences from the C++ TurtleKV](#differences-from-the-c-lionturtle)
 - [Testing](#testing)
 - [Code layout](#code-layout)
 
@@ -53,7 +53,7 @@ Each batch takes a ticket under the writer lock and registers it. Its versions c
 
 ## Differences from the C++ TurtleKV
 
-turtlekv-rs follows the C++ TurtleTree: buffer levels that fill like a binary counter, one leaf-sized flush per insert, and one checkpoint per memtable. It departs in these ways:
+lionturtle follows the C++ TurtleTree: buffer levels that fill like a binary counter, one leaf-sized flush per insert, and one checkpoint per memtable. It departs in these ways:
 
 - **Filters and indexes.** Bloom filters and a sparse block index replace quotient filters and the per-leaf trie.
 - **Flushed keys.** Each buffered segment records the keys flushed out of it as key intervals plus a clip range. Pivot changes leave segment metadata alone, and flushes update it without reading pages.
@@ -78,11 +78,11 @@ Threaded tests cover what one thread cannot: concurrent writers, readers and sca
 
 ## Code layout
 
-- `turtlekv/`: the store.
+- `lionturtle/`: the store.
   - `db.rs`: write path, commit tickets, memtable rotation, the checkpoint pipeline, recovery, page reclamation.
   - `tree/`: the TurtleTree, its cursors and scans, the page cache and prefetch.
   - `page.rs`, `bloom.rs`, `pagestore.rs`: pages, filters, arenas and the superblock.
   - `memtable.rs`, `wal.rs`, `storage.rs`: memtables, the log, and the storage traits.
   - `sim/`: the simulated disk, the VOPR driver, and a deterministic write-amplification simulator.
-- `kvbench/`: the YCSB driver for turtlekv-rs, RocksDB, fjall and ScyllaDB, and an in-memory index benchmark.
+- `kvbench/`: the YCSB driver for lionturtle, RocksDB, fjall and ScyllaDB, and an in-memory index benchmark.
 - `bench/aws/`: EC2 benchmark scripts.

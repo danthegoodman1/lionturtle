@@ -1,10 +1,10 @@
 //! Recovery of synchronous writes: from reused log segments, and from
 //! writers sharing fsyncs.
 
+use lionturtle::sim::{FaultConfig, SimStorage};
+use lionturtle::{Db, Options, TreeConfig, WriteOp};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use turtlekv::sim::{FaultConfig, SimStorage};
-use turtlekv::{Db, Options, TreeConfig, WriteOp};
 
 /// One 512-byte log record per put, filling one simulated sector.
 fn put(round: u32, i: u32) -> WriteOp {
