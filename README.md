@@ -138,18 +138,18 @@ Workload A with uniform keys, half reads and half updates, on 20M records of 1 K
 
 At a fixed offered load, five minutes each:
 
-| Durable ops/s | Engine | Read p50 | Read p99 | Read p999 | Update p50 | Update p99 | Seconds with read p99 over 10 ms |
-|---|---|--:|--:|--:|--:|--:|--:|
-| 11k | turtlekv-rs | 92 µs | 0.18 ms | 0.28 ms | 36 µs | 0.12 ms | 0 of 300 |
-| | RocksDB | 106 µs | 0.20 ms | 0.45 ms | 182 µs | 0.41 ms | 0 |
-| | ScyllaDB | 193 µs | 1.4 ms | 2.8 ms | 107 µs | 1.3 ms | 0 |
-| 70k | turtlekv-rs | 98 µs | 0.23 ms | 1.0 ms | 86 µs | 0.25 ms | 0 |
-| | RocksDB | 112 µs | 4.4 ms | 399 ms | 407 µs | 6.8 ms | 12 |
-| | ScyllaDB | 540 µs | 9.3 ms | 31 ms | 529 µs | 9.3 ms | 62 |
-| 118k | turtlekv-rs | 104 µs | 0.29 ms | 4.0 ms | 142 µs | 0.37 ms | 2 |
-| | RocksDB | 122 µs | 20 ms | 157 ms | 514 µs | 21 ms | 122 |
-| 150k | turtlekv-rs | 109 µs | 0.35 ms | 7.6 ms | 159 µs | 0.45 ms | 6 |
-| | RocksDB | 130 µs | 603 ms | 1.4 s | 562 µs | 610 ms | 184 |
+| Durable ops/s | Engine | Read p50 | Read p99 | Read p999 | Update p50 | Update p99 | Update p999 | Seconds with read p99 over 10 ms |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| 11k | turtlekv-rs | 92 µs | 0.18 ms | 0.28 ms | 36 µs | 0.12 ms | 0.16 ms | 0 of 300 |
+| | RocksDB | 106 µs | 0.20 ms | 0.45 ms | 182 µs | 0.41 ms | 3.6 ms | 0 |
+| | ScyllaDB | 193 µs | 1.4 ms | 2.8 ms | 107 µs | 1.3 ms | 2.3 ms | 0 |
+| 70k | turtlekv-rs | 98 µs | 0.23 ms | 1.0 ms | 86 µs | 0.25 ms | 1.4 ms | 0 |
+| | RocksDB | 112 µs | 4.4 ms | 399 ms | 407 µs | 6.8 ms | 403 ms | 12 |
+| | ScyllaDB | 540 µs | 9.3 ms | 31 ms | 529 µs | 9.3 ms | 30 ms | 62 |
+| 118k | turtlekv-rs | 104 µs | 0.29 ms | 4.0 ms | 142 µs | 0.37 ms | 4.4 ms | 2 |
+| | RocksDB | 122 µs | 20 ms | 157 ms | 514 µs | 21 ms | 159 ms | 122 |
+| 150k | turtlekv-rs | 109 µs | 0.35 ms | 7.6 ms | 159 µs | 0.45 ms | 8.7 ms | 6 |
+| | RocksDB | 130 µs | 603 ms | 1.4 s | 562 µs | 610 ms | 1.4 s | 184 |
 
 70k ops/s is half of ScyllaDB's closed-loop peak, and 118k half of RocksDB's over its first 40 seconds. In closed loop, where each client issues its next operation when the last returns:
 
@@ -159,12 +159,14 @@ At a fixed offered load, five minutes each:
 | Throughput over the first 40 seconds | 229k | 237k | 130k–152k |
 | Update p50, sustained | 300 µs | 919 µs | 1.25 ms |
 | Update p99 | 0.94 ms | 4.4 ms | 3.1 ms |
+| Update p999 | 18 ms | 15 ms | 12 ms |
 | Update max | 0.92 s | 75 ms | 53 ms |
 | Read p99 | 0.48 ms | 0.56 ms | 7.9 ms |
+| Read p999 | 1.1 ms | 0.91 ms | 24 ms |
 | Write amplification | 8.2 | 12.1 | |
 | Peak RSS | 3.0 GB | 1.5 GB | |
 
-Sustained runs lasted 10 to 17 minutes: 140M operations for the embedded engines and 90M for ScyllaDB, which slowed from 96k ops/s in its first minute to 77k in its sixteenth. RocksDB starts faster and slows down too. It defers compaction to keep writes moving: over ten minutes its pending compaction grew to 4.7 GB, its write amplification rose from about 8 over the first 40 seconds to 12.1, and its throughput fell from 219k ops/s in the first minute to 194k–213k after. The deferred compaction competes with reads: at 70k ops/s it held a read 663 ms, and at 150k its read p99 was 603 ms. turtlekv-rs checkpoints each memtable as it fills and held 216k–234k ops/s in every minute. When merging falls behind, its writers wait instead, and at the closed-loop peak its slowest update took 0.92 s against RocksDB's 75 ms.
+Sustained runs lasted 10 to 17 minutes: 140M operations for the embedded engines and 90M for ScyllaDB, which slowed from 96k ops/s in its first minute to 77k in its sixteenth. RocksDB starts faster and slows down too. It defers compaction to keep writes moving: over ten minutes its pending compaction grew to 4.7 GB, its write amplification rose from about 8 over the first 40 seconds to 12.1, and its throughput fell from 219k ops/s in the first minute to 194k–213k after. The deferred compaction competes with reads: at 70k ops/s it held a read 663 ms, and at 150k its read p99 was 603 ms. turtlekv-rs checkpoints each memtable as it fills and held 216k–234k ops/s in every minute. When merging falls behind, its writers wait instead: at the closed-loop peak its update p999 was 18 ms against RocksDB's 15 ms, and its slowest update took 0.92 s against 75 ms.
 
 ScyllaDB reports single-digit-millisecond read p99s while it compacts: on one i4i.4xlarge at about half its peak load, a 50/50 read/write workload held read p99 at 6.06 ms through a major compaction ([ScyllaDB 5.0 on i4i](https://www.scylladb.com/2022/09/07/benchmarking-scylladb-5-0-on-aws-i4i-4xlarge/)). `bench/scylla.sh` runs ScyllaDB 2026.3.4 as one node with 8 shards, an `iotune` profile of the drive and the same 3 GB cap, and kvbench calls it over CQL on loopback. The comparison favors the embedded engines in three ways:
 
