@@ -402,7 +402,9 @@ impl Flush {
 
     fn write_as(mut self, durable: bool) -> Result<()> {
         if !self.buf.is_empty() {
-            debug_assert_eq!(self.io.base + self.io.tail.len() as u64, self.offset);
+            // A failed write leaves `base` short of later offsets, and
+            // `Staging::write` returns that failure.
+            debug_assert!(self.io.failed || self.io.base + self.io.tail.len() as u64 == self.offset);
             self.io.write(&*self.log.file, &self.buf, durable)?;
             self.log.complete(self.offset, self.buf.len());
         }
