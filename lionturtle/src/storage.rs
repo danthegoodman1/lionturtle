@@ -57,6 +57,11 @@ pub trait File: Send + Sync {
 }
 
 /// Storage backed by a directory on the local file system.
+///
+/// On Linux, direct files open with O_DIRECT and durable writes use
+/// `pwritev2` with RWF_DSYNC. macOS has neither, so there every file is
+/// buffered, and a durable write is a write and an `F_FULLFSYNC`, which
+/// Rust's `sync_data` issues there and which also flushes the drive's cache.
 pub struct FsStorage {
     dir: PathBuf,
 }
@@ -75,6 +80,7 @@ impl Storage for FsStorage {
     }
 
     /// Opens with O_DIRECT, or buffered on a file system without it.
+    #[cfg(target_os = "linux")]
     fn open_direct(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
         use std::os::unix::fs::OpenOptionsExt;
         let opened =
@@ -124,6 +130,7 @@ impl File for FsFile {
 
     /// One `pwritev2` with RWF_DSYNC: the kernel writes with FUA, or follows
     /// the write with a flush, so no separate fsync is needed.
+    #[cfg(target_os = "linux")]
     fn write_all_at_durable(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         while !buf.is_empty() {
             let iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
@@ -157,6 +164,7 @@ impl File for FsFile {
         Ok(self.0.metadata()?.len())
     }
 
+    #[cfg(target_os = "linux")]
     fn advise_random(&self) {
         // SAFETY: posix_fadvise only reads its integer arguments.
         unsafe {
@@ -164,6 +172,7 @@ impl File for FsFile {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn prefetch(&self, offset: u64, len: u64) {
         // SAFETY: posix_fadvise only reads its integer arguments.
         unsafe {
@@ -171,10 +180,40 @@ impl File for FsFile {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
         // SAFETY: fallocate only reads its integer arguments.
         let r = unsafe { libc::fallocate(self.0.as_raw_fd(), mode, offset as libc::off_t, len as libc::off_t) };
+        if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+
+    /// Turns off read-ahead, as POSIX_FADV_RANDOM does on Linux.
+    #[cfg(target_os = "macos")]
+    fn advise_random(&self) {
+        // SAFETY: fcntl with F_RDAHEAD only reads its integer arguments.
+        unsafe {
+            libc::fcntl(self.0.as_raw_fd(), libc::F_RDAHEAD, 0);
+        }
+    }
+
+    /// Starts an asynchronous read, as POSIX_FADV_WILLNEED does on Linux.
+    #[cfg(target_os = "macos")]
+    fn prefetch(&self, offset: u64, len: u64) {
+        let advice = libc::radvisory { ra_offset: offset as libc::off_t, ra_count: len.min(i32::MAX as u64) as libc::c_int };
+        // SAFETY: fcntl reads `advice`, which outlives the call.
+        unsafe {
+            libc::fcntl(self.0.as_raw_fd(), libc::F_RDADVISE, &advice);
+        }
+    }
+
+    /// APFS punches holes with F_PUNCHHOLE. Callers ignore a failure, which
+    /// leaves the space allocated.
+    #[cfg(target_os = "macos")]
+    fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        let hole = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: offset as libc::off_t, fp_length: len as libc::off_t };
+        // SAFETY: fcntl reads `hole`, which outlives the call.
+        let r = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_PUNCHHOLE, &hole) };
         if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
 }
