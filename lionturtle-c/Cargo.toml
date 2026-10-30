@@ -1,0 +1,17 @@
+[package]
+name = "lionturtle-c"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C and C++ bindings for lionturtle"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+lionturtle = { path = "../lionturtle" }

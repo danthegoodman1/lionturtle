@@ -86,6 +86,33 @@ cargo run --release -p lionturtle --example quickstart
 
 The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. Keys run to 64 KiB and values to 16 MiB.
 
+## C and C++
+
+The `lionturtle-c` crate builds lionturtle as a static and a shared library, `liblionturtle_c`, with a C header, [`lionturtle.h`](lionturtle-c/include/lionturtle.h), and a C++17 wrapper, [`lionturtle.hpp`](lionturtle-c/include/lionturtle.hpp). Each [GitHub release](https://github.com/danthegoodman1/lionturtle/releases) attaches both libraries and headers for Linux x86_64, Linux arm64 and macOS arm64, or you can build them:
+
+```console
+cargo build --release -p lionturtle-c   # target/release/liblionturtle_c.{a,so,dylib}
+```
+
+```cpp
+#include "lionturtle.hpp"
+
+lionturtle::Db db("data");
+db.put("apple", "red");
+lionturtle::Batch batch;
+batch.put("banana", "yellow").erase("apple");
+db.write(batch, /*sync=*/true);  // one atomic, durable write
+if (auto v = db.get("banana")) std::cout << v->view() << "\n";
+for (auto it = db.prefix("b"); it.next();) std::cout << it.key() << " " << it.value() << "\n";
+```
+
+```console
+c++ -std=c++17 -Iinclude app.cpp lib/liblionturtle_c.a -lutil -lrt -lpthread -lm -ldl   # Linux
+c++ -std=c++17 -Iinclude app.cpp lib/liblionturtle_c.a                                  # macOS
+```
+
+C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error`. A `Db` and its snapshots serve any number of threads at once; use each iterator and batch from one thread at a time. Values come back without a copy: `lt_get` returns a handle to the store's bytes. `scan` and `stats` are Rust-only.
+
 ## Configuration
 
 `Options` and `TreeConfig` fields, with defaults:
@@ -134,6 +161,10 @@ cargo run --release --bin vopr -- --seed 42 --verbose  # replay one seed
 cargo run --release -p kvbench --features rocksdb -- --engine lionturtle --records 10000000
 cargo run --release -p kvbench --bin indexbench        # bbtree vs ART vs skip list
 cargo run --release --bin simperf                      # deterministic write amplification across χ
+lionturtle-c/tests/run.sh                              # C and C++ API tests
+cbindgen --config lionturtle-c/cbindgen.toml --crate lionturtle-c --output lionturtle-c/include/lionturtle.h
 ```
 
-CI runs rustfmt, clippy with warnings as errors, the tests on x86_64 and arm64 Linux and on Apple silicon macOS, and 300 simulation seeds on every pull request, plus 10,000 seeds nightly. Each merge to `main` publishes a new version to crates.io.
+The last command regenerates the C header after a change to `lionturtle-c/src/lib.rs`.
+
+CI runs rustfmt, clippy with warnings as errors, the Rust, C and C++ tests on x86_64 and arm64 Linux and on Apple silicon macOS, a check that the C header matches the bindings, and 300 simulation seeds on every pull request, plus 10,000 seeds nightly. Each merge to `main` publishes a new version to crates.io and attaches the C libraries to its GitHub release.
