@@ -445,9 +445,53 @@ const TURN_LIMIT: usize = COMMIT_RING as usize / 2;
 /// Spins before a waiting writer parks.
 const REQUEST_SPINS: u32 = 200;
 /// How long a parked writer sleeps before checking whether it should take
-/// the writer lock itself. A request queued while a caller other than a
-/// writer holds the lock waits at most this long.
-const REQUEST_PARK: std::time::Duration = std::time::Duration::from_micros(200);
+/// the writer lock itself. Releasing the lock wakes the writer next in line
+/// (see [`WriterGuard`]), so this is a backstop: a short one would have
+/// every parked writer polling, and with many more writers than cores those
+/// wake-ups starve the turn they wait on.
+const REQUEST_PARK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The writer lock. Releasing it wakes the writer whose request is next in
+/// line to take a turn, so a writer that parks waiting for the lock sleeps
+/// until its request is served or it is that writer.
+struct WriterGuard<'a> {
+    inner: &'a Inner,
+    w: Option<parking_lot::MutexGuard<'a, Writer>>,
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = Writer;
+    fn deref(&self) -> &Writer {
+        self.w.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Writer {
+        self.w.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        let w = self.w.take().expect("held until dropped");
+        // The oldest request a turn left goes first, or else the newest
+        // queued one, read once the lock is free.
+        let carried = w.carried.front().copied();
+        drop(w);
+        // Pairs with the fence in `Inner::await_request`: a writer that
+        // queued a request and then saw the lock held is parked or about to
+        // park, and this load sees its request or a later one.
+        std::sync::atomic::fence(SeqCst);
+        let next = carried.or_else(|| {
+            let head = self.inner.queue.load(Acquire);
+            (!head.is_null()).then_some(head as usize)
+        });
+        if let Some(key) = next {
+            Inner::wake(vec![key]);
+        }
+    }
+}
 
 struct Durable {
     sb: Superblock,
@@ -735,7 +779,7 @@ impl Db {
     pub fn sync(&self) -> Result<()> {
         self.inner.check_poisoned()?;
         let (log, end) = {
-            let w = self.inner.writer.lock();
+            let w = self.inner.lock_writer();
             (w.wal.log(), w.wal.len())
         };
         let r = log.sync_to(end);
@@ -747,7 +791,7 @@ impl Db {
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.check_poisoned()?;
         {
-            let mut w = self.inner.writer.lock();
+            let mut w = self.inner.lock_writer();
             if w.active.table.len() > 0 {
                 let r = self.inner.rotate(&mut w);
                 self.inner.poison_on_err(r)?;
@@ -781,7 +825,7 @@ impl Db {
 
     /// Freezes the active memtable if it holds anything, without waiting.
     pub fn freeze(&self) -> Result<()> {
-        let mut w = self.inner.writer.lock();
+        let mut w = self.inner.lock_writer();
         if w.active.table.len() > 0 {
             let r = self.inner.rotate(&mut w);
             self.inner.poison_on_err(r)?;
@@ -791,7 +835,7 @@ impl Db {
 
     /// Sequence number of the newest write, durable or not.
     pub fn last_seq(&self) -> u64 {
-        self.inner.writer.lock().next_seq - 1
+        self.inner.lock_writer().next_seq - 1
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -801,7 +845,7 @@ impl Db {
     pub fn stats(&self) -> DbStats {
         let inner = &self.inner;
         let (user_bytes, wal_bytes) = {
-            let w = inner.writer.lock();
+            let w = inner.lock_writer();
             (w.user_bytes, w.wal_bytes)
         };
         let v = inner.version.load();
@@ -875,12 +919,18 @@ impl Drop for Db {
             let _ = w.join();
         }
         if !self.inner.poisoned.load(SeqCst) {
-            let _ = self.inner.writer.lock().wal.sync();
+            let _ = self.inner.lock_writer().wal.sync();
         }
     }
 }
 
 impl Inner {
+    /// Takes the writer lock for a caller that serves no requests; see
+    /// [`WriterGuard`].
+    fn lock_writer(&self) -> WriterGuard<'_> {
+        WriterGuard { inner: self, w: Some(self.writer.lock()) }
+    }
+
     fn check_poisoned(&self) -> Result<()> {
         if self.poisoned.load(SeqCst) { Err(Error::Poisoned) } else { Ok(()) }
     }
@@ -975,19 +1025,12 @@ impl Inner {
             if request.done.load(Acquire) {
                 return;
             }
-            if let Some(mut w) = self.writer.try_lock() {
+            if let Some(w) = self.writer.try_lock() {
+                let mut w = WriterGuard { inner: self, w: Some(w) };
                 let woken = self.serve(&mut w);
-                let next = w.carried.front().copied().or_else(|| {
-                    let head = self.queue.load(Acquire);
-                    (!head.is_null()).then_some(head as usize)
-                });
+                // Releasing the lock wakes a writer to take the next turn.
                 drop(w);
                 Self::wake(woken);
-                // A request left for the next turn may belong to a parked
-                // writer: wake one to take the turn.
-                if let Some(key) = next {
-                    Self::wake(vec![key]);
-                }
                 continue;
             }
             if spins < REQUEST_SPINS {
@@ -997,9 +1040,14 @@ impl Inner {
             }
             let key = request as *const Request as usize;
             let deadline = std::time::Instant::now() + REQUEST_PARK;
-            // Park only while the lock is held: whoever releases it then
-            // wakes a waiting writer, after this check runs.
-            let waiting = || !request.done.load(Acquire) && self.writer.is_locked();
+            // Park only while the lock is held. The fence pairs with the one
+            // in `WriterGuard::drop`: either this check sees the lock free,
+            // or the writer releasing it sees this request queued and wakes
+            // a writer to serve it.
+            let waiting = || {
+                std::sync::atomic::fence(SeqCst);
+                !request.done.load(Acquire) && self.writer.is_locked()
+            };
             // SAFETY: the callbacks neither panic nor call into the parking
             // lot.
             unsafe {
