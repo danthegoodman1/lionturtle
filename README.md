@@ -60,17 +60,17 @@ Read p99 on workload C was 105 µs for turtlekv-rs, 118 µs for RocksDB and 138 
 
 | Workload (thousand ops/s) | turtlekv-rs | RocksDB | fjall | vs RocksDB |
 |---|--:|--:|--:|--:|
-| Load (inserts) | 877 | 458 | 311 | 1.92× |
-| A: 50% read, 50% update | 1,236 | 1,010 | 379 | 1.22× |
-| B: 95% read, 5% update | 1,250 | 1,105 | 904 | 1.13× |
-| C: 100% read | 1,320 | 1,093 | 910 | 1.21× |
-| E: 95% scan of up to 100 keys, 5% insert | 227 | 220 | 37 | 1.03× |
-| F: 50% read, 50% read-modify-write | 808 | 731 | 430 | 1.11× |
-| Write amplification during load | 9.0 | 13.5 | 15.2 | |
-| Disk after load (GB) | 61.9 | 56.7 | 56.0 | |
-| RSS during reads (GB) | 7.1 | 6.1 | 6.6 | |
+| Load (inserts) | 550 | 473 | 311 | 1.16× |
+| A: 50% read, 50% update | 487 | 296 | 180 | 1.65× |
+| B: 95% read, 5% update | 467 | 399 | 357 | 1.17× |
+| C: 100% read | 446 | 379 | 354 | 1.18× |
+| E: 95% scan of up to 100 keys, 5% insert | 94 | 84 | 40 | 1.13× |
+| F: 50% read, 50% read-modify-write | 298 | 227 | 143 | 1.31× |
+| Write amplification during load | 9.0 | 13.5 | 15.5 | |
+| Disk after load (GB) | 63.9 | 55.8 | 55.4 | |
+| RSS during reads (GB) | 7.0 | 6.0 | 6.6 | |
 
-Most reads hit memory: median read latency on C was under 5 µs for every engine. The rest wait on the drives, and read p99 on C was 113 µs for turtlekv-rs, 134 µs for RocksDB and 153 µs for fjall. Scan p50 on E was 61, 45 and 322 µs. The three engines ran one after another on one instance, with the drives trimmed before each and the CPUs' C6 idle state disabled.
+Reads at this scale wait on the drives: read p99 on C was 550 µs for turtlekv-rs, 577 µs for RocksDB and 588 µs for fjall. Scan p50 on E was 63, 50 and 499 µs. turtlekv-rs ran on a second instance of the same type. In a separate test on one instance, with the page cache dropped before each run, E ran at 101 thousand scans per second for turtlekv-rs and 73 for RocksDB, three runs each.
 
 ### Clock speed
 
@@ -78,12 +78,12 @@ Cached operations scale with core speed. To measure it alone, turtlekv-rs ran on
 
 | Workload (thousand ops/s) | Full clock | 3.2 GHz | Full / capped |
 |---|--:|--:|--:|
-| Load (inserts) | 2,953 | 2,113 | 1.40× |
-| A: 50% read, 50% update | 5,492 | 4,041 | 1.36× |
-| C: 100% read | 22,346 | 18,058 | 1.24× |
-| E: 95% scan of up to 100 keys, 5% insert | 1,119 | 821 | 1.36× |
+| Load (inserts) | 2,224 | 1,700 | 1.31× |
+| A: 50% read, 50% update | 5,342 | 3,402 | 1.57× |
+| C: 100% read | 23,195 | 19,044 | 1.22× |
+| E: 95% scan of up to 100 keys, 5% insert | 1,203 | 977 | 1.23× |
 
-Point reads gain less than the clock, because much of a 0.6 µs read waits on memory. Writes and scans gain more: capping raised mean update latency from 4.2 to 6.0 µs. On EC2 at 400M records, the reads that miss memory wait about 100 µs on a drive and make up most of the mean read latency, so there clock speed matters mainly for writes.
+Cached reads gain less than the clock, because much of a 0.6 µs read waits on memory. Writes gain more: capping raised mean update latency from 5.0 to 8.1 µs. On EC2 at 400M records, a read that misses memory waits hundreds of microseconds on a drive, so there clock speed matters mainly for writes.
 
 ```console
 echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
@@ -103,7 +103,7 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 
 - **One journal lock.** Every fjall write takes one journal mutex, so loads slow as threads grow. On the workstation at 10M records, fjall loaded 781 thousand inserts per second on one thread, ahead of RocksDB's 681, and 435 thousand on 16.
 - **Version skipping.** A fjall scan steps past a key's older versions one at a time; RocksDB reseeks after eight. Zipfian updates pile versions onto hot keys, so E after A and B scans slowly: on 2M records with one thread, fjall ran 106–125 thousand scans per second after the load and 7.6 thousand after 400 thousand operations of workload A.
-- **Synchronous writes.** fjall persists its journal once per writer, without grouping, so more threads add no durable throughput: on EC2 it fell from 32 thousand per second on one thread to 16 thousand on 64.
+- **Synchronous writes.** fjall persists its journal once per writer, without grouping, so more threads add no durable throughput: on EC2 it fell from 31 thousand per second on one thread to 19 thousand on 64.
 
 ### Synchronous writes
 
@@ -113,18 +113,18 @@ Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB m
 
 | Client threads | turtlekv-rs | RocksDB | RocksDB, recycled logs | fjall |
 |---|--:|--:|--:|--:|
-| Workstation NVMe, 1 | 0.5 | 0.3 | 0.5 | 0.5 |
-| Workstation NVMe, 16 | 4.1 | 2.4 | 4.7 | 0.5 |
-| Workstation NVMe, 64 | 16.0 | 7.7 | 15.1 | 0.4 |
-| EC2 i7ie.6xlarge, 1 | 38.2 | 7.9 | 34.3 | 32.2 |
-| EC2 i7ie.6xlarge, 16 | 188.5 | 61.6 | 175.9 | 29.9 |
-| EC2 i7ie.6xlarge, 64 | 369.6 | 139.7 | 242.6 | 16.3 |
+| Workstation NVMe, 1 | 0.5 | 0.2 | 0.5 | 0.5 |
+| Workstation NVMe, 16 | 3.7 | 2.2 | 3.9 | 0.5 |
+| Workstation NVMe, 64 | 15.1 | 7.3 | 14.2 | 0.4 |
+| EC2 instance store, 1 | 33.6 | 11.5 | 30.4 | 31.0 |
+| EC2 instance store, 16 | 157.1 | 71.1 | 144.2 | 27.0 |
+| EC2 instance store, 64 | 337.8 | 187.9 | 288.0 | 18.8 |
 
-The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. The i7ie's instance-store drive (ext4) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 26 µs on average for turtlekv-rs on one thread.
+The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. EC2 i7ie instance store (XFS on RAID 0) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 30 µs on average for turtlekv-rs on one thread.
 
-The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit. With it enabled, RocksDB with recycled logs fell from 176 to 29 thousand durable updates per second at 16 threads and from 243 to 54 thousand at 64, RocksDB's one-thread mean rose from 127 to 548 µs, and fjall fell to 4 thousand per second at 64 threads. turtlekv-rs fell from 189 to 127 thousand at 16 threads and held within 4% at 1 and 64. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
+The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit, and with it enabled, a tenth or more of writes wake a CPU from it. Then every engine's one-thread mean rises to 50–110 µs, runs swing by 40%, and no engine passes 43 thousand per second at 16 or 64 threads. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
 
-The i7ie.6xlarge has one CPU socket; the i7ie.48xlarge has two, and writers on different sockets pass the log's state across the link between them. There, binding the process to one socket's CPUs raised 64-thread durable throughput by 17% for turtlekv-rs, from 319 to 373 thousand per second, and by 10% for RocksDB with recycled logs, at the cost of the other socket's cores for reads and background work:
+The i7ie has two CPU sockets, and writers on different sockets pass the log's state across the link between them. Binding the process to one socket's CPUs raised 64-thread durable throughput by 14% for turtlekv-rs and 12% for RocksDB with recycled logs, at the cost of the other socket's cores for reads and background work:
 
 ```console
 taskset -c "$(cat /sys/devices/system/node/node0/cpulist)" <command>
