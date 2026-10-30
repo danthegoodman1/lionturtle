@@ -1572,6 +1572,9 @@ enum Walk {
 }
 
 impl DbIter {
+    /// The next entry, or `None` past the end. A read can fail, so this
+    /// returns a `Result` and `DbIter` has no `Iterator` impl.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
         match &mut self.0 {
             Walk::Forward(f) => f.next(),

@@ -3,7 +3,14 @@ name = "lionturtle"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "A Rust implementation of TurtleKV: a key-value store built on TurtleTrees (B^ε+-trees) with checkpoint-distance tuning."
+repository.workspace = true
+description = "An embedded key-value store built on TurtleKV's TurtleTree, with paced checkpoints for high throughput and short tail latency"
+readme = "../README.md"
+keywords = ["database", "key-value", "storage", "embedded", "b-epsilon-tree"]
+categories = ["database-implementations"]
+
+[lints]
+workspace = true
 
 [dependencies]
 arc-swap = "1.7"

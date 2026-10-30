@@ -80,7 +80,7 @@ pub fn run(cfg: &PerfConfig) -> PerfReport {
 
     disk.reset_stats();
     for i in 0..cfg.gets {
-        let k = mix(mix(i) % cfg.records ^ cfg.seed);
+        let k = mix((mix(i) % cfg.records) ^ cfg.seed);
         assert!(db.get(&k.to_be_bytes()).expect("get").is_some(), "loaded key missing");
     }
     let reads = disk.stats().class("pages");

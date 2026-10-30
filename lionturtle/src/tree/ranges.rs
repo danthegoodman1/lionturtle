@@ -90,6 +90,7 @@ impl KeyRanges {
     /// The smallest key at or above `key` outside the set: `Ok(None)` if
     /// `key` is outside already, `Ok(Some(k))` to skip ahead to `k`, and
     /// `Err(())` if everything from `key` on is in the set.
+    #[allow(clippy::result_unit_err)]
     pub fn skip(&self, key: &[u8]) -> Result<Option<&Bytes>, ()> {
         match self.find(key) {
             None => Ok(None),
@@ -212,7 +213,7 @@ mod tests {
             let clipped = set.clip(b"f", Some(b"p"));
             for (i, &m) in model.iter().enumerate() {
                 let k = [b'a' + i as u8];
-                let inside = &k[..] >= &b"f"[..] && &k[..] < &b"p"[..];
+                let inside = k[..] >= b"f"[..] && k[..] < b"p"[..];
                 assert_eq!(clipped.contains(&k), m && inside);
             }
         }

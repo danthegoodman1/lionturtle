@@ -412,8 +412,8 @@ impl Sim {
         };
         let expected: Vec<(&Vec<u8>, &Vec<u8>)> =
             state.range(start.to_vec()..).take_while(|(k, _)| end.is_none_or(|e| &k[..] < e)).take(limit).collect();
-        if got.len() != expected.len() || got.iter().zip(&expected).any(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..]) {
-            let first_diff = got.iter().zip(&expected).position(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..]);
+        if got.len() != expected.len() || got.iter().zip(&expected).any(|((gk, gv), (ek, ev))| gk[..] != ek[..] || gv[..] != ev[..]) {
+            let first_diff = got.iter().zip(&expected).position(|((gk, gv), (ek, ev))| gk[..] != ek[..] || gv[..] != ev[..]);
             return Err(format!(
                 "scan from {:?} limit {limit} (snapshot {snap:?}): got {} entries, expected {}, first difference at {first_diff:?}",
                 Bytes::copy_from_slice(start),
@@ -443,9 +443,9 @@ impl Sim {
             match self.db().scan(b"", None, usize::MAX) {
                 Ok(got) => {
                     let ok = got.len() == self.model.state.len()
-                        && got.iter().zip(&self.model.state).all(|((gk, gv), (ek, ev))| &gk[..] == &ek[..] && &gv[..] == &ev[..]);
+                        && got.iter().zip(&self.model.state).all(|((gk, gv), (ek, ev))| gk[..] == ek[..] && gv[..] == ev[..]);
                     if !ok {
-                        let missing = self.model.state.keys().filter(|k| !got.iter().any(|(g, _)| &g[..] == &k[..])).count();
+                        let missing = self.model.state.keys().filter(|k| !got.iter().any(|(g, _)| g[..] == k[..])).count();
                         return Err(format!(
                             "full scan has {} entries, model has {} ({missing} model keys missing)",
                             got.len(),

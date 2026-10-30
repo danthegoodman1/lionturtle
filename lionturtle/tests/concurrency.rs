@@ -54,7 +54,7 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
                 i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let k = (i >> 33) % KEYS_PER_WRITER;
                 version += 1;
-                if (i >> 20) % 10 == 0 {
+                if (i >> 20).is_multiple_of(10) {
                     db.delete(&key(w, k)).unwrap();
                 } else {
                     db.put(&key(w, k), &value(version, w, k)).unwrap();
@@ -74,7 +74,7 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
                 i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let w = (i >> 40) as usize % WRITERS;
                 let k = (i >> 20) % KEYS_PER_WRITER;
-                if (i >> 8) % 8 == 0 {
+                if (i >> 8).is_multiple_of(8) {
                     // A scan must be sorted and only show versions written.
                     let rows = db.scan(&key(w, k), None, 50).unwrap();
                     for pair in rows.windows(2) {
