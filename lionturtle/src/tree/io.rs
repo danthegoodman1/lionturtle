@@ -200,6 +200,21 @@ impl Schedule {
         let left = target * (1.0 - share);
         (remaining > 0 && left > 0.0).then_some((left, remaining))
     }
+
+    /// Accounts for `bytes` of I/O asked for at `now` and returns when it
+    /// may start.
+    fn claim(&mut self, bytes: u64, now: Instant) -> Instant {
+        let left = self.left(now);
+        self.done += bytes;
+        // Past the estimate or the deadline, go at full speed.
+        let Some((left, remaining)) = left else { return now };
+        // Each I/O claims its share of the time left at the rate that
+        // finishes on time. Time spent idle raises the rate rather than
+        // banking a burst.
+        let start = self.next.max(now);
+        self.next = start + Duration::from_secs_f64(left * bytes as f64 / remaining as f64);
+        start
+    }
 }
 
 impl Pacer {
@@ -225,19 +240,10 @@ impl Pacer {
     /// Accounts for `bytes` of checkpoint I/O about to start, first waiting
     /// for its turn on the schedule.
     pub fn take(&self, bytes: u64) {
-        let mut state = self.state.lock();
-        let Some(s) = state.as_mut() else { return };
-        let now = Instant::now();
-        let left = s.left(now);
-        s.done += bytes;
-        // Past the estimate or the deadline, go at full speed.
-        let Some((left, remaining)) = left else { return };
-        // Each I/O claims its share of the time left at the rate that
-        // finishes on time. Time spent idle raises the rate rather than
-        // banking a burst.
-        let start = s.next.max(now);
-        s.next = start + Duration::from_secs_f64(left * bytes as f64 / remaining as f64);
-        drop(state);
+        let start = match self.state.lock().as_mut() {
+            Some(s) => s.claim(bytes, Instant::now()),
+            None => return,
+        };
         // Re-check at least every 10 ms, since a stop lifts the pace.
         while start > Instant::now() {
             let wait = (start - Instant::now()).min(Duration::from_millis(10));
@@ -449,41 +455,90 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    const MS: Duration = Duration::from_millis(1);
+
     fn pace(expected: u64, target_ms: u64, progress: f64) -> Pace {
         Pace { expected, target: Duration::from_millis(target_ms), progress: Box::new(move || progress), fill: 0.5 }
     }
 
+    fn schedule(pace: Pace, started: Instant) -> Schedule {
+        Schedule { pace, started, done: 0, next: started }
+    }
+
+    /// Asserts that `t` falls `ms` milliseconds after `t0`, to the microsecond.
+    #[track_caller]
+    fn assert_at(t0: Instant, t: Instant, ms: f64) {
+        let at = (t - t0).as_nanos() as f64 / 1e6;
+        assert!((at - ms).abs() < 1e-3, "at {at} ms, want {ms}");
+    }
+
     #[test]
-    fn spaces_io_until_stopped() {
-        let pacer = Pacer::default();
-        let t = Instant::now();
-        pacer.take(1 << 20);
-        assert!(t.elapsed() < Duration::from_millis(20), "nothing to pace");
-        pacer.start(pace(1000, 200, 0.0));
-        let t = Instant::now();
-        pacer.take(250);
-        assert!(t.elapsed() < Duration::from_millis(20), "the first I/O starts at once");
-        pacer.take(250);
-        assert!(t.elapsed() >= Duration::from_millis(40), "the next waits out the first's share; waited {:?}", t.elapsed());
-        pacer.stop();
-        let t = Instant::now();
-        pacer.take(400);
-        assert!(t.elapsed() < Duration::from_millis(50));
+    fn spaces_io_evenly() {
+        let t0 = Instant::now();
+        let mut s = schedule(pace(1000, 200, 0.0), t0);
+        // I/O asked for just as its turn comes goes out every 50 ms.
+        for i in 0..4 {
+            assert_at(t0, s.claim(250, t0 + 50 * i * MS), 50.0 * i as f64);
+        }
+        // I/O asked for early waits for its turn.
+        let mut s = schedule(pace(1000, 200, 0.0), t0);
+        assert_at(t0, s.claim(250, t0), 0.0);
+        assert_at(t0, s.claim(250, t0 + 10 * MS), 50.0);
     }
 
     #[test]
     fn idle_time_raises_the_rate_without_a_burst() {
-        let pacer = Pacer::default();
-        pacer.start(pace(1000, 400, 0.0));
-        std::thread::sleep(Duration::from_millis(200));
+        let t0 = Instant::now();
+        let mut s = schedule(pace(1000, 400, 0.0), t0);
         // Half the time is gone and all the bytes remain: 250 bytes now take
-        // 50 ms, where a schedule that banked the idle time would let 500
-        // through at once.
+        // 50 ms. At the starting rate they took 100 ms, and a schedule that
+        // banked the idle time would let 500 through at once.
+        let at = t0 + 200 * MS;
+        assert_at(t0, s.claim(250, at), 200.0);
+        assert_at(t0, s.claim(250, at), 250.0);
+    }
+
+    #[test]
+    fn filling_memtable_deadline_and_overrun_lift_the_pace() {
+        let t0 = Instant::now();
+        // The next memtable is already as full as the pace's fill share.
+        let mut s = schedule(pace(1000, 60_000, 0.5), t0);
+        assert_eq!(s.claim(500, t0), t0);
+        assert_eq!(s.claim(500, t0), t0);
+        // Past the deadline.
+        let mut s = schedule(pace(1000, 200, 0.0), t0);
+        assert_eq!(s.claim(500, t0 + 200 * MS), t0 + 200 * MS);
+        assert_eq!(s.claim(500, t0 + 200 * MS), t0 + 200 * MS);
+        // Past the estimate.
+        let mut s = schedule(pace(100, 60_000, 0.0), t0);
+        assert_eq!(s.claim(150, t0), t0);
+        assert_eq!(s.claim(50, t0), t0);
+    }
+
+    // The tests below run on the real clock, so they check waits from one
+    // side only: a sleep can overrun on a busy machine, but never ends early.
+
+    #[test]
+    fn take_waits_its_turn_until_stopped() {
+        let pacer = Pacer::default();
+        let waited = || pacer.waited_ns.load(Relaxed);
+        pacer.take(1 << 20);
+        assert_eq!(waited(), 0, "nothing to pace");
+        let started = Instant::now();
+        pacer.start(pace(1000, 200, 0.0));
         let t = Instant::now();
         pacer.take(250);
+        let first = Instant::now();
+        assert_eq!(waited(), 0, "the first I/O starts at once");
         pacer.take(250);
-        let waited = t.elapsed();
-        assert!(waited >= Duration::from_millis(40) && waited < Duration::from_millis(90), "waited {waited:?}");
+        // The second waits out the first's share: a quarter of the time left
+        // when the first asked.
+        let share = (200 * MS).saturating_sub(first - started) / 4;
+        assert!(t.elapsed() >= share, "waited {:?}, want {share:?}", t.elapsed());
+        pacer.stop();
+        let before = waited();
+        pacer.take(400);
+        assert_eq!(waited(), before, "a stop lifts the pace");
     }
 
     #[test]
@@ -494,27 +549,12 @@ mod tests {
         let t = Instant::now();
         std::thread::scope(|s| {
             s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(50 * MS);
                 pacer.stop();
             });
             // Its turn comes in 30 s.
             pacer.take(500);
         });
-        assert!(t.elapsed() < Duration::from_millis(500), "waited {:?}", t.elapsed());
-    }
-
-    #[test]
-    fn filling_memtable_and_overrun_lift_the_pace() {
-        let pacer = Pacer::default();
-        // The next memtable is already as full as the pace's fill share.
-        pacer.start(pace(1000, 60_000, 0.5));
-        let t = Instant::now();
-        pacer.take(500);
-        pacer.take(500);
-        // Past the estimate, I/O no longer waits.
-        pacer.start(pace(100, 60_000, 0.0));
-        pacer.take(150);
-        pacer.take(50);
-        assert!(t.elapsed() < Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_secs(10), "waited {:?}", t.elapsed());
     }
 }

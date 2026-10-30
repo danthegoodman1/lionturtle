@@ -116,6 +116,7 @@ jobs:
           fi
       - name: Test before tagging (release.yml runs its matrix again before publish)
         if: steps.decide.outputs.release == 'true'
+        timeout-minutes: 20
         run: cargo test --workspace
       - name: Bump version, escalating until the level covers the API diff
         id: version
