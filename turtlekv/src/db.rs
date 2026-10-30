@@ -29,6 +29,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
 use std::thread::JoinHandle;
@@ -52,10 +53,14 @@ pub struct Options {
     /// room for another frozen memtable checkpoints inline.
     pub background: bool,
     /// Threads in the store's own pool for parallel merges and page writes;
-    /// 0 runs them on the caller's rayon pool. Merges wait on I/O more than
-    /// CPU, so a few threads keep up, and each extra thread costs memory: an
-    /// allocator keeps what other threads free from a worker's buffers
-    /// resident in that worker's heap until the worker allocates again.
+    /// 0 runs them on the caller's rayon pool. Merges spend most of their
+    /// time waiting on reads, so each thread mostly adds reads in flight: on
+    /// an EC2 instance-store drive, 8 threads raised peak throughput on 1 KB
+    /// records by 13% over 4, and 16 by 18%. Each thread costs memory, since
+    /// an allocator keeps what other threads free from a worker's buffers
+    /// resident in that worker's heap until the worker allocates again: 16
+    /// threads held about 440 MB more than 4, and under 128 durable writers
+    /// outgrew a 3 GB memory cap within six minutes, where 8 stayed under it.
     pub merge_threads: usize,
     /// Spread each background checkpoint's I/O over most of the time the
     /// next memtable takes to fill, rather than run it at full speed, so
@@ -67,6 +72,11 @@ pub struct Options {
 /// its memtable took to fill, or by the time the next memtable is this full.
 pub const PACE_SHARE: f64 = 0.75;
 
+/// Checkpoint I/O per memtable byte that pacing expects before any
+/// checkpoint has run. Checkpoints of uniform 1 KB updates read and wrote 9
+/// to 15 times their memtable, more as the tree grows.
+const FIRST_CHECKPOINT_IO: u64 = 12;
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -77,7 +87,7 @@ impl Default for Options {
             wal_buffer_bytes: 1 << 20,
             max_frozen: 2,
             background: true,
-            merge_threads: 4,
+            merge_threads: 8,
             pace_checkpoints: true,
         }
     }
@@ -457,10 +467,14 @@ struct Applied {
     mem: Arc<Mem>,
     root: Option<Subtree>,
     created_files: bool,
-    /// Pages written before the checkpoint finished applying. Any that a
-    /// later batch superseded are garbage no committed tree references.
-    early: Vec<PagePtr>,
+    /// Pages written while the checkpoint applied. Any that a later batch
+    /// superseded are garbage no committed tree references.
+    written: Vec<PagePtr>,
 }
+
+/// An applied checkpoint's tree, whether it created an arena file, and the
+/// pages it wrote while applying.
+type Checkpointed = (Option<Subtree>, bool, Vec<PagePtr>);
 
 #[derive(Debug, Default, Clone)]
 pub struct DbStats {
@@ -830,8 +844,8 @@ impl Db {
             if let Some(r) = &a.root {
                 tree::reachable(r, &mut expected);
             }
-            // Its superseded early pages stay allocated until it commits.
-            expected.extend(a.early.iter().copied());
+            // Its superseded pages stay allocated until it commits.
+            expected.extend(a.written.iter().copied());
         }
         let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
         assert!(live.is_subset(&allocated), "a live page is not allocated");
@@ -1228,11 +1242,11 @@ impl Inner {
         let ctx = Ctx { cfg: &self.opts.tree, io: &self.io, next_page_id: &self.next_page_id };
         // Pace the checkpoint of a memtable that filled, if no other frozen
         // memtable waits behind it, expecting as much I/O as the largest of
-        // the last few checkpoints. One after open has no estimate and runs
-        // at full speed, as does one a caller froze early, and one whose
-        // writers waited on the checkpoint before it: when writers outrun
-        // checkpoints, every checkpoint is late.
-        let expected = self.checkpoint_io.lock().iter().copied().max().unwrap_or(0);
+        // the last few checkpoints, or FIRST_CHECKPOINT_IO times its memtable
+        // after open. One a caller froze early runs at full speed, as does
+        // one whose writers waited on the checkpoint before it: when writers
+        // outrun checkpoints, every checkpoint is late.
+        let expected = self.checkpoint_io.lock().iter().copied().max().unwrap_or_else(|| mem.bytes() * FIRST_CHECKPOINT_IO);
         let version = self.version.load();
         if self.opts.pace_checkpoints
             && self.opts.background
@@ -1253,35 +1267,9 @@ impl Inner {
         drop(version);
         let io_bytes = || self.io.counters.span_read_bytes.load(Relaxed) + self.io.counters.page_bytes_written.load(Relaxed);
         let io_before = io_bytes();
-        let apply = |batches: std::sync::mpsc::Receiver<Arc<DataPage>>| -> Result<(Option<Subtree>, bool, Vec<PagePtr>)> {
-            let mut root = applier.root.clone();
-            let mut created_files = false;
-            let mut early = Vec::new();
-            for batch in batches {
-                let t = std::time::Instant::now();
-                root = tree::apply_batch(&ctx, root.as_ref(), batch)?;
-                self.timing.apply_ns.fetch_add(since(t), Relaxed);
-                // Pages a checkpoint has yet to write count against half the
-                // cache: past that, write the new pages below the root now
-                // rather than hold them all until the checkpoint ends. A
-                // later batch may still supersede one, wasting its write,
-                // so a large cache keeps them all in memory.
-                if let Some(r) = &root {
-                    let pages = tree::unwritten_below_root(r);
-                    if pages.iter().map(|p| p.meta.image_len()).sum::<u64>() > self.opts.cache_bytes / 2 {
-                        let t = std::time::Instant::now();
-                        created_files |= tree::write_pages(&ctx, &pages)?;
-                        early.extend(pages.iter().filter_map(|p| p.ptr()));
-                        self.timing.write_ns.fetch_add(since(t), Relaxed);
-                    }
-                }
-            }
-            let t = std::time::Instant::now();
-            if let Some(r) = &root {
-                created_files |= tree::write_tree(&ctx, r)?;
-            }
-            self.timing.write_ns.fetch_add(since(t), Relaxed);
-            Ok((root, created_files, early))
+        let apply = |batches| {
+            let root = applier.root.clone();
+            if self.opts.background { self.apply_writing(&ctx, root, batches) } else { self.apply_then_write(&ctx, root, batches) }
         };
         let run = |rx| match &self.merge_pool {
             Some(pool) => pool.install(|| apply(rx)),
@@ -1318,7 +1306,7 @@ impl Inner {
             run(rx)
         };
         self.io.pacer.stop();
-        let (root, created_files, early) = applied?;
+        let (root, created_files, written) = applied?;
         let mut recent = self.checkpoint_io.lock();
         if recent.len() == 3 {
             recent.pop_front();
@@ -1327,8 +1315,82 @@ impl Inner {
         drop(recent);
         applier.root = root.clone();
         applier.last_applied = mem.id;
-        self.pending.lock().push_back(Applied { mem, root, created_files, early });
+        self.pending.lock().push_back(Applied { mem, root, created_files, written });
         Ok(true)
+    }
+
+    /// Applies a checkpoint's batches while writer threads write the pages
+    /// each leaves below the root, so the checkpoint's writes overlap its
+    /// merges and the pacer can spread them over the whole checkpoint. The
+    /// newest quarter of the cache in queued pages waits, so a page a later
+    /// batch supersedes goes unwritten. Queued pages stay within half the
+    /// cache: past that, applying waits.
+    fn apply_writing(&self, ctx: &Ctx, mut root: Option<Subtree>, batches: Receiver<Arc<DataPage>>) -> Result<Checkpointed> {
+        std::thread::scope(|scope| {
+            let mut writer = tree::PageWriter::spawn(scope, ctx.io, self.opts.cache_bytes / 4, &self.timing.write_ns);
+            let mut applied = Ok(());
+            for batch in batches {
+                let t = std::time::Instant::now();
+                match tree::apply_batch(ctx, root.as_ref(), batch) {
+                    Ok(r) => root = r,
+                    Err(e) => {
+                        applied = Err(e);
+                        break;
+                    }
+                }
+                self.timing.apply_ns.fetch_add(since(t), Relaxed);
+                if let Some(r) = &root {
+                    writer.queue(tree::unwritten_below_root(r));
+                }
+                if !writer.wait_below(self.opts.cache_bytes / 2) {
+                    break;
+                }
+            }
+            if applied.is_ok()
+                && let Some(r) = &root
+            {
+                writer.queue(tree::unwritten(r));
+            }
+            let written = writer.finish();
+            applied?;
+            let (mut created_files, written) = written?;
+            if let Some(r) = &root {
+                created_files |= tree::write_nodes(ctx, r)?;
+            }
+            Ok((root, created_files, written))
+        })
+    }
+
+    /// Applies a checkpoint's batches and writes its pages on this thread,
+    /// in an order that depends only on the batches.
+    fn apply_then_write(&self, ctx: &Ctx, mut root: Option<Subtree>, batches: Receiver<Arc<DataPage>>) -> Result<Checkpointed> {
+        let mut created_files = false;
+        let mut early = Vec::new();
+        for batch in batches {
+            let t = std::time::Instant::now();
+            root = tree::apply_batch(ctx, root.as_ref(), batch)?;
+            self.timing.apply_ns.fetch_add(since(t), Relaxed);
+            // Pages a checkpoint has yet to write count against half the
+            // cache: past that, write the new pages below the root now
+            // rather than hold them all until the checkpoint ends. A later
+            // batch may still supersede one, wasting its write, so a large
+            // cache keeps them all in memory.
+            if let Some(r) = &root {
+                let pages = tree::unwritten_below_root(r);
+                if pages.iter().map(|p| p.meta.image_len()).sum::<u64>() > self.opts.cache_bytes / 2 {
+                    let t = std::time::Instant::now();
+                    created_files |= tree::write_pages(ctx, &pages)?;
+                    early.extend(pages.iter().filter_map(|p| p.ptr()));
+                    self.timing.write_ns.fetch_add(since(t), Relaxed);
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        if let Some(r) = &root {
+            created_files |= tree::write_tree(ctx, r)?;
+        }
+        self.timing.write_ns.fetch_add(since(t), Relaxed);
+        Ok((root, created_files, early))
     }
 
     /// Makes the oldest applied checkpoint durable, commits it, and swaps it
@@ -1336,7 +1398,7 @@ impl Inner {
     fn commit_step(&self) -> Result<bool> {
         self.check_poisoned()?;
         let mut durable = self.durable.lock();
-        let Some(Applied { mem, root, created_files, early }) = self.pending.lock().pop_front() else {
+        let Some(Applied { mem, root, created_files, written }) = self.pending.lock().pop_front() else {
             return Ok(false);
         };
         let t = std::time::Instant::now();
@@ -1363,7 +1425,7 @@ impl Inner {
             tree::reachable(r, &mut live);
         }
         let mut garbage: Vec<PagePtr> = durable.live.difference(&live).copied().collect();
-        garbage.extend(early.into_iter().filter(|p| !live.contains(p)));
+        garbage.extend(written.into_iter().filter(|p| !live.contains(p)));
         let epoch = Arc::new(Epoch::new(self.io.clone()));
         let old_epoch = std::mem::replace(&mut durable.epoch, epoch.clone());
         durable.live = live;

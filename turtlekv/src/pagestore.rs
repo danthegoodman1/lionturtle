@@ -5,6 +5,14 @@
 //! the smallest class that fits it; the unwritten tail of its slot stays a
 //! hole in the sparse file.
 //!
+//! Each page is written whole in one write that bypasses the page cache. On
+//! a workstation's consumer NVMe drive, 4 MiB direct writes beside 4 KiB
+//! reads held read p99.99 near 6 ms, where the same bandwidth written back
+//! in smaller pieces, by the kernel or by `sync_file_range`, left it near
+//! 50 ms. On an EC2 instance-store drive both held reads under 1 ms, and
+//! whole-page writes raised peak throughput on 1 KB records by 7% over
+//! 256 KiB pieces, since each writer thread finishes a page sooner.
+//!
 //! Free space is never persisted. At open, every slot that the recovered
 //! checkpoint does not reference is free; afterwards a slot is freed only once
 //! a newer checkpoint no longer references it and no reader can reach it.
@@ -15,7 +23,7 @@
 
 use crate::error::{Result, corruption};
 use crate::page::PageId;
-use crate::storage::{File, Storage};
+use crate::storage::{DIRECT_ALIGN, File, Storage};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
@@ -23,10 +31,6 @@ use std::sync::{Arc, OnceLock};
 
 pub const MIN_SLOT: u64 = 4096;
 pub const CLASSES: usize = 20;
-/// Bytes per write of a page image. Each chunk reaches the device before
-/// the next starts, so a read queues behind at most one chunk per writing
-/// thread rather than the many megabytes writeback would otherwise queue.
-const WRITE_CHUNK: usize = 256 << 10;
 
 /// Where a page image lives on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -96,6 +100,8 @@ pub struct PageStore {
     storage: Arc<dyn Storage>,
     /// Arena files by size class. Reads find them without locking.
     files: Vec<OnceLock<Arc<dyn File>>>,
+    /// The same arenas opened for direct writes.
+    direct: Vec<OnceLock<Arc<dyn File>>>,
     /// Serializes arena creation.
     create: Mutex<()>,
     alloc: Mutex<Vec<ClassAlloc>>,
@@ -130,7 +136,15 @@ impl PageStore {
         for (class, a) in alloc.iter_mut().enumerate() {
             a.free = (0..a.next).filter(|s| !used[class].contains(s)).collect();
         }
-        Ok(Self { storage, files, create: Mutex::new(()), alloc: Mutex::new(alloc), freed: Mutex::new(Vec::new()) })
+        let direct = (0..CLASSES).map(|_| OnceLock::new()).collect();
+        Ok(Self {
+            storage,
+            files,
+            direct,
+            create: Mutex::new(()),
+            alloc: Mutex::new(alloc),
+            freed: Mutex::new(Vec::new()),
+        })
     }
 
     /// Reserves a slot for a page image of `len` bytes.
@@ -218,18 +232,38 @@ impl PageStore {
         Ok((slot.get_or_init(|| f), true))
     }
 
-    /// Writes a page image to its slot in chunks, calling `pace` before each
-    /// and waiting for each to reach the device. Returns true if this created
-    /// an arena file.
-    pub fn write(&self, ptr: &PagePtr, image: &[u8], pace: &dyn Fn(u64)) -> Result<bool> {
+    /// The arena for `class` opened for direct writes, and whether this
+    /// created the arena. The buffered handle is opened first, so syncing
+    /// the buffered handles covers direct writes too.
+    fn direct_file(&self, class: u8) -> Result<(&Arc<dyn File>, bool)> {
+        let (_, created) = self.file(class)?;
+        let slot = &self.direct[class as usize];
+        if let Some(f) = slot.get() {
+            return Ok((f, created));
+        }
+        let _g = self.create.lock();
+        if let Some(f) = slot.get() {
+            return Ok((f, created));
+        }
+        let f = self.storage.open_direct(&arena_name(class), false)?;
+        Ok((slot.get_or_init(|| f), created))
+    }
+
+    /// Writes a page image to its slot, padded to [`DIRECT_ALIGN`], in direct
+    /// writes of at most `piece` bytes, calling `pace` with each write's
+    /// length before it. Returns true if this created an arena file.
+    pub fn write(&self, ptr: &PagePtr, image: &[u8], piece: usize, pace: &dyn Fn(u64)) -> Result<bool> {
         debug_assert_eq!(image.len(), ptr.len as usize);
-        let (file, created) = self.file(ptr.class)?;
-        let mut at = ptr.offset();
-        for chunk in image.chunks(WRITE_CHUNK) {
-            pace(chunk.len() as u64);
-            file.write_all_at(chunk, at)?;
-            file.write_back(at, chunk.len() as u64);
-            at += chunk.len() as u64;
+        let (file, created) = self.direct_file(ptr.class)?;
+        let len = image.len().next_multiple_of(DIRECT_ALIGN);
+        let mut buf = vec![0u8; len + DIRECT_ALIGN];
+        let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        let buf = &mut buf[start..start + len];
+        buf[..image.len()].copy_from_slice(image);
+        let piece = piece.min(len).max(DIRECT_ALIGN).next_multiple_of(DIRECT_ALIGN);
+        for (i, part) in buf.chunks(piece).enumerate() {
+            pace(part.len() as u64);
+            file.write_all_at(part, ptr.offset() + (i * piece) as u64)?;
         }
         Ok(created)
     }
@@ -425,6 +459,22 @@ mod tests {
             let loaded = Superblock::load(&disk).unwrap().unwrap();
             assert!(loaded.last_seq == 10 || loaded.last_seq == 20);
             assert!(loaded.root.is_some());
+        }
+    }
+
+    #[test]
+    fn page_written_in_pieces_reads_back_whole() {
+        let disk: Arc<dyn Storage> = Arc::new(SimStorage::new(1, FaultConfig::default()));
+        let store = PageStore::open(disk, &[]).unwrap();
+        let image: Vec<u8> = (0..3 * DIRECT_ALIGN as u32 + 100).map(|i| (i % 251) as u8).collect();
+        for piece in [1, DIRECT_ALIGN, 2 * DIRECT_ALIGN, usize::MAX] {
+            let ptr = store.allocate(7, image.len() as u64, 0).unwrap();
+            let paced = std::cell::RefCell::new(Vec::new());
+            store.write(&ptr, &image, piece, &|n| paced.borrow_mut().push(n)).unwrap();
+            assert_eq!(&store.read(&ptr, 0, image.len() as u64).unwrap()[..], &image[..]);
+            let paced = paced.into_inner();
+            assert_eq!(paced.iter().sum::<u64>(), image.len().next_multiple_of(DIRECT_ALIGN) as u64);
+            assert_eq!(paced.len(), if piece == usize::MAX { 1 } else { 4usize.div_ceil(piece.max(DIRECT_ALIGN) / DIRECT_ALIGN) });
         }
     }
 }

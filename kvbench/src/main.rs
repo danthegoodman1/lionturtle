@@ -126,7 +126,7 @@ fn parse_args() -> Args {
         chi: num("--chi", 32),
         memtable: get("--memtable").unwrap_or_else(|| "bbtree".into()),
         max_frozen: num("--max-frozen", 2) as usize,
-        merge_threads: num("--merge-threads", 4) as usize,
+        merge_threads: num("--merge-threads", 8) as usize,
         wal_buffer_kb: num("--wal-buffer-kb", 1024) as usize,
         fjall_workers: num("--fjall-workers", 8) as usize,
         fjall_manual_persist: num("--fjall-manual-persist", 1) == 1,

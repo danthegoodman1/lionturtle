@@ -51,9 +51,6 @@ pub trait File: Send + Sync {
     fn punch_hole(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
-    /// Writes `[offset, offset + len)` to the device and waits until it is
-    /// there. Durability still needs a sync.
-    fn write_back(&self, _offset: u64, _len: u64) {}
     /// Starts reading `[offset, offset + len)` into the page cache without
     /// waiting, so a later read of it waits less.
     fn prefetch(&self, _offset: u64, _len: u64) {}
@@ -174,14 +171,6 @@ impl File for FsFile {
         // SAFETY: posix_fadvise only reads its integer arguments.
         unsafe {
             libc::posix_fadvise(self.0.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
-        }
-    }
-
-    fn write_back(&self, offset: u64, len: u64) {
-        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-        // SAFETY: sync_file_range only reads its integer arguments.
-        unsafe {
-            libc::sync_file_range(self.0.as_raw_fd(), offset as libc::off64_t, len as libc::off64_t, flags);
         }
     }
 

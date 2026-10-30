@@ -264,8 +264,9 @@ impl Engine for Rocks {
 }
 
 /// A ScyllaDB node over CQL, called synchronously from each client thread.
-/// Writes rely on ScyllaDB's periodic commitlog sync, like the other
-/// engines' buffered logs.
+/// A write is as durable as the node's commitlog mode makes it: in batch
+/// mode, `bench/scylla.sh`'s default, the node acknowledges it once its
+/// commitlog entry is fsynced, so `--sync` has no further effect.
 #[cfg(feature = "scylla")]
 struct Scylla {
     rt: tokio::runtime::Runtime,

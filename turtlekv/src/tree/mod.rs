@@ -12,9 +12,9 @@
 //!
 //! Nodes are immutable once shared (`Arc`), so applying batches builds a new
 //! tree that shares untouched subtrees with the old one. New pages stay in
-//! memory until their checkpoint writes them, when it ends or, once they
-//! pass half the cache, between batches; a page that a later batch
-//! supersedes while still in memory is never written at all.
+//! memory until their checkpoint writes them, on [`PageWriter`] threads
+//! while later batches apply or when the checkpoint ends; a page that a
+//! later batch supersedes while still in memory is never written at all.
 //!
 //! A segment records what part of its page belongs to the node: a clip range
 //! `[lo, hi)` (set when a node split leaves one page shared by both halves)
@@ -1306,6 +1306,13 @@ pub fn write_tree(ctx: &Ctx, root: &Subtree) -> Result<bool> {
     Ok(write_nodes(ctx, root)? | created)
 }
 
+/// Every unwritten data page of the tree.
+pub fn unwritten(root: &Subtree) -> Vec<Arc<DataPage>> {
+    let mut pages = Vec::new();
+    collect_unwritten(root, &mut pages, &mut std::collections::HashSet::new());
+    pages
+}
+
 /// The unwritten data pages below the root's own buffer: those of every
 /// child subtree. A later batch of the same checkpoint rewrites the root's
 /// buffer far more often than anything below it.
@@ -1373,7 +1380,164 @@ fn collect_unwritten(t: &Subtree, out: &mut Vec<Arc<DataPage>>, seen: &mut std::
     }
 }
 
-fn write_nodes(ctx: &Ctx, t: &Subtree) -> Result<bool> {
+/// Threads that write a checkpoint's queued pages. Each writes one page at
+/// a time and waits for it to reach the device, so two keep the drive busy.
+const PAGE_WRITERS: usize = 2;
+
+/// Whether writing pages created an arena file, and the pointers of the
+/// pages written.
+pub type Written = (bool, Vec<PagePtr>);
+
+/// Writes a checkpoint's data pages on threads of their own as the apply
+/// stage queues them, so writes overlap merges rather than follow them.
+///
+/// The newest queued pages wait in a reserve: a later batch may supersede
+/// them, and a superseded page leaves the queue unwritten. Writers take the
+/// oldest pages once the reserve is full, and every page once the apply
+/// stage finishes.
+pub struct PageWriter<'scope> {
+    shared: Arc<WriterShared>,
+    queued: std::collections::HashSet<PageId>,
+    threads: Vec<std::thread::ScopedJoinHandle<'scope, Result<Written>>>,
+}
+
+#[derive(Default)]
+struct WriterShared {
+    state: parking_lot::Mutex<WriterState>,
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct WriterState {
+    queue: std::collections::VecDeque<Arc<DataPage>>,
+    /// Bytes of pages in the queue.
+    queued: u64,
+    /// Bytes of pages a writer has taken and not finished.
+    writing: u64,
+    reserve: u64,
+    finishing: bool,
+    failed: bool,
+}
+
+impl<'scope> PageWriter<'scope> {
+    /// Starts the writers, which keep `reserve` bytes of the newest pages
+    /// queued, adding the time they spend writing to `busy_ns`.
+    pub fn spawn<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        io: &'env PageIo,
+        reserve: u64,
+        busy_ns: &'env AtomicU64,
+    ) -> Self {
+        let shared = Arc::new(WriterShared::default());
+        shared.state.lock().reserve = reserve;
+        let threads = (0..PAGE_WRITERS)
+            .map(|_| {
+                let shared = shared.clone();
+                scope.spawn(move || {
+                    let mut created = false;
+                    let mut written = Vec::new();
+                    loop {
+                        let page = {
+                            let mut s = shared.state.lock();
+                            loop {
+                                if s.failed {
+                                    return Ok((created, written));
+                                }
+                                if !s.queue.is_empty() && (s.queued > s.reserve || s.finishing) {
+                                    let page = s.queue.pop_front().expect("queue is not empty");
+                                    let len = page.meta.image_len();
+                                    s.queued -= len;
+                                    s.writing += len;
+                                    break page;
+                                }
+                                if s.finishing {
+                                    return Ok((created, written));
+                                }
+                                shared.changed.wait(&mut s);
+                            }
+                        };
+                        let len = page.meta.image_len();
+                        // The page may have been superseded since it was taken.
+                        let r = if Arc::strong_count(&page) > 1 {
+                            let t = std::time::Instant::now();
+                            let r = io.write(&page);
+                            busy_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            r
+                        } else {
+                            Ok(false)
+                        };
+                        let mut s = shared.state.lock();
+                        s.writing -= len;
+                        shared.changed.notify_all();
+                        match r {
+                            Ok(c) => {
+                                created |= c;
+                                written.extend(page.ptr());
+                            }
+                            Err(e) => {
+                                s.failed = true;
+                                return Err(e);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self { shared, queued: Default::default(), threads }
+    }
+
+    /// Queues the pages not queued before, and drops queued pages that only
+    /// the queue still holds: a later batch superseded them.
+    pub fn queue(&mut self, pages: Vec<Arc<DataPage>>) {
+        let mut s = self.shared.state.lock();
+        s.queue.retain(|p| Arc::strong_count(p) > 1);
+        for page in pages {
+            if self.queued.insert(page.id()) {
+                s.queue.push_back(page);
+            }
+        }
+        s.queued = s.queue.iter().map(|p| p.meta.image_len()).sum();
+        self.shared.changed.notify_all();
+    }
+
+    /// Waits until at most `limit` bytes of queued pages remain unwritten.
+    /// Returns false if a writer failed.
+    pub fn wait_below(&self, limit: u64) -> bool {
+        let mut s = self.shared.state.lock();
+        while s.queued + s.writing > limit && !s.failed {
+            self.shared.changed.wait(&mut s);
+        }
+        !s.failed
+    }
+
+    /// Writes the remaining queued pages. Returns whether an arena file was
+    /// created, and the pointers of every page written.
+    pub fn finish(self) -> Result<Written> {
+        {
+            let mut s = self.shared.state.lock();
+            s.queue.retain(|p| Arc::strong_count(p) > 1);
+            s.finishing = true;
+        }
+        self.shared.changed.notify_all();
+        let mut created = false;
+        let mut written = Vec::new();
+        let mut first_err = None;
+        for t in self.threads {
+            match t.join().expect("page writer panicked") {
+                Ok((c, w)) => {
+                    created |= c;
+                    written.extend(w);
+                }
+                Err(e) => first_err = first_err.or(Some(e)),
+            }
+        }
+        first_err.map_or(Ok((created, written)), Err)
+    }
+}
+
+/// Writes every unwritten node of the tree bottom-up, after its data pages.
+/// Returns whether an arena file was created.
+pub fn write_nodes(ctx: &Ctx, t: &Subtree) -> Result<bool> {
     let Subtree::Node(n) = t else { return Ok(false) };
     if n.ptr().is_some() {
         return Ok(false);
@@ -1385,7 +1549,7 @@ fn write_nodes(ctx: &Ctx, t: &Subtree) -> Result<bool> {
     let id = ctx.new_page_id();
     let raw = encode_node(n, id);
     let ptr = ctx.io.store.allocate(id, raw.len() as u64, raw.len() as u32)?;
-    created |= ctx.io.store.write(&ptr, &raw, &|n| ctx.io.pacer.take(n))?;
+    created |= ctx.io.store.write(&ptr, &raw, ctx.io.write_piece(), &|n| ctx.io.pacer.take(n))?;
     n.ptr.set(ptr).expect("node written once");
     Ok(created)
 }
