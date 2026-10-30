@@ -63,14 +63,7 @@ pub struct PageCursor {
 }
 
 impl PageCursor {
-    pub fn new(
-        io: &PageIo,
-        page: Arc<DataPage>,
-        lo: &[u8],
-        hi: Option<Bytes>,
-        dead: KeyRanges,
-        mode: ReadMode,
-    ) -> Result<Self> {
+    pub fn new(io: &PageIo, page: Arc<DataPage>, lo: &[u8], hi: Option<Bytes>, dead: KeyRanges, mode: ReadMode) -> Result<Self> {
         let mut c = Self {
             page,
             hi,
@@ -99,10 +92,7 @@ impl PageCursor {
                     let span = merge_span(meta, b, hi, limit);
                     (self.span, self.span_from_disk) = io.span(&self.page, span.clone())?;
                     // Start reading the next span while this one merges.
-                    if self.span_from_disk
-                        && span.end < meta.n_blocks as usize
-                        && hi.is_none_or(|h| meta.block_first_key(span.end) < h)
-                    {
+                    if self.span_from_disk && span.end < meta.n_blocks as usize && hi.is_none_or(|h| meta.block_first_key(span.end) < h) {
                         io.prefetch_span(&self.page, merge_span(meta, span.end, hi, limit));
                     }
                     self.span_blocks = span;
@@ -227,14 +217,7 @@ pub struct LevelCursor {
 impl LevelCursor {
     pub fn new(io: &PageIo, level: &[Segment], lo: &[u8], hi: Option<&[u8]>, mode: ReadMode) -> Result<Self> {
         let segments: Vec<Segment> = level.iter().filter(|s| s.overlaps(lo, hi)).cloned().collect();
-        let mut c = Self {
-            segments,
-            next: 0,
-            lo: Bytes::copy_from_slice(lo),
-            hi: hi.map(Bytes::copy_from_slice),
-            mode,
-            current: None,
-        };
+        let mut c = Self { segments, next: 0, lo: Bytes::copy_from_slice(lo), hi: hi.map(Bytes::copy_from_slice), mode, current: None };
         c.open_next(io)?;
         Ok(c)
     }
@@ -375,5 +358,4 @@ impl Merger {
         self.pick();
         Ok(())
     }
-
 }

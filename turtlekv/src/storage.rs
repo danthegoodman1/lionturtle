@@ -70,25 +70,15 @@ impl FsStorage {
 
 impl Storage for FsStorage {
     fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(self.dir.join(name))?;
+        let file = OpenOptions::new().read(true).write(true).create(create).truncate(false).open(self.dir.join(name))?;
         Ok(Arc::new(FsFile(file)))
     }
 
     /// Opens with O_DIRECT, or buffered on a file system without it.
     fn open_direct(&self, name: &str, create: bool) -> io::Result<Arc<dyn File>> {
         use std::os::unix::fs::OpenOptionsExt;
-        let opened = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .custom_flags(libc::O_DIRECT)
-            .open(self.dir.join(name));
+        let opened =
+            OpenOptions::new().read(true).write(true).create(create).truncate(false).custom_flags(libc::O_DIRECT).open(self.dir.join(name));
         match opened {
             Ok(file) => Ok(Arc::new(FsFile(file))),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => self.open(name, create),

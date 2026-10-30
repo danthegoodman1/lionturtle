@@ -124,12 +124,7 @@ pub fn list_segments(storage: &dyn Storage) -> Result<Vec<u64>> {
 
 /// Bytes a batch occupies in the log.
 pub fn encoded_len(ops: &[WriteOp]) -> usize {
-    HEADER_LEN
-        + 12
-        + ops
-            .iter()
-            .map(|op| 1 + 4 + op.key.len() + op.value.as_put().map_or(0, |v| 4 + v.len()))
-            .sum::<usize>()
+    HEADER_LEN + 12 + ops.iter().map(|op| 1 + 4 + op.key.len() + op.value.as_put().map_or(0, |v| 4 + v.len())).sum::<usize>()
 }
 
 /// A record without its sequence number: the bytes between the header and
@@ -508,12 +503,7 @@ pub struct Replay {
 /// A segment can end torn, or at a gap, and still be followed by valid
 /// segments: recovery leaves such a segment in place and logs new writes to
 /// the next one, whose sequence numbers continue from the last valid record.
-pub fn replay(
-    storage: &dyn Storage,
-    id: u64,
-    after_seq: u64,
-    mut apply: impl FnMut(u64, WriteOp),
-) -> Result<Replay> {
+pub fn replay(storage: &dyn Storage, id: u64, after_seq: u64, mut apply: impl FnMut(u64, WriteOp)) -> Result<Replay> {
     let file = storage.open(&segment_name(id), false)?;
     let len = file.len()? as usize;
     let mut data = vec![0u8; len];

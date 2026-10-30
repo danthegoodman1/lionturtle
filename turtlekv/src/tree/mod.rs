@@ -177,9 +177,7 @@ impl Segment {
 
     fn range_is_empty(&self) -> bool {
         let meta = &self.page.meta;
-        meta.n_items == 0
-            || self.hi.as_ref().is_some_and(|h| &h[..] <= self.min_key())
-            || self.min_key() > meta.max_key()
+        meta.n_items == 0 || self.hi.as_ref().is_some_and(|h| &h[..] <= self.min_key()) || self.min_key() > meta.max_key()
     }
 
     /// True when no key of the clipped range is live.
@@ -280,12 +278,7 @@ impl Node {
 }
 
 /// Merges `sources` (newest first) into pages of about `target` bytes each.
-fn build_pages(
-    ctx: &Ctx,
-    merger: &mut Merger,
-    target: u64,
-    drop_tombstones: bool,
-) -> Result<Vec<Arc<DataPage>>> {
+fn build_pages(ctx: &Ctx, merger: &mut Merger, target: u64, drop_tombstones: bool) -> Result<Vec<Arc<DataPage>>> {
     let capacity = (target + target / 16) as usize + 4096;
     let mut pages = Vec::new();
     let mut b = PageBuilder::with_capacity(ctx.new_page_id(), capacity);
@@ -333,14 +326,9 @@ impl Run<'_> {
 
     fn source(&self, ctx: &Ctx, lo: &[u8], hi: Option<&[u8]>) -> Result<Source> {
         Ok(match self {
-            Run::Page(p) => Source::Page(PageCursor::new(
-                ctx.io,
-                (*p).clone(),
-                lo,
-                hi.map(Bytes::copy_from_slice),
-                KeyRanges::new(),
-                ctx.merge_mode(),
-            )?),
+            Run::Page(p) => {
+                Source::Page(PageCursor::new(ctx.io, (*p).clone(), lo, hi.map(Bytes::copy_from_slice), KeyRanges::new(), ctx.merge_mode())?)
+            }
             Run::Level(l) => Source::Level(LevelCursor::new(ctx.io, l, lo, hi, ctx.merge_mode())?),
         })
     }
@@ -603,10 +591,7 @@ fn apply_to_child(ctx: &Ctx, child: Subtree, batch: Batch, lo: &Bytes, hi: Optio
             debug_assert_eq!(n.hi.as_ref(), hi);
             let mut n = (*n).clone();
             node_apply(ctx, &mut n, batch)?;
-            Ok(split_if_needed(ctx, n)?
-                .into_iter()
-                .map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n))))
-                .collect())
+            Ok(split_if_needed(ctx, n)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect())
         }
     }
 }
@@ -710,10 +695,7 @@ fn merge_siblings(ctx: &Ctx, left: &Subtree, right: &Subtree, lo: &Bytes) -> Res
         }
         (Subtree::Node(a), Subtree::Node(b)) => {
             let merged = concat_nodes(a, b);
-            Ok(split_if_needed(ctx, merged)?
-                .into_iter()
-                .map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n))))
-                .collect())
+            Ok(split_if_needed(ctx, merged)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect())
         }
         _ => unreachable!("siblings have equal height"),
     }
@@ -873,15 +855,7 @@ fn new_root(ctx: &Ctx, pieces: Vec<Piece>) -> Node {
     let n = pieces.len();
     let (mut pivots, children): (Vec<Bytes>, Vec<Subtree>) = pieces.into_iter().unzip();
     pivots[0] = Bytes::new();
-    Node {
-        height,
-        pivots,
-        hi: None,
-        children,
-        pending: vec![0; n],
-        levels: vec![Vec::new(); ctx.cfg.max_levels],
-        ptr: OnceLock::new(),
-    }
+    Node { height, pivots, hi: None, children, pending: vec![0; n], levels: vec![Vec::new(); ctx.cfg.max_levels], ptr: OnceLock::new() }
 }
 
 /// Applies one sorted batch to the tree rooted at `root` and returns the new
@@ -897,10 +871,7 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
         Some(Subtree::Node(n)) => {
             let mut n = (**n).clone();
             node_apply(ctx, &mut n, batch)?;
-            split_if_needed(ctx, n)?
-                .into_iter()
-                .map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n))))
-                .collect()
+            split_if_needed(ctx, n)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect()
         }
     };
     loop {
@@ -909,10 +880,7 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
             1 => break,
             _ => {
                 let root = new_root(ctx, pieces);
-                pieces = split_if_needed(ctx, root)?
-                    .into_iter()
-                    .map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n))))
-                    .collect();
+                pieces = split_if_needed(ctx, root)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect();
             }
         }
     }
@@ -1422,12 +1390,7 @@ struct WriterState {
 impl<'scope> PageWriter<'scope> {
     /// Starts the writers, which keep `reserve` bytes of the newest pages
     /// queued, adding the time they spend writing to `busy_ns`.
-    pub fn spawn<'env>(
-        scope: &'scope std::thread::Scope<'scope, 'env>,
-        io: &'env PageIo,
-        reserve: u64,
-        busy_ns: &'env AtomicU64,
-    ) -> Self {
+    pub fn spawn<'env>(scope: &'scope std::thread::Scope<'scope, 'env>, io: &'env PageIo, reserve: u64, busy_ns: &'env AtomicU64) -> Self {
         let shared = Arc::new(WriterShared::default());
         shared.state.lock().reserve = reserve;
         let threads = (0..PAGE_WRITERS)
@@ -1583,12 +1546,7 @@ fn load_data_page(io: &PageIo, ptr: PagePtr, pages: &mut HashMap<PageId, Arc<Dat
     Ok(page)
 }
 
-fn load_subtree(
-    io: &PageIo,
-    ptr: PagePtr,
-    height: u32,
-    pages: &mut HashMap<PageId, Arc<DataPage>>,
-) -> Result<Subtree> {
+fn load_subtree(io: &PageIo, ptr: PagePtr, height: u32, pages: &mut HashMap<PageId, Arc<DataPage>>) -> Result<Subtree> {
     if height == 0 {
         return Ok(Subtree::Leaf(load_data_page(io, ptr, pages)?));
     }
@@ -1772,11 +1730,7 @@ fn check_subtree(io: &PageIo, cfg: &TreeConfig, t: &Subtree, lo: &Bytes, hi: Opt
 }
 
 /// Builds a page from sorted `(key, value)` pairs; for tests and batching.
-pub fn page_from_entries<'a>(
-    id: PageId,
-    entries: impl IntoIterator<Item = EntryRef<'a>>,
-    filter_bits: u32,
-) -> PageImage {
+pub fn page_from_entries<'a>(id: PageId, entries: impl IntoIterator<Item = EntryRef<'a>>, filter_bits: u32) -> PageImage {
     let mut b = PageBuilder::new(id);
     for e in entries {
         b.push(e);

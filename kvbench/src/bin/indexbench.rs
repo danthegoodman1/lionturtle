@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::ops::{Bound, ControlFlow};
 use std::sync::Arc;
 use std::time::Instant;
-use turtlekv::memtable::{MemTableKind, new_memtable};
 use turtlekv::Value;
+use turtlekv::memtable::{MemTableKind, new_memtable};
 
 fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;

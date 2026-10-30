@@ -3,8 +3,8 @@
 //! thread; this exercises the locks, version swaps, and epoch reclamation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use turtlekv::sim::{FaultConfig, SimStorage};
 use turtlekv::storage::FsStorage;
@@ -29,14 +29,7 @@ fn version_of(v: &[u8]) -> u64 {
 
 fn stress(storage: Arc<dyn turtlekv::storage::Storage>, memtable: MemTableKind, secs: u64) {
     let opts = Options {
-        tree: TreeConfig {
-            leaf_size: 8 << 10,
-            max_pivots: 8,
-            min_pivots: 2,
-            max_segments: 12,
-            max_levels: 4,
-            ..TreeConfig::default()
-        },
+        tree: TreeConfig { leaf_size: 8 << 10, max_pivots: 8, min_pivots: 2, max_segments: 12, max_levels: 4, ..TreeConfig::default() },
         checkpoint_distance: 4,
         cache_bytes: 256 << 10,
         memtable,
@@ -49,8 +42,7 @@ fn stress(storage: Arc<dyn turtlekv::storage::Storage>, memtable: MemTableKind, 
     let db = Arc::new(Db::open(storage.clone(), opts.clone()).unwrap());
     // Highest version each key has been written with (published after the
     // write returns), so readers can bound what they see.
-    let written: Arc<Vec<AtomicU64>> =
-        Arc::new((0..WRITERS as u64 * KEYS_PER_WRITER).map(|_| AtomicU64::new(0)).collect());
+    let written: Arc<Vec<AtomicU64>> = Arc::new((0..WRITERS as u64 * KEYS_PER_WRITER).map(|_| AtomicU64::new(0)).collect());
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for w in 0..WRITERS {
@@ -204,10 +196,8 @@ fn atomic_batches(memtable: MemTableKind) {
                 i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let p = (i >> 33) % PAIRS;
                 let pairs = |rows: &[(bytes::Bytes, bytes::Bytes)]| -> Vec<(u64, u64)> {
-                    let got: HashMap<u64, u64> = rows
-                        .iter()
-                        .map(|(k, v)| (u64::from_be_bytes(k[..].try_into().unwrap()), version(Some(v.clone()))))
-                        .collect();
+                    let got: HashMap<u64, u64> =
+                        rows.iter().map(|(k, v)| (u64::from_be_bytes(k[..].try_into().unwrap()), version(Some(v.clone())))).collect();
                     (0..PAIRS)
                         .map(|p| {
                             let (a, b) = (got.get(&(2 * p)), got.get(&(2 * p + 1)));

@@ -4,10 +4,7 @@
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 
-const SALT: [u32; 8] = [
-    0x47b6_137b, 0x4497_4d91, 0x8824_ad5b, 0xa2b7_289d, 0x7054_95c7, 0x2df1_424b, 0x9efc_4947,
-    0x5c6b_fb31,
-];
+const SALT: [u32; 8] = [0x47b6_137b, 0x4497_4d91, 0x8824_ad5b, 0xa2b7_289d, 0x7054_95c7, 0x2df1_424b, 0x9efc_4947, 0x5c6b_fb31];
 
 pub const BLOCK_BYTES: usize = 32;
 
@@ -112,9 +109,7 @@ mod tests {
         for i in 0..n as u64 {
             assert!(may_contain(&filter, hash_key(&i.to_be_bytes())));
         }
-        let fp = (n as u64..n as u64 * 11)
-            .filter(|i| may_contain(&filter, hash_key(&i.to_be_bytes())))
-            .count();
+        let fp = (n as u64..n as u64 * 11).filter(|i| may_contain(&filter, hash_key(&i.to_be_bytes()))).count();
         let rate = fp as f64 / (n * 10) as f64;
         assert!(rate < 0.01, "false positive rate {rate}");
     }

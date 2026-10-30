@@ -182,12 +182,7 @@ fn mix(phase: &str) -> Vec<(Op, f64)> {
 
 fn io_counters() -> (u64, u64) {
     let s = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    let field = |name: &str| {
-        s.lines()
-            .find_map(|l| l.strip_prefix(name))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-    };
+    let field = |name: &str| s.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
     (field("read_bytes:"), field("write_bytes:"))
 }
 
@@ -205,10 +200,7 @@ fn status_bytes(field: &str) -> u64 {
 fn cgroup_peak_bytes() -> u64 {
     let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let path = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("");
-    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
 fn dir_bytes(path: &std::path::Path) -> u64 {
@@ -331,13 +323,7 @@ unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-fn run_phase(
-    engine: &Arc<dyn Engine>,
-    args: &Args,
-    phase: &str,
-    records: &Arc<AtomicU64>,
-    timeline: &Arc<Timeline>,
-) -> PhaseResult {
+fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<AtomicU64>, timeline: &Arc<Timeline>) -> PhaseResult {
     let mix = mix(phase);
     let n = records.load(Ordering::SeqCst);
     let zipf = Arc::new(Zipfian::new(n, 0.99));
@@ -386,7 +372,13 @@ fn run_phase(
                 for _ in 0..per_thread {
                     let r = rng.unit();
                     let mut acc = 0.0;
-                    let op = mix.iter().find(|(_, p)| { acc += p; r < acc }).map_or(mix[0].0, |(op, _)| *op);
+                    let op = mix
+                        .iter()
+                        .find(|(_, p)| {
+                            acc += p;
+                            r < acc
+                        })
+                        .map_or(mix[0].0, |(op, _)| *op);
                     let n = records.load(Ordering::Relaxed).max(1);
                     let item = if uniform { rng.below(n) } else { zipf.next_scrambled(&mut rng) % n };
                     let t0 = if schedule.is_empty() {

@@ -95,11 +95,7 @@ pub struct PageMeta {
 
 impl std::fmt::Debug for PageMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PageMeta")
-            .field("id", &self.id)
-            .field("n_items", &self.n_items)
-            .field("data_bytes", &self.data_bytes)
-            .finish()
+        f.debug_struct("PageMeta").field("id", &self.id).field("n_items", &self.n_items).field("data_bytes", &self.data_bytes).finish()
     }
 }
 
@@ -158,11 +154,7 @@ impl PageMeta {
 
     pub fn block(&self, i: usize) -> BlockInfo {
         let at = i * INDEX_RECORD;
-        BlockInfo {
-            offset: u32_at(&self.raw, at),
-            len: u32_at(&self.raw, at + 4),
-            first_item: u32_at(&self.raw, at + 8),
-        }
+        BlockInfo { offset: u32_at(&self.raw, at), len: u32_at(&self.raw, at + 4), first_item: u32_at(&self.raw, at + 8) }
     }
 
     pub fn block_first_key(&self, i: usize) -> &[u8] {
@@ -266,11 +258,7 @@ impl PageMeta {
             return 0;
         }
         let first = self.block(blocks.start).first_item as u64;
-        let end = if blocks.end == self.n_blocks as usize {
-            self.n_items as u64
-        } else {
-            self.block(blocks.end).first_item as u64
-        };
+        let end = if blocks.end == self.n_blocks as usize { self.n_items as u64 } else { self.block(blocks.end).first_item as u64 };
         (end - first) * self.data_bytes / self.n_items as u64
     }
 
@@ -493,11 +481,7 @@ impl PageBuilder {
             self.buf.extend_from_slice(&[0; BLOCK_HEADER]);
             self.first_keys.push((self.keys.len() as u32, e.key.len() as u32));
             self.keys.extend_from_slice(e.key);
-            self.index.push(BlockInfo {
-                offset: self.block_start as u32,
-                len: 0,
-                first_item: self.n_items,
-            });
+            self.index.push(BlockInfo { offset: self.block_start as u32, len: 0, first_item: self.n_items });
         }
         self.block_entries.push((self.buf.len() - self.block_start) as u32);
         self.buf.extend_from_slice(&(e.key.len() as u16).to_le_bytes());

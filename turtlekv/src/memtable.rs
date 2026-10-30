@@ -150,10 +150,7 @@ impl MemTable for SkipListTable {
 
     fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
         let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
-        let visible = self
-            .map
-            .range::<[u8], _>((start, hi))
-            .filter_map(|e| Some((e.key().clone(), e.value().load().at(view)?.clone())));
+        let visible = self.map.range::<[u8], _>((start, hi)).filter_map(|e| Some((e.key().clone(), e.value().load().at(view)?.clone())));
         out.extend(visible.take(limit));
     }
 
@@ -287,10 +284,7 @@ impl MemTable for BTreeTable {
         }
         let map = self.map.read();
         let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
-        let visible = map
-            .range::<[u8], _>((Bound::Included(start), hi))
-            .rev()
-            .filter_map(|(k, v)| Some((k.clone(), v.at(view)?.clone())));
+        let visible = map.range::<[u8], _>((Bound::Included(start), hi)).rev().filter_map(|(k, v)| Some((k.clone(), v.at(view)?.clone())));
         out.extend(visible.take(limit));
     }
 
@@ -364,10 +358,14 @@ impl MemTable for ArtTable {
             let idx = self.arena.push(next);
             let mut moved = false;
             self.art
-                .compute_or_insert(k, |old| {
-                    moved = old == current;
-                    if moved { idx } else { old.expect("keys are never removed") }
-                }, &guard)
+                .compute_or_insert(
+                    k,
+                    |old| {
+                        moved = old == current;
+                        if moved { idx } else { old.expect("keys are never removed") }
+                    },
+                    &guard,
+                )
                 .expect("ART allocation failed");
             if moved {
                 return;
@@ -395,7 +393,9 @@ impl MemTable for ArtTable {
             let to = hi.min(u64::MAX as u128) as usize;
             let n = self.art.range(&(lo as usize), &to, &mut buf, &guard);
             for &(k, i) in &buf[..n] {
-                if taken < limit && let Some(value) = self.visible(i, view) {
+                if taken < limit
+                    && let Some(value) = self.visible(i, view)
+                {
                     out.push((Bytes::copy_from_slice(&(k as u64).to_be_bytes()), value));
                     taken += 1;
                 }
@@ -511,16 +511,20 @@ mod tests {
             }
             t.insert(b, put(b"b"), 6, 4);
             let at = |s: u64| t.get(a, &|seq, _| seq <= s).and_then(Value::into_put).map(|v| String::from_utf8(v.to_vec()).unwrap());
-            assert_eq!([at(0), at(1), at(2), at(4), at(6), at(8), at(9), at(100)], [
-                None,
-                Some("1".into()),
-                Some("1".into()),
-                Some("3".into()),
-                Some("5".into()),
-                Some("7".into()),
-                Some("9".into()),
-                Some("9".into())
-            ], "{kind:?}");
+            assert_eq!(
+                [at(0), at(1), at(2), at(4), at(6), at(8), at(9), at(100)],
+                [
+                    None,
+                    Some("1".into()),
+                    Some("1".into()),
+                    Some("3".into()),
+                    Some("5".into()),
+                    Some("7".into()),
+                    Some("9".into()),
+                    Some("9".into())
+                ],
+                "{kind:?}"
+            );
             let committed = |ticket: u64| ticket >= 5;
             let newest_committed = t.get(a, &|_, ticket| committed(ticket));
             assert_eq!(newest_committed, Some(Value::Put(Bytes::from("5"))), "{kind:?}");

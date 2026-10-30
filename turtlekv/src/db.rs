@@ -26,12 +26,12 @@ use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
+use std::cell::UnsafeCell;
 use std::collections::{HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
 #[derive(Clone, Debug)]
@@ -639,7 +639,16 @@ impl Db {
             io,
             version: ArcSwap::from_pointee(version),
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer { wal, flush_claimed: 0, carried: VecDeque::new(), next_seq: last_seq + 1, next_ticket: 1, active, user_bytes: 0, wal_bytes: 0 }),
+            writer: Mutex::new(Writer {
+                wal,
+                flush_claimed: 0,
+                carried: VecDeque::new(),
+                next_seq: last_seq + 1,
+                next_ticket: 1,
+                active,
+                user_bytes: 0,
+                wal_bytes: 0,
+            }),
             queue: AtomicPtr::new(std::ptr::null_mut()),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
@@ -663,10 +672,7 @@ impl Db {
             for (name, stage) in [("turtlekv-apply", Stage::Apply), ("turtlekv-commit", Stage::Commit)] {
                 let inner = inner.clone();
                 workers.push(
-                    std::thread::Builder::new()
-                        .name(name.into())
-                        .spawn(move || inner.stage_loop(stage))
-                        .expect("spawn checkpoint thread"),
+                    std::thread::Builder::new().name(name.into()).spawn(move || inner.stage_loop(stage)).expect("spawn checkpoint thread"),
                 );
             }
         }

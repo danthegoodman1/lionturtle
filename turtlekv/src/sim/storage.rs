@@ -282,13 +282,7 @@ impl SimStorage {
             }
             None => return Err(io::Error::new(io::ErrorKind::NotFound, name.to_string())),
         };
-        Ok(Arc::new(SimFile {
-            state: self.state.clone(),
-            ino,
-            generation,
-            class: class_of(name),
-            direct,
-        }))
+        Ok(Arc::new(SimFile { state: self.state.clone(), ino, generation, class: class_of(name), direct }))
     }
 }
 
@@ -374,10 +368,7 @@ impl SimFile {
         if state.rng.chance(state.faults.write_error) {
             return Err(io::Error::other("sim: write error"));
         }
-        let inode = state
-            .inodes
-            .get_mut(&self.ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
+        let inode = state.inodes.get_mut(&self.ino).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
         let start = offset as usize;
         let end = start + buf.len();
         if durable {
@@ -432,19 +423,13 @@ impl File for SimFile {
         if state.rng.chance(state.faults.read_error) {
             return Err(io::Error::other("sim: read error"));
         }
-        let inode = state
-            .inodes
-            .get(&self.ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
+        let inode = state.inodes.get(&self.ino).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
         let end = offset as usize + buf.len();
         if end > inode.data.len() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sim: read past end"));
         }
         buf.copy_from_slice(&inode.data[offset as usize..end]);
-        if !buf.is_empty()
-            && state.faults.corrupt_classes.contains(&self.class)
-            && state.rng.chance(state.faults.read_corruption)
-        {
+        if !buf.is_empty() && state.faults.corrupt_classes.contains(&self.class) && state.rng.chance(state.faults.read_corruption) {
             let bit = state.rng.below(buf.len() as u64 * 8);
             buf[(bit / 8) as usize] ^= 1 << (bit % 8);
         }
@@ -493,10 +478,7 @@ impl File for SimFile {
         if state.rng.chance(state.faults.write_error) {
             return Err(io::Error::other("sim: punch error"));
         }
-        let inode = state
-            .inodes
-            .get_mut(&self.ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
+        let inode = state.inodes.get_mut(&self.ino).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sim: file removed"))?;
         let start = (offset as usize).min(inode.data.len());
         let end = (offset as usize).saturating_add(len as usize).min(inode.data.len());
         let old = inode.data[start..end].to_vec();

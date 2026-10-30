@@ -23,8 +23,7 @@ impl Harness {
     }
 
     fn apply(&mut self, ops: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
-        let entries: Vec<EntryRef> =
-            ops.iter().map(|(k, v)| EntryRef { key: k, value: v.as_deref() }).collect();
+        let entries: Vec<EntryRef> = ops.iter().map(|(k, v)| EntryRef { key: k, value: v.as_deref() }).collect();
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let page = Arc::new(DataPage::unwritten(page_from_entries(id, entries, 10)));
         let root = apply_batch(&self.ctx(), self.root.as_ref(), page).unwrap();

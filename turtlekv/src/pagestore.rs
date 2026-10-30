@@ -70,10 +70,7 @@ impl PagePtr {
             len: u32::from_le_bytes(b[13..17].try_into().unwrap()),
             meta_off: u32::from_le_bytes(b[17..21].try_into().unwrap()),
         };
-        (ptr.class < CLASSES as u8
-            && ptr.meta_off <= ptr.len
-            && ptr.len as u64 <= slot_size(ptr.class))
-        .then_some(ptr)
+        (ptr.class < CLASSES as u8 && ptr.meta_off <= ptr.len && ptr.len as u64 <= slot_size(ptr.class)).then_some(ptr)
     }
 }
 
@@ -137,20 +134,12 @@ impl PageStore {
             a.free = (0..a.next).filter(|s| !used[class].contains(s)).collect();
         }
         let direct = (0..CLASSES).map(|_| OnceLock::new()).collect();
-        Ok(Self {
-            storage,
-            files,
-            direct,
-            create: Mutex::new(()),
-            alloc: Mutex::new(alloc),
-            freed: Mutex::new(Vec::new()),
-        })
+        Ok(Self { storage, files, direct, create: Mutex::new(()), alloc: Mutex::new(alloc), freed: Mutex::new(Vec::new()) })
     }
 
     /// Reserves a slot for a page image of `len` bytes.
     pub fn allocate(&self, id: PageId, len: u64, meta_off: u32) -> Result<PagePtr> {
-        let class = class_for(len)
-            .ok_or_else(|| crate::Error::InvalidArgument(format!("page of {len} bytes too large")))?;
+        let class = class_for(len).ok_or_else(|| crate::Error::InvalidArgument(format!("page of {len} bytes too large")))?;
         let mut alloc = self.alloc.lock();
         let a = &mut alloc[class as usize];
         let slot = match a.free.pop_first() {
@@ -381,13 +370,7 @@ impl Superblock {
             }
             _ => return None,
         };
-        Some(Self {
-            checkpoint_id: u(0),
-            last_seq: u(1),
-            last_memtable_id: u(2),
-            next_page_id: u(3),
-            root,
-        })
+        Some(Self { checkpoint_id: u(0), last_seq: u(1), last_memtable_id: u(2), next_page_id: u(3), root })
     }
 
     /// Reads the newest valid superblock, or `None` if the store is new.

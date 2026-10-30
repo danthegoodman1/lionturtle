@@ -15,15 +15,8 @@ fn main() {
     println!("records,chi,leaf_kb,checkpoints,height,waf_total,waf_pages,wal_mb,page_mb,disk_mb,reads_per_get,read_kb_per_get");
     for &n in &records {
         for &chi in &chis {
-            let cfg = PerfConfig {
-                records: n,
-                value_size: 120,
-                leaf_size: leaf_kb << 10,
-                chi,
-                cache_bytes: 1 << 20,
-                gets: 20_000,
-                seed: 42,
-            };
+            let cfg =
+                PerfConfig { records: n, value_size: 120, leaf_size: leaf_kb << 10, chi, cache_bytes: 1 << 20, gets: 20_000, seed: 42 };
             let r = run(&cfg);
             println!(
                 "{n},{chi},{leaf_kb},{},{},{:.3},{:.3},{:.1},{:.1},{:.1},{:.3},{:.2}",

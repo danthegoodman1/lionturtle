@@ -253,11 +253,7 @@ impl Sim {
     }
 
     fn value(&mut self) -> Vec<u8> {
-        let len = if self.fixed_size || self.rng.chance(0.1) {
-            self.max_value
-        } else {
-            self.rng.range(0, self.max_value as u64) as usize
-        };
+        let len = if self.fixed_size || self.rng.chance(0.1) { self.max_value } else { self.rng.range(0, self.max_value as u64) as usize };
         let mut v = vec![0u8; len];
         self.rng.fill(&mut v);
         v
@@ -307,16 +303,10 @@ impl Sim {
         self.open()?;
         let recovered = self.db().last_seq();
         if recovered < self.model.synced_seq || recovered > self.model.last_seq {
-            return Err(format!(
-                "recovered to seq {recovered}, outside [{}, {}]",
-                self.model.synced_seq, self.model.last_seq
-            ));
+            return Err(format!("recovered to seq {recovered}, outside [{}, {}]", self.model.synced_seq, self.model.last_seq));
         }
         if self.verbose {
-            eprintln!(
-                "crash: recovered seq {recovered} (synced {}, last {})",
-                self.model.synced_seq, self.model.last_seq
-            );
+            eprintln!("crash: recovered seq {recovered} (synced {}, last {})", self.model.synced_seq, self.model.last_seq);
         }
         self.model.rewind_to(recovered);
         // What recovery read back is on the media now.
@@ -339,7 +329,10 @@ impl Sim {
         if recovered != self.model.last_seq {
             // Closing syncs the log; a sync fault there is a crash.
             if recovered < self.model.synced_seq || recovered > self.model.last_seq {
-                return Err(format!("clean reopen lost writes: seq {recovered}, synced {}, last {}", self.model.synced_seq, self.model.last_seq));
+                return Err(format!(
+                    "clean reopen lost writes: seq {recovered}, synced {}, last {}",
+                    self.model.synced_seq, self.model.last_seq
+                ));
             }
             self.model.rewind_to(recovered);
         }
@@ -419,9 +412,7 @@ impl Sim {
         };
         let expected: Vec<(&Vec<u8>, &Vec<u8>)> =
             state.range(start.to_vec()..).take_while(|(k, _)| end.is_none_or(|e| &k[..] < e)).take(limit).collect();
-        if got.len() != expected.len()
-            || got.iter().zip(&expected).any(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..])
-        {
+        if got.len() != expected.len() || got.iter().zip(&expected).any(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..]) {
             let first_diff = got.iter().zip(&expected).position(|((gk, gv), (ek, ev))| &gk[..] != &ek[..] || &gv[..] != &ev[..]);
             return Err(format!(
                 "scan from {:?} limit {limit} (snapshot {snap:?}): got {} entries, expected {}, first difference at {first_diff:?}",
@@ -500,7 +491,11 @@ impl Sim {
             };
             let (it, expected): (DbIter, Vec<_>) = if let Some(prefix) = prefix {
                 let it = if reverse { snap.prefix_rev(&prefix) } else { snap.prefix(&prefix) };
-                let expected = state.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                let expected = state
+                    .range(prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 (it, expected)
             } else {
                 let it = if reverse { snap.iter_rev(&start, end.as_deref()) } else { snap.iter(&start, end.as_deref()) };
