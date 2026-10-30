@@ -1,0 +1,47 @@
+name: Nightly simulation
+
+# Ten thousand VOPR seeds a night, four processes at a time, each from its own
+# random start. The 300 seeds on each pull request catch common bugs; rare
+# ones need this volume. A failure files an issue with the seed's replay
+# command.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin vopr
+      - name: Simulate
+        run: |
+          status=0
+          seq 4 | xargs -P 4 -I{} sh -c './target/release/vopr --seeds 2500 > vopr-{}.log 2>&1' || status=$?
+          cat vopr-*.log
+          exit $status
+      - name: File an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "The nightly simulation of ${GITHUB_SHA} failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '```'
+            grep -hE '^(FAILED|reproduce)' vopr-*.log || echo "no failing seed printed; see the run's log"
+            echo '```'
+          } > issue.md
+          gh issue create --title "Nightly simulation failed on ${GITHUB_SHA::7}" --body-file issue.md

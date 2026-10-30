@@ -58,7 +58,7 @@ pub struct Args {
     /// Make every write in the timed phases durable before it returns. The
     /// load stays buffered.
     pub sync: bool,
-    /// RocksDB reuses retired log files, as turtlekv-rs always does.
+    /// RocksDB reuses retired log files, as lionturtle always does.
     pub rocksdb_recycle_logs: bool,
     /// Upper bound in MB/s for RocksDB's auto-tuned limiter on flush and
     /// compaction writes; 0 leaves it off.
@@ -68,7 +68,7 @@ pub struct Args {
     /// Operations per second across all client threads in the timed phases,
     /// as a cycle of (rate, seconds) segments; empty issues them back to back.
     pub rate: Vec<(f64, f64)>,
-    /// Pace turtlekv-rs checkpoints.
+    /// Pace lionturtle checkpoints.
     pub pace: bool,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
@@ -76,7 +76,7 @@ pub struct Args {
 }
 
 impl Args {
-    /// Memtable size for every engine: turtlekv's checkpoint distance in
+    /// Memtable size for every engine: lionturtle's checkpoint distance in
     /// leaf-sized batches.
     pub fn memtable_bytes(&self) -> u64 {
         self.chi * (self.leaf_kb << 10)
@@ -113,7 +113,7 @@ fn parse_args() -> Args {
     let num = |name: &str, default: u64| get(name).map(|v| v.parse().expect(name)).unwrap_or(default);
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     Args {
-        engine: get("--engine").unwrap_or_else(|| "turtlekv".into()),
+        engine: get("--engine").unwrap_or_else(|| "lionturtle".into()),
         dir: get("--dir").unwrap_or_else(|| "bench-data".into()),
         phases: get("--phases").unwrap_or_else(|| "load,a,b,c,e,f".into()).split(',').map(String::from).collect(),
         records: num("--records", 10_000_000),
@@ -182,12 +182,7 @@ fn mix(phase: &str) -> Vec<(Op, f64)> {
 
 fn io_counters() -> (u64, u64) {
     let s = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    let field = |name: &str| {
-        s.lines()
-            .find_map(|l| l.strip_prefix(name))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-    };
+    let field = |name: &str| s.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
     (field("read_bytes:"), field("write_bytes:"))
 }
 
@@ -205,10 +200,7 @@ fn status_bytes(field: &str) -> u64 {
 fn cgroup_peak_bytes() -> u64 {
     let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let path = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("");
-    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
 fn dir_bytes(path: &std::path::Path) -> u64 {
@@ -331,13 +323,7 @@ unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-fn run_phase(
-    engine: &Arc<dyn Engine>,
-    args: &Args,
-    phase: &str,
-    records: &Arc<AtomicU64>,
-    timeline: &Arc<Timeline>,
-) -> PhaseResult {
+fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<AtomicU64>, timeline: &Arc<Timeline>) -> PhaseResult {
     let mix = mix(phase);
     let n = records.load(Ordering::SeqCst);
     let zipf = Arc::new(Zipfian::new(n, 0.99));
@@ -386,7 +372,13 @@ fn run_phase(
                 for _ in 0..per_thread {
                     let r = rng.unit();
                     let mut acc = 0.0;
-                    let op = mix.iter().find(|(_, p)| { acc += p; r < acc }).map_or(mix[0].0, |(op, _)| *op);
+                    let op = mix
+                        .iter()
+                        .find(|(_, p)| {
+                            acc += p;
+                            r < acc
+                        })
+                        .map_or(mix[0].0, |(op, _)| *op);
                     let n = records.load(Ordering::Relaxed).max(1);
                     let item = if uniform { rng.below(n) } else { zipf.next_scrambled(&mut rng) % n };
                     let t0 = if schedule.is_empty() {

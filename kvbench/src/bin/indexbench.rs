@@ -7,13 +7,13 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use bytes::Bytes;
+use lionturtle::Value;
+use lionturtle::memtable::{MemTableKind, new_memtable};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::{Bound, ControlFlow};
 use std::sync::Arc;
 use std::time::Instant;
-use turtlekv::memtable::{MemTableKind, new_memtable};
-use turtlekv::Value;
 
 fn mix(mut x: u64) -> u64 {
     x ^= x >> 30;

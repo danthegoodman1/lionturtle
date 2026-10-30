@@ -26,8 +26,8 @@ if ! mountpoint -q /mnt/data; then
   sudo mount -o noatime "$dev" /mnt/data
   sudo chown "$USER" /mnt/data
 fi
-cd ~/turtlekv-rs
+cd ~/lionturtle
 cargo build --release -p kvbench --features rocksdb,scylla --bins 2>&1 | tail -1
-cargo build --release -p turtlekv --bins 2>&1 | tail -1
+cargo build --release -p lionturtle --bins 2>&1 | tail -1
 lsblk -d -n -o NAME,MODEL,SIZE | grep -c "Instance Storage"
 df -h /mnt/data

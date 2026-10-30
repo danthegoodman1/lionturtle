@@ -15,7 +15,7 @@ pub trait Engine: Send + Sync {
     fn stats_json(&self) -> String {
         "{}".into()
     }
-    /// Finishes background work the writes so far started: turtlekv-rs
+    /// Finishes background work the writes so far started: lionturtle
     /// checkpoints its memtables, and the LSM engines flush and compact fully.
     fn settle(&self) {}
     /// Total seconds writers have waited for background work, where the
@@ -27,7 +27,7 @@ pub trait Engine: Send + Sync {
 
 pub fn open(args: &Args) -> Arc<dyn Engine> {
     match args.engine.as_str() {
-        "turtlekv" => Arc::new(Turtle::open(args)),
+        "lionturtle" => Arc::new(Turtle::open(args)),
         "fjall" => Arc::new(Fjall::open(args)),
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Arc::new(Rocks::open(args)),
@@ -38,18 +38,18 @@ pub fn open(args: &Args) -> Arc<dyn Engine> {
 }
 
 struct Turtle {
-    db: turtlekv::Db,
+    db: lionturtle::Db,
 }
 
 impl Turtle {
     fn open(args: &Args) -> Self {
-        let tree = turtlekv::TreeConfig {
+        let tree = lionturtle::TreeConfig {
             leaf_size: args.leaf_kb << 10,
             max_levels: args.max_levels,
             filter_bits: args.filter_bits,
             ..Default::default()
         };
-        let opts = turtlekv::Options {
+        let opts = lionturtle::Options {
             tree,
             checkpoint_distance: args.chi,
             cache_bytes: args.cache_mb << 20,
@@ -60,15 +60,15 @@ impl Turtle {
             merge_threads: args.merge_threads,
             pace_checkpoints: args.pace,
         };
-        let storage = Arc::new(turtlekv::storage::FsStorage::new(&args.dir).unwrap());
-        Self { db: turtlekv::Db::open(storage, opts).unwrap() }
+        let storage = Arc::new(lionturtle::storage::FsStorage::new(&args.dir).unwrap());
+        Self { db: lionturtle::Db::open(storage, opts).unwrap() }
     }
 }
 
 impl Engine for Turtle {
     fn put(&self, key: &[u8], value: &[u8], sync: bool) {
         if sync {
-            self.db.write(&[turtlekv::WriteOp::put(key.to_vec(), value.to_vec())], true).unwrap();
+            self.db.write(&[lionturtle::WriteOp::put(key.to_vec(), value.to_vec())], true).unwrap();
         } else {
             self.db.put(key, value).unwrap();
         }
@@ -281,8 +281,7 @@ impl Scylla {
     fn open(args: &Args) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
         let (session, insert, select, scan) = rt.block_on(async {
-            let session =
-                scylla::client::session_builder::SessionBuilder::new().known_node(&args.scylla_host).build().await.unwrap();
+            let session = scylla::client::session_builder::SessionBuilder::new().known_node(&args.scylla_host).build().await.unwrap();
             for q in [
                 "CREATE KEYSPACE IF NOT EXISTS kvbench WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}",
                 "CREATE TABLE IF NOT EXISTS kvbench.kv (k blob PRIMARY KEY, v blob) WITH compression = {'sstable_compression': ''}",

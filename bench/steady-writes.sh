@@ -1,8 +1,8 @@
 #!/bin/bash
 # Reads during sustained writes, after the SILK paper (ATC '19). Loads 5M
-# records of 1 KB into turtlekv-rs and RocksDB, then runs workload A with
+# records of 1 KB into lionturtle and RocksDB, then runs workload A with
 # uniform keys at fixed rates for five minutes each under a 3 GB memory cap:
-# turtlekv-rs with checkpoint pacing on and off, and RocksDB with its
+# lionturtle with checkpoint pacing on and off, and RocksDB with its
 # auto-tuned rate limiter on and off. Latency counts from each operation's
 # scheduled start. Run it on a drive with little bandwidth to spare, such as
 # bench/slow-drive.sh makes. Each run appends its per-second percentiles to
@@ -19,14 +19,14 @@ engine() {
     "${@:2}"
   fi
 }
-for e in turtlekv rocksdb; do
+for e in lionturtle rocksdb; do
   rm -rf "$dir/loaded-$e"
   engine $e "$bin" --engine $e "${common[@]}" --dir "$dir/loaded-$e" --phases load --settle 1 --keep 1 > /dev/null
 done
 # Rate and operation count: five minutes of each.
 for run in "15000 4500000" "22000 6600000" "10000:20,30000:10 5000000"; do
   read -r rate ops <<< "$run"
-  for variant in "turtlekv --pace 1" "turtlekv --pace 0" "rocksdb --rocksdb-rate-mb 200" "rocksdb --rocksdb-rate-mb 0"; do
+  for variant in "lionturtle --pace 1" "lionturtle --pace 0" "rocksdb --rocksdb-rate-mb 200" "rocksdb --rocksdb-rate-mb 0"; do
     read -r e flag value <<< "$variant"
     rm -rf "$dir/run"
     cp -r --sparse=always "$dir/loaded-$e" "$dir/run"
@@ -41,4 +41,4 @@ for d, _, fs in os.walk(sys.argv[1]):
       --keep 1 --label "$e rate=$rate $flag $value" --timeline "$dir/timeline.jsonl" | grep -o '"label":"[^"]*"\|"read":{[^}]*}'
   done
 done
-rm -rf "$dir/run" "$dir/loaded-turtlekv" "$dir/loaded-rocksdb"
+rm -rf "$dir/run" "$dir/loaded-lionturtle" "$dir/loaded-rocksdb"
