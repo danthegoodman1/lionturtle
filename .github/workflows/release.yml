@@ -1,0 +1,110 @@
+name: Release
+
+# Publishes to crates.io via Trusted Publishing (OIDC — no long-lived token
+# secret). Runs when a v* tag is pushed, as a reusable workflow called from
+# bump.yml (tags pushed by a workflow's GITHUB_TOKEN don't trigger tag
+# workflows, so the bump path calls this directly), or manually via
+# workflow_dispatch to (re-)release an existing tag whose publish never landed.
+#
+# The "already on crates.io" check makes publish idempotent and doubles as the
+# first-publish path: a brand-new crate returns 404 and is published.
+#
+# crates.io setup (see RELEASING.md): lionturtle -> Settings -> Trusted
+# Publishing -> GitHub danthegoodman1/lionturtle, with an entry for
+# release.yml AND one for bump.yml (the OIDC claim names the top-level
+# workflow).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to release (the tag created by the bump workflow)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Existing v* tag to release (publish is skipped if that version is already on crates.io)
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATE: lionturtle
+  MANIFEST: lionturtle/Cargo.toml
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: dtolnay/rust-toolchain@stable
+      # workflow_call children inherit the caller's event context, so a
+      # push-to-main auto-release also reports event_name == 'push'; only a
+      # real tag push (ref_type == 'tag') has a tag name to verify against.
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          crate_version=$(grep -m1 '^version' "$MANIFEST" | cut -d'"' -f2)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+      - name: Check if this version is already on crates.io
+        id: check
+        run: |
+          crate_version=$(grep -m1 '^version' "$MANIFEST" | cut -d'"' -f2)
+          status=$(curl -s -o /dev/null -w "%{http_code}" -A "${CRATE}-release-workflow" "https://crates.io/api/v1/crates/${CRATE}/${crate_version}")
+          if [ "$status" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "${CRATE} ${crate_version} is already on crates.io; skipping publish"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.check.outputs.published == 'false'
+      - name: Publish
+        if: steps.check.outputs.published == 'false'
+        run: cargo publish -p "$CRATE"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # For a manually pushed tag (not the bump path, which already created the
+      # release), make sure a GitHub release exists for it.
+      - name: Ensure a GitHub release exists for the tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes

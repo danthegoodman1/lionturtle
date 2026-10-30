@@ -1,6 +1,8 @@
 # lionturtle
 
-An embedded key-value store in Rust, built on the TurtleTree from [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)). The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable.
+lionturtle is an embedded key-value store in Rust for Linux. It is a modified version of [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)): it keeps TurtleKV's TurtleTree, paces its background I/O after [SILK](https://www.usenix.org/conference/atc19/presentation/balmau), and borrows group commit and log recycling from LSM stores such as RocksDB, to keep throughput high and tail latency low.
+
+The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
 
 ## Features
 
@@ -117,6 +119,7 @@ The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_re
 
 - [BENCHMARKS.md](BENCHMARKS.md): every benchmark result, how each ran, and the commands to reproduce it.
 - [DESIGN.md](DESIGN.md): the write path, the TurtleTree, reads and visibility; durability guarantees; how lionturtle differs from the C++ TurtleKV; and what the tests check.
+- [RELEASING.md](RELEASING.md): how merges to `main` become crates.io releases.
 
 ## Development
 
@@ -128,3 +131,5 @@ cargo run --release -p kvbench --features rocksdb -- --engine lionturtle --recor
 cargo run --release -p kvbench --bin indexbench        # bbtree vs ART vs skip list
 cargo run --release --bin simperf                      # deterministic write amplification across χ
 ```
+
+CI runs rustfmt, clippy with warnings as errors, the tests on x86_64 and arm64 Linux, and 300 simulation seeds on every pull request, plus 10,000 seeds nightly. Each merge to `main` publishes a new version to crates.io.

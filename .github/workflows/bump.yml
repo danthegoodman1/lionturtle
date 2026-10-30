@@ -1,0 +1,193 @@
+name: Auto Release
+
+# Auto-release on every push to main, with a semver safety net: the bump level
+# defaults to "auto" — start at patch and escalate (patch -> minor -> major)
+# until cargo-semver-checks agrees the level covers the public-API diff since
+# the last published release. A breaking change auto-releases as 0.(x+1).0
+# instead of sneaking out as a patch.
+#
+# First-publish guard: before the crate exists on crates.io there is no
+# baseline to diff against, so cargo-semver-checks is skipped and the current
+# Cargo.toml version is released as-is (tag it, publish it). Every push after
+# that escalates normally.
+#
+# lionturtle is the only published crate in this workspace; its version lives
+# in lionturtle/Cargo.toml, and kvbench is never published.
+#
+# This triggers on push directly (not workflow_run chained off CI) because
+# crates.io Trusted Publishing rejects workflow_run-triggered workflows; the
+# bump job runs the tests itself before tagging, and release.yml runs its own
+# matrix again before publishing.
+#
+# Controls, via the head commit message (PR title, for squash merges):
+#   "#minor" / "#major"  force a bump level (fails if it can't cover the diff)
+#   "[skip release]"     skip releasing this push
+# Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
+#
+# The chore(release) commit and tag are pushed with GITHUB_TOKEN, which never
+# triggers workflows, so this can't loop. Publishing happens in the called
+# release.yml, but the OIDC claim names the top-level workflow — crates.io
+# Trusted Publishing must list this file (bump.yml) as a workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto = patch, escalated if the API diff demands more)
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CRATE: lionturtle
+  MANIFEST: lionturtle/Cargo.toml
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Decide bump level
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            level="$INPUT_BUMP"
+          else
+            case "$HEAD_MSG" in
+              "chore(release):"*)
+                echo "Release commit; skipping"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            if grep -qF '[skip release]' <<< "$HEAD_MSG"; then
+              echo "[skip release] marker; skipping"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            level=auto
+            grep -qF '#minor' <<< "$HEAD_MSG" && level=minor
+            grep -qF '#major' <<< "$HEAD_MSG" && level=major
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $level"
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.decide.outputs.release == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.decide.outputs.release == 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.decide.outputs.release == 'true'
+        with:
+          tool: cargo-semver-checks
+      - name: First-publish check (does the crate exist on crates.io yet?)
+        id: exists
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" -A "${CRATE}-release-workflow" "https://crates.io/api/v1/crates/${CRATE}")
+          if [ "$status" = "200" ]; then
+            echo "first_publish=false" >> "$GITHUB_OUTPUT"
+            echo "${CRATE} is already on crates.io; semver-checks will run against it"
+          else
+            echo "first_publish=true" >> "$GITHUB_OUTPUT"
+            echo "${CRATE} not found on crates.io (HTTP $status); first publish — semver-checks skipped"
+          fi
+      - name: Test before tagging (release.yml runs its matrix again before publish)
+        if: steps.decide.outputs.release == 'true'
+        run: cargo test --workspace
+      - name: Bump version, escalating until the level covers the API diff
+        id: version
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          current=$(grep -m1 '^version' "$MANIFEST" | cut -d'"' -f2)
+          IFS=. read -r major minor patch <<< "$current"
+          next() {
+            case "$1" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "${major}.$((minor + 1)).0" ;;
+              patch) echo "${major}.${minor}.$((patch + 1))" ;;
+            esac
+          }
+          if [ "${{ steps.exists.outputs.first_publish }}" = "true" ]; then
+            # No baseline on crates.io: release the current version verbatim.
+            new="$current"
+            echo "First publish: releasing $current as-is (no version bump, no semver-checks)"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ steps.decide.outputs.level }}" in
+              auto) candidates="patch minor major" ;;
+              *) candidates="${{ steps.decide.outputs.level }}" ;;
+            esac
+            chosen=""
+            for level in $candidates; do
+              new=$(next "$level")
+              echo "::group::Trying $level: $current -> $new"
+              sed -i "0,/^version = \"${current}\"/s//version = \"${new}\"/" "$MANIFEST"
+              cargo update --workspace
+              if cargo semver-checks check-release -p "$CRATE"; then
+                chosen="$level"
+                echo "::endgroup::"
+                break
+              fi
+              echo "::endgroup::"
+              git checkout -- "$MANIFEST" Cargo.lock
+            done
+            if [ -z "$chosen" ]; then
+              echo "::error::None of [$candidates] covers the public-API diff since the last published release" >&2
+              exit 1
+            fi
+            echo "commit=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing $current -> $new ($chosen)"
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+      - name: Commit, tag, and create the GitHub release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ steps.version.outputs.commit }}" = "true" ]; then
+            git commit -am "chore(release): ${{ steps.version.outputs.tag }}"
+            git push origin main
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "refs/tags/${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+  release:
+    needs: bump
+    if: needs.bump.outputs.release == 'true'
+    permissions:
+      id-token: write
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.bump.outputs.tag }}
