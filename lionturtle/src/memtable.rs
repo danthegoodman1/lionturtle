@@ -26,28 +26,54 @@ pub struct Versions {
     seq: u64,
     ticket: u64,
     value: Value,
-    older: Option<Arc<Versions>>,
+    older: Older,
+}
+
+/// The link from a version to the next older one.
+#[derive(Clone, Debug)]
+struct Older(Option<Arc<Versions>>);
+
+impl Drop for Older {
+    // Free the chain iteratively: a key overwritten N times in one memtable
+    // holds N versions, and dropping 100,000 recursively overflowed a
+    // checkpoint thread's 2 MiB stack. An overwrite drops the old head, whose
+    // chain the new head shares, so that case stays inline.
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(v) = self.0.take().and_then(Arc::into_inner) {
+            free_chain(v);
+        }
+    }
+}
+
+/// Frees `v` and the versions behind it that no other chain shares.
+fn free_chain(mut v: Versions) {
+    let mut next = v.older.0.take();
+    while let Some(older) = next {
+        let Some(mut o) = Arc::into_inner(older) else { break };
+        next = o.older.0.take();
+    }
 }
 
 impl Versions {
     fn new(seq: u64, ticket: u64, value: Value) -> Self {
-        Self { seq, ticket, value, older: None }
+        Self { seq, ticket, value, older: Older(None) }
     }
 
     /// These versions plus the one written at `seq`.
     fn with(&self, seq: u64, ticket: u64, value: Value) -> Self {
         if seq > self.seq {
-            return Self { seq, ticket, value, older: Some(Arc::new(self.clone())) };
+            return Self { seq, ticket, value, older: Older(Some(Arc::new(self.clone()))) };
         }
         if seq == self.seq {
             return Self { seq, ticket, value, older: self.older.clone() };
         }
         // A writer with an earlier sequence number inserted second.
-        let older = match &self.older {
+        let older = match &self.older.0 {
             Some(o) => o.with(seq, ticket, value),
             None => Self::new(seq, ticket, value),
         };
-        Self { older: Some(Arc::new(older)), ..self.clone() }
+        Self { older: Older(Some(Arc::new(older))), ..self.clone() }
     }
 
     /// The newest value `view` sees.
@@ -57,7 +83,7 @@ impl Versions {
             if view(v.seq, v.ticket) {
                 return Some(&v.value);
             }
-            v = v.older.as_deref()?;
+            v = v.older.0.as_deref()?;
         }
     }
 }
@@ -473,6 +499,22 @@ mod tests {
     }
 
     const ALL: View = &|_, _| true;
+
+    /// A key overwritten N times holds N versions. Dropping the table must
+    /// free them without recursing once per version, which overflows the
+    /// stack of whichever thread drops it.
+    #[test]
+    fn long_version_chains_drop_on_a_small_stack() {
+        for kind in KINDS {
+            let t = new_memtable(kind);
+            for seq in 1..=100_000 {
+                t.insert(b"hot-key!", put(b"v"), seq, seq);
+            }
+            assert_eq!(t.get(b"hot-key!", ALL), Some(put(b"v")), "{kind:?}");
+            // 256 KiB holds a few thousand frames of a recursive drop.
+            std::thread::Builder::new().stack_size(256 << 10).spawn(move || drop(t)).unwrap().join().unwrap();
+        }
+    }
 
     #[test]
     fn newest_sequence_wins_in_every_kind() {

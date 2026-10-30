@@ -4,6 +4,10 @@ name: Nightly simulation
 # random start. The 300 seeds on each pull request catch common bugs; rare
 # ones need this volume. A failure files an issue with the seed's replay
 # command.
+#
+# VOPR seeds are short histories on small stores. The soak job runs one long
+# history at the default sizes on Linux and macOS, which catches bugs that
+# grow with the data, such as a key's version chain overflowing a stack.
 
 on:
   schedule:
@@ -45,3 +49,27 @@ jobs:
             echo '```'
           } > issue.md
           gh issue create --title "Nightly simulation failed on ${GITHUB_SHA::7}" --body-file issue.md
+
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak for 15 minutes
+        env:
+          LIONTURTLE_SOAK_SECS: "900"
+        run: cargo test --release -p lionturtle --test concurrency -- --ignored --exact soak_default_options --nocapture
+      - name: File an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OS: ${{ matrix.os }}
+        run: |
+          echo "The nightly soak test of ${GITHUB_SHA} failed on ${OS}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > issue.md
+          gh issue create --title "Nightly soak failed on ${GITHUB_SHA::7} (${OS})" --body-file issue.md
