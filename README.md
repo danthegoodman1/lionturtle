@@ -35,14 +35,15 @@ YCSB on 50M records of 128 bytes, with 16 client threads under a 4 GB memory cap
 
 Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns:
 
-| | turtlekv-rs | RocksDB | ScyllaDB |
-|---|--:|--:|--:|
-| Read p99 at 70k ops/s | 0.23 ms | 4.4 ms | 9.3 ms |
-| Update p99 at 70k ops/s | 0.25 ms | 6.8 ms | 9.3 ms |
-| Read p99 at 150k ops/s | 0.35 ms | 603 ms | |
-| Throughput over 10+ minutes | 226k ops/s | 206k | 88k |
+| Durable ops/s | Engine | Read p99 | Read p999 | Update p99 | Update p999 |
+|---|---|--:|--:|--:|--:|
+| 70k | turtlekv-rs | 0.23 ms | 1.0 ms | 0.25 ms | 1.4 ms |
+| | RocksDB | 4.4 ms | 399 ms | 6.8 ms | 403 ms |
+| | ScyllaDB | 9.3 ms | 31 ms | 9.3 ms | 30 ms |
+| 150k | turtlekv-rs | 0.35 ms | 7.6 ms | 0.45 ms | 8.7 ms |
+| | RocksDB | 603 ms | 1.4 s | 610 ms | 1.4 s |
 
-ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row.
+ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 10 minutes or more, sustained throughput was 226k ops/s for turtlekv-rs, 206k for RocksDB and 88k for ScyllaDB.
 
 ### Trade-offs
 
