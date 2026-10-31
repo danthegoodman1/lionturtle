@@ -59,6 +59,7 @@ impl Turtle {
             background: true,
             merge_threads: args.merge_threads,
             pace_checkpoints: args.pace,
+            preallocate_log: args.preallocate_log,
         };
         let storage = Arc::new(lionturtle::storage::FsStorage::new(&args.dir).unwrap());
         Self { db: lionturtle::Db::open(storage, opts).unwrap() }

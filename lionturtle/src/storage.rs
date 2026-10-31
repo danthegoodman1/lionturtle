@@ -51,6 +51,13 @@ pub trait File: Send + Sync {
     fn punch_hole(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
+    /// Zeroes `[offset, offset + len)` as written blocks, extending the file
+    /// to cover it, so that later writes there overwrite allocated space.
+    /// Returns `Unsupported` where the file system cannot do this without
+    /// the caller writing the zeros itself.
+    fn write_zeroes(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// Starts reading `[offset, offset + len)` into the page cache without
     /// waiting, so a later read of it waits less.
     fn prefetch(&self, _offset: u64, _len: u64) {}
@@ -186,6 +193,29 @@ impl File for FsFile {
         // SAFETY: fallocate only reads its integer arguments.
         let r = unsafe { libc::fallocate(self.0.as_raw_fd(), mode, offset as libc::off_t, len as libc::off_t) };
         if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+
+    /// `fallocate` with FALLOC_FL_WRITE_ZEROES, from Linux 6.17, which has
+    /// the drive zero the range where it can. Plain `fallocate` would leave
+    /// the blocks unwritten, and the first write into one changes extent
+    /// metadata that the sync after it must journal.
+    #[cfg(target_os = "linux")]
+    fn write_zeroes(&self, offset: u64, len: u64) -> io::Result<()> {
+        // Not yet in the libc crate.
+        const FALLOC_FL_WRITE_ZEROES: libc::c_int = 0x80;
+        loop {
+            // SAFETY: fallocate only reads its integer arguments.
+            let r = unsafe { libc::fallocate(self.0.as_raw_fd(), FALLOC_FL_WRITE_ZEROES, offset as libc::off_t, len as libc::off_t) };
+            if r == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::ENOSYS) => return Err(io::ErrorKind::Unsupported.into()),
+                _ => return Err(e),
+            }
+        }
     }
 
     /// Turns off read-ahead, as POSIX_FADV_RANDOM does on Linux.

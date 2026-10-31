@@ -46,7 +46,7 @@ Each batch takes a ticket under the writer lock and registers it. Its versions c
 
 ## Guarantees
 
-- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused; see [Synchronous writes](BENCHMARKS.md#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
+- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused. With `preallocate_log`, segments with none to reuse are zero-filled ahead of their writes; see [Synchronous writes](BENCHMARKS.md#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
 - **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
