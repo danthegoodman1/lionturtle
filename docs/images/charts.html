@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lionturtle charts</title>
+<!-- Source of the README charts. render.sh screenshots each chart in light and dark. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg: #f3f4f2;
+  --surface: #fcfcfb;
+  --ink: #101315;
+  --ink-2: #4a5056;
+  --muted: #7f858a;
+  --grid: #e3e5e2;
+  --axis: #c3c7c3;
+  --ring: rgba(16, 19, 21, 0.10);
+  --lt: #2a78d6;
+  --rocks: #eb6834;
+  --third: #1baf7a;
+  --font-display: "Archivo", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
+    --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
+    --lt: #3987e5; --rocks: #d95926; --third: #199e70;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
+  --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
+  --lt: #3987e5; --rocks: #d95926; --third: #199e70;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.55;
+  padding: 32px 16px 64px;
+}
+.wrap { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 48px; }
+h1, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+h3 { font-size: 1.05rem; font-weight: 650; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; }
+.key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.82rem; color: var(--ink-2); }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 24px; font-size: 0.8rem; color: var(--muted); }
+
+/* YCSB throughput: one row per workload, a bar per engine on a shared linear axis */
+.hero { padding: 40px; display: flex; flex-direction: column; gap: 22px; }
+.hero-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px 32px; }
+.hero h1 { font-size: 3.1rem; font-weight: 780; font-stretch: 80%; line-height: 1.02; letter-spacing: -0.015em; max-width: 20ch; }
+.hero h1 em { font-style: normal; color: var(--lt); }
+.hero-meta { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--ink-2); }
+.hero-meta b { color: var(--ink); font-weight: 600; }
+.hero .foot { border-top: 1px solid var(--grid); padding-top: 14px; }
+.ycsb { display: grid; grid-template-columns: 13rem minmax(0, 1fr) 5.5rem; column-gap: 18px; }
+.colhead { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding-bottom: 4px; border-bottom: 1px solid var(--grid); }
+.colhead.r { text-align: right; }
+.row-label { padding: 12px 0; align-self: center; }
+.row-label .name { font-weight: 600; font-size: 0.95rem; line-height: 1.25; }
+.row-label .sub { font-size: 0.8rem; color: var(--muted); line-height: 1.3; }
+.track { position: relative; padding: 12px 0; display: flex; flex-direction: column; justify-content: center; gap: 3px; }
+.track .gl { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
+.track .gl.zero { background: var(--axis); }
+.b { position: relative; display: flex; align-items: center; height: 13px; }
+.bar { height: 13px; border-radius: 0 4px 4px 0; flex: none; }
+.v { margin-left: 4px; padding: 1px 3px; background: var(--surface); font-family: var(--font-mono); font-size: 0.72rem; line-height: 1; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.v.lead { color: var(--ink); font-weight: 600; }
+.ratio { align-self: center; text-align: right; font-family: var(--font-display); font-weight: 750; font-stretch: 85%; font-size: 1.35rem; }
+.axis { grid-column: 2; position: relative; height: 22px; border-top: 1px solid var(--axis); }
+.axis span { position: absolute; top: 4px; transform: translateX(-50%); font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.axis-cap { grid-column: 2; font-size: 0.76rem; color: var(--muted); }
+
+/* Durable writes: p99 against offered load, one panel per operation, shared log axis */
+.durable { display: flex; flex-direction: column; gap: 16px; }
+.multiples { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.panel { padding: 16px 16px 10px; display: flex; flex-direction: column; gap: 8px; }
+.panel svg { width: 100%; height: auto; display: block; overflow: visible; }
+.panel svg text { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+.panel svg .lbl { font-family: var(--font-body); font-size: 12px; font-weight: 600; fill: var(--ink); }
+.panel svg .lbl2 { font-family: var(--font-body); font-size: 12px; fill: var(--ink-2); }
+
+/* Capture mode, set by a URL hash such as #ycsb-dark: one chart at 2x on GitHub's page color */
+html.capture { zoom: 2; }
+html.capture body { padding-block: 24px; }
+html.capture[data-theme="light"] { --bg: #ffffff; }
+html.capture[data-theme="dark"] { --bg: #0d1117; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card hero" id="ycsb">
+    <div class="hero-head">
+      <h1>lionturtle loads <em>1.6×</em> as fast as RocksDB and leads every YCSB workload</h1>
+      <div class="hero-meta">
+        <span><b>YCSB</b> · 50M records of 128 bytes · 16 client threads</span>
+        <span>4 GB memory cap · 1 GB block cache · 128 MiB memtables</span>
+        <span>EC2 i7ie.6xlarge · instance-store NVMe</span>
+      </div>
+    </div>
+    <div class="ycsb" id="ycsb-chart" role="img"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--lt)"></i>lionturtle</span>
+        <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--third)"></i>fjall</span>
+      </div>
+      <span>Bytes written per user byte during load: lionturtle 5.8, RocksDB 7.6, fjall 8.7.</span>
+    </div>
+  </div>
+
+  <div class="durable" id="durable">
+    <div class="multiples" id="multiples"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--lt)"></i>lionturtle</span>
+        <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--third)"></i>ScyllaDB</span>
+      </div>
+      <span>Workload A on 20M records of 1 KB, every update durable · five minutes per rate · EC2 i7ie.6xlarge</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const D = {
+  // BENCHMARKS.md, YCSB at 50M records: thousand ops/s for lionturtle, RocksDB, fjall
+  ycsb: [
+    ["Load", "inserts", 1417, 867, 382],
+    ["Workload A", "50% read, 50% update", 1180, 958, 511],
+    ["Workload B", "95% read, 5% update", 1028, 902, 705],
+    ["Workload C", "100% read", 1041, 883, 732],
+    ["Workload E", "95% scan, 5% insert", 149, 135, 43],
+    ["Workload F", "50% read, 50% read-modify-write", 680, 646, 464],
+  ],
+  // BENCHMARKS.md, durable writes under load: p99 in ms at each offered rate
+  durable: {
+    rates: [11000, 70000, 118000, 150000],
+    read: { lt: [0.18, 0.23, 0.29, 0.35], rocks: [0.20, 4.4, 20, 603], third: [1.4, 9.3] },
+    update: { lt: [0.12, 0.25, 0.37, 0.45], rocks: [0.41, 6.8, 21, 610], third: [1.3, 9.3] },
+  },
+};
+
+const [view, theme] = location.hash.slice(1).split("-");
+if (theme) document.documentElement.dataset.theme = theme;
+if (view) {
+  document.documentElement.classList.add("capture");
+  for (const c of document.querySelector(".wrap").children) c.hidden = c.id !== view;
+}
+
+const fmt = n => n.toLocaleString("en-US");
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+(function ycsb() {
+  const host = document.getElementById("ycsb-chart");
+  const MAX = 1650, ticks = [0, 500, 1000, 1500];
+  const pos = v => (v / MAX) * 100;
+  host.append(el("div", "colhead", "Workload"), el("div", "colhead", "Thousand ops/s"), el("div", "colhead r", "vs RocksDB"));
+  for (const [name, sub, lt, rocks, fjall] of D.ycsb) {
+    const lab = el("div", "row-label");
+    lab.append(el("div", "name", name), el("div", "sub", sub));
+    const tr = el("div", "track");
+    for (const t of ticks) { const g = el("i", t ? "gl" : "gl zero"); g.style.left = pos(t) + "%"; tr.append(g); }
+    for (const [v, color, lead] of [[lt, "var(--lt)", true], [rocks, "var(--rocks)", false], [fjall, "var(--third)", false]]) {
+      const b = el("div", "b"), bar = el("span", "bar");
+      bar.style.width = pos(v) + "%"; bar.style.background = color;
+      b.append(bar, el("span", lead ? "v lead" : "v", fmt(v)));
+      tr.append(b);
+    }
+    host.append(lab, tr, el("div", "ratio", (lt / rocks).toFixed(2) + "×"));
+  }
+  const axis = el("div", "axis");
+  for (const t of ticks) { const s = el("span", null, fmt(t)); s.style.left = pos(t) + "%"; axis.append(s); }
+  host.append(axis, el("div", "axis-cap", "Thousand operations per second"));
+  host.setAttribute("aria-label", "Thousand YCSB operations per second for lionturtle, RocksDB and fjall: " +
+    D.ycsb.map(([n, , a, b, c]) => `${n} ${fmt(a)}, ${fmt(b)} and ${fmt(c)}`).join("; ") + ".");
+})();
+
+(function durable() {
+  const host = document.getElementById("multiples");
+  const S = D.durable, W = 480, H = 300, L = 58, R = 92, T = 14, B = 46;
+  const LO = Math.log10(0.1), HI = Math.log10(1000);
+  const x = v => L + (v / 150000) * (W - L - R);
+  const y = v => T + (1 - (Math.log10(v) - LO) / (HI - LO)) * (H - T - B);
+  const NS = "http://www.w3.org/2000/svg";
+  const sv = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+  const ms = v => v >= 1000 ? v / 1000 + " s" : v + " ms";
+  const series = [["third", "ScyllaDB"], ["rocks", "RocksDB"], ["lt", "lionturtle"]];
+  for (const [title, data] of [["Read p99", S.read], ["Update p99", S.update]]) {
+    const p = el("div", "card panel"); p.append(el("h3", null, title));
+    const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${title} at ${S.rates.map(fmt).join(", ")} durable ops/s, log scale. ` +
+      series.map(([k, n]) => `${n}: ${data[k].map(ms).join(", ")}`).join("; ") + "." });
+    for (const t of [0.1, 1, 10, 100, 1000]) {
+      svg.append(sv("line", { x1: L, x2: W - R + 6, y1: y(t), y2: y(t), stroke: t === 0.1 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+      svg.append(sv("text", { x: L - 8, y: y(t) + 4, "text-anchor": "end" }, ms(t)));
+    }
+    S.rates.forEach(r => svg.append(sv("text", { x: x(r), y: H - 26, "text-anchor": "middle" }, r / 1000 + "k")));
+    svg.append(sv("text", { x: (L + W - R) / 2, y: H - 6, "text-anchor": "middle" }, "durable ops/s offered"));
+    for (const [k, name] of series) {
+      const vals = data[k], color = `var(--${k})`;
+      svg.append(sv("polyline", { points: vals.map((v, i) => `${x(S.rates[i])},${y(v)}`).join(" "), fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      vals.forEach((v, i) => svg.append(sv("circle", { cx: x(S.rates[i]), cy: y(v), r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2 })));
+      const lx = x(S.rates[vals.length - 1]), ly = y(vals[vals.length - 1]);
+      // ScyllaDB stops at 70k, where RocksDB's rising line runs to its right, so its label sits above and to the left.
+      const left = vals.length < S.rates.length;
+      const ax = left ? lx - 10 : lx + 10, dy = left ? -30 : -2, anchor = left ? "end" : "start";
+      svg.append(sv("text", { x: ax, y: ly + dy, class: "lbl", "text-anchor": anchor }, ms(vals[vals.length - 1])));
+      svg.append(sv("text", { x: ax, y: ly + dy + 14, class: "lbl2", "text-anchor": anchor }, name));
+    }
+    p.append(svg); host.append(p);
+  }
+})();
+</script>
+</body>
+</html>
