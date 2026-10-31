@@ -51,8 +51,8 @@ typedef enum lt_status {
    */
   LT_POISONED = 3,
   /**
-   * An argument was out of range: a null pointer, an unknown option, or a
-   * key or value over its size limit (64 KiB and 16 MiB).
+   * An argument was out of range: a null pointer, an unknown option, a
+   * key over 65,535 bytes, or a value over 16 MiB.
    */
   LT_INVALID_ARGUMENT = 4,
   /**
