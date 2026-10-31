@@ -76,7 +76,7 @@ VOPR drives the store on one thread so seeds replay exactly. Each seed draws a s
 
 Threaded tests cover what one thread cannot: concurrent writers, readers and scanners against background checkpoints, and batches that must stay whole to every reader on every memtable, including gets, scans and iterators of all kinds sharing one snapshot.
 
-VOPR seeds and the threaded tests use small stores so that a short history reaches many checkpoints, which leaves out whatever grows only over a long history. A memtable keeps every version of a key, so a key written in every batch, as a commit timestamp is, collects millions of versions in one default-size memtable. The soak test runs the threaded workload at the default options with such a key, for 15 minutes nightly on Linux and macOS: `LIONTURTLE_SOAK_SECS=900 cargo test --release --test concurrency -- --ignored soak_default_options`.
+VOPR seeds and the threaded tests use small stores so that a short history reaches many checkpoints, which leaves out whatever grows only over a long history. A memtable keeps every version of a key, so a key written in every batch, as a commit timestamp is, collects millions of versions in one default-size memtable. The soak test runs the threaded workload at the default options with such a key, for 15 minutes nightly on x86_64 and arm64 Linux and on macOS: `LIONTURTLE_SOAK_SECS=900 cargo test --release --test concurrency -- --ignored soak_default_options`.
 
 ## Code layout
 

@@ -303,11 +303,6 @@ fn atomic_batches_btree() {
     atomic_batches(MemTableKind::BTree);
 }
 
-#[test]
-fn atomic_batches_art() {
-    atomic_batches(MemTableKind::Art8);
-}
-
 /// Many writers queue for the writer lock at once, so each turn serves many
 /// requests, while another thread keeps taking the lock for `sync` and
 /// `last_seq`, which serve no requests. Small memtables rotate every few

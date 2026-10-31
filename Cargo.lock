@@ -211,15 +211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
-name = "congee"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72819224a9c43e0a5d64bdad35a71fde68bf479992fb8989635c72bc547909be"
-dependencies = [
- "crossbeam-epoch",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,7 +675,6 @@ version = "0.1.0"
 dependencies = [
  "bbtree",
  "bytes",
- "congee",
  "crossbeam-skiplist",
  "fjall",
  "hdrhistogram",
@@ -750,7 +740,6 @@ dependencies = [
  "bbtree",
  "boxcar",
  "bytes",
- "congee",
  "crc32c",
  "crossbeam-skiplist",
  "libc",

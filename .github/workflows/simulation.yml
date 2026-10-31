@@ -6,8 +6,9 @@ name: Nightly simulation
 # command.
 #
 # VOPR seeds are short histories on small stores. The soak job runs one long
-# history at the default sizes on Linux and macOS, which catches bugs that
-# grow with the data, such as a key's version chain overflowing a stack.
+# history at the default sizes on x86_64 and arm64 Linux and on macOS, which
+# catches bugs that grow with the data, such as a key's version chain
+# overflowing a stack.
 
 on:
   schedule:
@@ -54,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:

@@ -5,9 +5,9 @@
 //! [`View`] accepts. Writers insert outside the writer lock, so a version
 //! may sit in the table before its batch commits; the view decides which
 //! versions a reader sees. Concurrent writers to one key may insert in any
-//! order; versions stay sorted by sequence number. Four implementations share
-//! the [`MemTable`] trait so the in-memory layer can be compared head to
-//! head.
+//! order; versions stay sorted by sequence number. Three implementations
+//! share the [`MemTable`] trait so the in-memory layer can be compared head
+//! to head.
 
 use crate::types::Value;
 use arc_swap::ArcSwap;
@@ -116,9 +116,6 @@ pub enum MemTableKind {
     BBTree,
     /// std's `BTreeMap` behind a reader-writer lock.
     BTree,
-    /// congee's adaptive radix tree with optimistic lock coupling (ART-OLC),
-    /// the index design C++ TurtleKV uses. Keys must be exactly 8 bytes.
-    Art8,
 }
 
 impl std::str::FromStr for MemTableKind {
@@ -128,7 +125,6 @@ impl std::str::FromStr for MemTableKind {
             "skiplist" => Ok(Self::SkipList),
             "bbtree" => Ok(Self::BBTree),
             "btree" => Ok(Self::BTree),
-            "art" => Ok(Self::Art8),
             _ => Err(format!("unknown memtable kind {s}")),
         }
     }
@@ -139,7 +135,6 @@ pub fn new_memtable(kind: MemTableKind) -> Box<dyn MemTable> {
         MemTableKind::SkipList => Box::new(SkipListTable::default()),
         MemTableKind::BBTree => Box::new(BBTreeTable::default()),
         MemTableKind::BTree => Box::new(BTreeTable::default()),
-        MemTableKind::Art8 => Box::new(ArtTable::default()),
     }
 }
 
@@ -325,174 +320,11 @@ impl MemTable for BTreeTable {
     }
 }
 
-/// An ART over 8-byte keys. The tree maps each key to an index into an
-/// append-only arena of version chains, so readers never see a freed chain;
-/// a replaced chain stays in the arena until the memtable drops.
-#[derive(Default)]
-pub struct ArtTable {
-    art: congee::Congee<usize, usize>,
-    arena: boxcar::Vec<Versions>,
-}
-
-fn art_key(key: &[u8]) -> usize {
-    u64::from_be_bytes(key.try_into().expect("the ART memtable takes 8-byte keys")) as usize
-}
-
-/// The first eight bytes of `key` as an integer, zero-padded, and whether
-/// `key` runs past them.
-fn art_prefix(key: &[u8]) -> (u128, bool) {
-    (crate::types::key_prefix(key) as u128, key.len() > 8)
-}
-
-/// The smallest 8-byte key at or above `start` (or above it, when
-/// `exclusive`), as an integer; 2^64 when there is none.
-fn art_lower(start: &[u8], exclusive: bool) -> u128 {
-    let (p, longer) = art_prefix(start);
-    // A shorter key sorts before its zero-padded form; a longer one after.
-    if longer || (exclusive && start.len() == 8) { p + 1 } else { p }
-}
-
-/// The 8-byte keys below `end` are those below the returned integer.
-fn art_upper(end: Option<&[u8]>) -> u128 {
-    match end {
-        None => 1 << 64,
-        Some(e) => {
-            let (p, longer) = art_prefix(e);
-            if longer { p + 1 } else { p }
-        }
-    }
-}
-
-impl ArtTable {
-    fn visible(&self, i: usize, view: View) -> Option<Value> {
-        self.arena[i].at(view).cloned()
-    }
-}
-
-impl MemTable for ArtTable {
-    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
-        let k = art_key(key);
-        let guard = self.art.pin();
-        // Each version adds a chain to the arena, and the key moves to it only
-        // if no other writer moved the key first.
-        loop {
-            let current = self.art.get(&k, &guard);
-            let next = match current {
-                Some(c) => self.arena[c].with(seq, ticket, value.clone()),
-                None => Versions::new(seq, ticket, value.clone()),
-            };
-            let idx = self.arena.push(next);
-            let mut moved = false;
-            self.art
-                .compute_or_insert(
-                    k,
-                    |old| {
-                        moved = old == current;
-                        if moved { idx } else { old.expect("keys are never removed") }
-                    },
-                    &guard,
-                )
-                .expect("ART allocation failed");
-            if moved {
-                return;
-            }
-        }
-    }
-
-    fn get(&self, key: &[u8], view: View) -> Option<Value> {
-        let guard = self.art.pin();
-        self.visible(self.art.get(&art_key(key), &guard)?, view)
-    }
-
-    fn range(&self, start: Bound<&[u8]>, end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
-        let mut lo = match start {
-            Bound::Included(k) => art_lower(k, false),
-            Bound::Excluded(k) => art_lower(k, true),
-            Bound::Unbounded => 0,
-        };
-        let hi = art_upper(end);
-        let guard = self.art.pin();
-        let mut buf = vec![(0usize, 0usize); limit.clamp(1, 4096)];
-        let mut taken = 0;
-        while taken < limit && lo < hi {
-            // `range` excludes its end, so the largest key needs its own lookup.
-            let to = hi.min(u64::MAX as u128) as usize;
-            let n = self.art.range(&(lo as usize), &to, &mut buf, &guard);
-            for &(k, i) in &buf[..n] {
-                if taken < limit
-                    && let Some(value) = self.visible(i, view)
-                {
-                    out.push((Bytes::copy_from_slice(&(k as u64).to_be_bytes()), value));
-                    taken += 1;
-                }
-            }
-            if n < buf.len() {
-                if taken < limit
-                    && hi > u64::MAX as u128
-                    && lo <= u64::MAX as u128
-                    && let Some(i) = self.art.get(&usize::MAX, &guard)
-                    && let Some(value) = self.visible(i, view)
-                {
-                    out.push((Bytes::copy_from_slice(&u64::MAX.to_be_bytes()), value));
-                }
-                return;
-            }
-            lo = buf[n - 1].0 as u128 + 1;
-        }
-    }
-
-    /// The tree only iterates forward, so this reads ever wider windows
-    /// ending at `end`, which costs about twice the entries it returns.
-    fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>) {
-        let lo = art_lower(start, false);
-        let mut hi = art_upper(end);
-        let mut span: u128 = 1 << 16;
-        let mut taken = 0;
-        let mut window = Vec::new();
-        while taken < limit && lo < hi {
-            let from = hi.saturating_sub(span).max(lo);
-            let to = (hi <= u64::MAX as u128).then(|| (hi as u64).to_be_bytes());
-            window.clear();
-            self.range(Bound::Included(&(from as u64).to_be_bytes()), to.as_ref().map(|t| &t[..]), view, usize::MAX, &mut window);
-            for e in window.drain(..).rev().take(limit - taken) {
-                out.push(e);
-                taken += 1;
-            }
-            hi = from;
-            span = span.saturating_mul(2);
-        }
-    }
-
-    fn for_each(&self, f: &mut dyn FnMut(&[u8], &Value)) {
-        let mut out = Vec::new();
-        let mut start = Bound::Unbounded;
-        let mut last: Option<Bytes>;
-        loop {
-            out.clear();
-            self.range(start, None, &|_, _| true, 4096, &mut out);
-            for (k, v) in &out {
-                f(k, v);
-            }
-            if out.len() < 4096 {
-                return;
-            }
-            last = out.last().map(|(k, _)| k.clone());
-            start = Bound::Excluded(last.as_deref().unwrap());
-        }
-    }
-
-    fn len(&self) -> usize {
-        let mut n = 0;
-        self.for_each(&mut |_, _| n += 1);
-        n
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const KINDS: [MemTableKind; 4] = [MemTableKind::SkipList, MemTableKind::BBTree, MemTableKind::BTree, MemTableKind::Art8];
+    const KINDS: [MemTableKind; 3] = [MemTableKind::SkipList, MemTableKind::BBTree, MemTableKind::BTree];
 
     fn put(v: &'static [u8]) -> Value {
         Value::Put(Bytes::from_static(v))

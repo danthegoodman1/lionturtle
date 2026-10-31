@@ -121,7 +121,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 |---|---|---|
 | `checkpoint_distance` | 32 | Memtable size in leaf-sized batches (χ). Larger cuts write amplification and costs memory. |
 | `cache_bytes` | 1 GiB | Block and page-image cache. A checkpoint keeps its newest quarter of this in unwritten pages, and applying waits once its unwritten pages pass half. |
-| `memtable` | `BBTree` | Memtable implementation: `BBTree`, `SkipList`, `BTree`, or `Art8` (8-byte keys) |
+| `memtable` | `BBTree` | Memtable implementation: `BBTree`, `SkipList`, or `BTree` |
 | `max_frozen` | 2 | Frozen memtables allowed to await checkpointing before writers wait |
 | `wal_buffer_bytes` | 1 MiB | Log bytes buffered before a write to the file |
 | `merge_threads` | 8 | Threads for parallel merges and page writes; 0 uses the caller's rayon pool. Each adds reads in flight and holds memory. |
@@ -159,7 +159,7 @@ cargo test --release                                   # unit, model and threade
 cargo run --release --bin vopr -- --seeds 1000         # 1,000 simulation seeds from a random start
 cargo run --release --bin vopr -- --seed 42 --verbose  # replay one seed
 cargo run --release -p kvbench --features rocksdb -- --engine lionturtle --records 10000000
-cargo run --release -p kvbench --bin indexbench        # bbtree vs ART vs skip list
+cargo run --release -p kvbench --bin indexbench        # bbtree vs skip list vs BTreeMap
 cargo run --release --bin simperf                      # deterministic write amplification across χ
 lionturtle-c/tests/run.sh                              # C and C++ API tests
 cbindgen --config lionturtle-c/cbindgen.toml --crate lionturtle-c --output lionturtle-c/include/lionturtle.h
