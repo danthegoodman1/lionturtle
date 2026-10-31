@@ -16,7 +16,6 @@ workspace = true
 arc-swap = "1.7"
 bbtree = "0.1.5"
 boxcar = "0.2"
-congee = "0.4"
 bytes = "1"
 crc32c = "0.6"
 crossbeam-skiplist = "0.1"

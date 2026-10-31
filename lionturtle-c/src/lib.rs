@@ -44,8 +44,6 @@ pub const LT_MEMTABLE_BBTREE: u32 = 0;
 pub const LT_MEMTABLE_SKIPLIST: u32 = 1;
 /// Rust's BTreeMap behind a reader-writer lock.
 pub const LT_MEMTABLE_BTREE: u32 = 2;
-/// An adaptive radix tree. Every key must be exactly 8 bytes.
-pub const LT_MEMTABLE_ART8: u32 = 3;
 
 /// Settings for lt_open(). Start from lt_options_default(); the
 /// Configuration section of lionturtle's README describes each field.
@@ -87,7 +85,6 @@ impl lt_options {
             LT_MEMTABLE_BBTREE => MemTableKind::BBTree,
             LT_MEMTABLE_SKIPLIST => MemTableKind::SkipList,
             LT_MEMTABLE_BTREE => MemTableKind::BTree,
-            LT_MEMTABLE_ART8 => MemTableKind::Art8,
             other => return Err(invalid(format!("unknown memtable {other}"))),
         };
         Ok(Options {
@@ -300,7 +297,6 @@ pub extern "C" fn lt_options_default() -> lt_options {
             MemTableKind::BBTree => LT_MEMTABLE_BBTREE,
             MemTableKind::SkipList => LT_MEMTABLE_SKIPLIST,
             MemTableKind::BTree => LT_MEMTABLE_BTREE,
-            MemTableKind::Art8 => LT_MEMTABLE_ART8,
         },
         max_frozen: o.max_frozen,
         wal_buffer_bytes: o.wal_buffer_bytes,

@@ -1,6 +1,6 @@
-//! In-memory index comparison: bbtree vs congee (ART-OLC) vs crossbeam's
-//! skip list vs a locked BTreeMap, first as raw u64 -> u64 maps, then as
-//! TurtleKV memtables holding 8-byte keys and 120-byte values.
+//! In-memory index comparison: bbtree vs crossbeam's skip list vs a locked
+//! BTreeMap, first as raw u64 -> u64 maps, then as lionturtle memtables
+//! holding 8-byte keys and 120-byte values.
 //! Usage: indexbench [keys] [threads,threads,...]
 
 #[global_allocator]
@@ -75,24 +75,6 @@ impl Index for Locked {
     }
 }
 
-struct Art(congee::Congee<usize, usize>);
-impl Index for Art {
-    fn insert(&self, k: u64, v: u64) {
-        let g = self.0.pin();
-        self.0.insert(k as usize, v as usize, &g).unwrap();
-    }
-    fn get(&self, k: u64) -> Option<u64> {
-        let g = self.0.pin();
-        self.0.get(&(k as usize), &g).map(|v| v as u64)
-    }
-    fn scan(&self, k: u64, n: usize) -> u64 {
-        let g = self.0.pin();
-        let mut buf = [(0usize, 0usize); 128];
-        let got = self.0.range(&(k as usize), &usize::MAX, &mut buf[..n.min(128)], &g);
-        buf[..got].iter().map(|(_, v)| *v as u64).sum()
-    }
-}
-
 fn run<F: Fn(u64) + Sync>(threads: usize, ops: u64, f: F) -> f64 {
     let t = Instant::now();
     std::thread::scope(|s| {
@@ -118,7 +100,6 @@ fn main() {
     for &t in &threads {
         let indexes: Vec<(&str, Arc<dyn Index>)> = vec![
             ("bbtree", Arc::new(BB(bbtree::BBTreeMap::new()))),
-            ("congee_art", Arc::new(Art(congee::Congee::default()))),
             ("crossbeam_skiplist", Arc::new(Skip(crossbeam_skiplist::SkipMap::new()))),
             ("rwlock_btreemap", Arc::new(Locked(RwLock::new(BTreeMap::new())))),
         ];
@@ -133,16 +114,11 @@ fn main() {
             println!("{name},{t},{ins:.2},{get:.2},{scan:.3}");
         }
     }
-    println!("\n# TurtleKV memtables: 8-byte keys, 120-byte values; Mops/s");
+    println!("\n# lionturtle memtables: 8-byte keys, 120-byte values; Mops/s");
     println!("memtable,threads,insert,get,scan100");
     let value = Bytes::from(vec![7u8; 120]);
     for &t in &threads {
-        for (name, kind) in [
-            ("bbtree", MemTableKind::BBTree),
-            ("art", MemTableKind::Art8),
-            ("skiplist", MemTableKind::SkipList),
-            ("btree", MemTableKind::BTree),
-        ] {
+        for (name, kind) in [("bbtree", MemTableKind::BBTree), ("skiplist", MemTableKind::SkipList), ("btree", MemTableKind::BTree)] {
             let table = new_memtable(kind);
             let ins = run(t, n, |i| table.insert(&mix(i).to_be_bytes(), Value::Put(value.clone()), i, 0));
             let get = run(t, n, |i| {

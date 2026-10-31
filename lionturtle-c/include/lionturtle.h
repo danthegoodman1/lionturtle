@@ -33,11 +33,6 @@
 #define LT_MEMTABLE_BTREE 2
 
 /**
- * An adaptive radix tree. Every key must be exactly 8 bytes.
- */
-#define LT_MEMTABLE_ART8 3
-
-/**
  * The outcome of a call. A call that returns anything but LT_OK leaves a
  * message for lt_last_error().
  */

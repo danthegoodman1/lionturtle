@@ -1,10 +1,12 @@
 //! Multi-threaded stress: writers, readers, and scanners run against a store
 //! whose background thread checkpoints continuously. The VOPR runs on one
 //! thread; this exercises the locks, version swaps, and epoch reclamation.
+//! The VOPR also runs short histories on small stores, so the soak test runs
+//! one long history at the default sizes.
 
 use lionturtle::sim::{FaultConfig, SimStorage};
 use lionturtle::storage::FsStorage;
-use lionturtle::{Db, MemTableKind, Options, TreeConfig};
+use lionturtle::{Db, MemTableKind, Options, TreeConfig, WriteOp};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -12,6 +14,9 @@ use std::time::{Duration, Instant};
 
 const WRITERS: usize = 4;
 const KEYS_PER_WRITER: u64 = 400;
+/// Written in every batch, as a commit timestamp is, so each memtable holds
+/// a version of it per batch.
+const HOT: &[u8] = b"hot";
 
 fn key(w: usize, k: u64) -> Vec<u8> {
     format!("w{w}-k{k:05}").into_bytes()
@@ -27,8 +32,9 @@ fn version_of(v: &[u8]) -> u64 {
     std::str::from_utf8(&v[..10]).unwrap().parse().unwrap()
 }
 
-fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind, secs: u64) {
-    let opts = Options {
+/// Sizes small enough that a few seconds of writes run many checkpoints.
+fn small_options(memtable: MemTableKind) -> Options {
+    Options {
         tree: TreeConfig { leaf_size: 8 << 10, max_pivots: 8, min_pivots: 2, max_segments: 12, max_levels: 4, ..TreeConfig::default() },
         checkpoint_distance: 4,
         cache_bytes: 256 << 10,
@@ -38,7 +44,11 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
         background: true,
         merge_threads: 2,
         pace_checkpoints: true,
-    };
+    }
+}
+
+fn stress(storage: Arc<dyn lionturtle::storage::Storage>, opts: Options, secs: u64) {
+    let memtable = opts.memtable;
     let db = Arc::new(Db::open(storage.clone(), opts.clone()).unwrap());
     // Highest version each key has been written with (published after the
     // write returns), so readers can bound what they see.
@@ -54,11 +64,9 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
                 i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let k = (i >> 33) % KEYS_PER_WRITER;
                 version += 1;
-                if (i >> 20).is_multiple_of(10) {
-                    db.delete(&key(w, k)).unwrap();
-                } else {
-                    db.put(&key(w, k), &value(version, w, k)).unwrap();
-                }
+                let op =
+                    if (i >> 20).is_multiple_of(10) { WriteOp::delete(key(w, k)) } else { WriteOp::put(key(w, k), value(version, w, k)) };
+                db.write(&[op, WriteOp::put(HOT, value(version, w, 0))], false).unwrap();
                 written[w * KEYS_PER_WRITER as usize + k as usize].store(version, Ordering::SeqCst);
             }
         }));
@@ -109,8 +117,12 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
 
     // Every key must hold its final write, before and after a reopen.
     let snapshot: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..WRITERS)
-        .flat_map(|w| (0..KEYS_PER_WRITER).map(move |k| (w, k)))
-        .map(|(w, k)| (key(w, k), db.get(&key(w, k)).unwrap().map(|v| v.to_vec())))
+        .flat_map(|w| (0..KEYS_PER_WRITER).map(move |k| key(w, k)))
+        .chain([HOT.to_vec()])
+        .map(|k| {
+            let v = db.get(&k).unwrap().map(|v| v.to_vec());
+            (k, v)
+        })
         .collect();
     db.checkpoint().unwrap();
     db.check_invariants().unwrap();
@@ -126,21 +138,34 @@ fn stress(storage: Arc<dyn lionturtle::storage::Storage>, memtable: MemTableKind
 
 #[test]
 fn concurrent_bbtree_sim_disk() {
-    stress(Arc::new(SimStorage::new(5, FaultConfig::default())), MemTableKind::BBTree, 4);
+    stress(Arc::new(SimStorage::new(5, FaultConfig::default())), small_options(MemTableKind::BBTree), 4);
 }
 
 #[test]
 fn concurrent_skiplist_real_disk() {
     let dir = std::env::temp_dir().join(format!("lionturtle-stress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    stress(Arc::new(FsStorage::new(&dir).unwrap()), MemTableKind::SkipList, 4);
+    stress(Arc::new(FsStorage::new(&dir).unwrap()), small_options(MemTableKind::SkipList), 4);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The stress workload at the default options for `LIONTURTLE_SOAK_SECS`
+/// seconds (120 by default), long enough for full-size memtables and a hot
+/// key with millions of versions in each. The nightly workflow runs it.
+#[test]
+#[ignore = "runs for minutes"]
+fn soak_default_options() {
+    let secs = std::env::var("LIONTURTLE_SOAK_SECS").map_or(120, |s| s.parse().expect("seconds"));
+    let dir = std::env::temp_dir().join(format!("lionturtle-soak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    stress(Arc::new(FsStorage::new(&dir).unwrap()), Options::default(), secs);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn concurrent_btree_sim_disk() {
     let started = Instant::now();
-    stress(Arc::new(SimStorage::new(6, FaultConfig::default())), MemTableKind::BTree, 3);
+    stress(Arc::new(SimStorage::new(6, FaultConfig::default())), small_options(MemTableKind::BTree), 3);
     assert!(started.elapsed() < Duration::from_secs(120));
 }
 
@@ -276,11 +301,6 @@ fn atomic_batches_skiplist() {
 #[test]
 fn atomic_batches_btree() {
     atomic_batches(MemTableKind::BTree);
-}
-
-#[test]
-fn atomic_batches_art() {
-    atomic_batches(MemTableKind::Art8);
 }
 
 /// Many writers queue for the writer lock at once, so each turn serves many
