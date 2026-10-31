@@ -16,7 +16,7 @@
 use crate::bloom::{self, SharedFilter};
 use crate::error::{Error, Result};
 use crate::memtable::{MemTable, MemTableKind, View, new_memtable};
-use crate::page::{EntryRef, PageBuilder, entry_size};
+use crate::page::{Compression, EntryRef, entry_size};
 use crate::pagestore::{PagePtr, PageStore, Superblock};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, Pace, PageIo};
@@ -74,6 +74,16 @@ pub struct Options {
     /// with none to reuse: a new store's first few, and any that outgrow
     /// the one they reuse. It writes those segments twice, once as zeros.
     pub preallocate_log: bool,
+    /// How data pages written from now on are stored. With
+    /// [`Compression::Lz4`], each block holds about as many entries as
+    /// compress into one 4 KiB page, judged from the pages written before,
+    /// and is compressed on its own as its page is written. Fewer bytes reach
+    /// the drive and the files shrink, while a point read still reads one
+    /// aligned page. Blocks in memory and in the block cache stay
+    /// uncompressed, so only a read from disk decompresses, about 1 µs for a
+    /// block that compressed by half. A store may switch either way between
+    /// opens: each page records how it was stored.
+    pub compression: Compression,
 }
 
 /// A paced checkpoint aims to finish its I/O within this share of the time
@@ -98,6 +108,7 @@ impl Default for Options {
             merge_threads: 8,
             pace_checkpoints: true,
             preallocate_log: false,
+            compression: Compression::None,
         }
     }
 }
@@ -653,14 +664,14 @@ impl Db {
         let max_image = opts.tree.leaf_size * 2 + (1 << 20);
         // Load the tree through a provisional store, then reopen the arenas
         // knowing which slots the tree uses.
-        let probe = PageIo::new(PageStore::open(storage.clone(), &[])?, 0, max_image);
+        let probe = PageIo::new(PageStore::open(storage.clone(), &[])?, 0, max_image, Compression::None);
         let root = sb.root.map(|r| tree::load_tree(&probe, r)).transpose()?;
         let mut live = HashSet::new();
         if let Some(r) = &root {
             tree::reachable(r, &mut live);
         }
         let live_vec: Vec<PagePtr> = live.iter().copied().collect();
-        let io = Arc::new(PageIo::new(PageStore::open(storage.clone(), &live_vec)?, opts.cache_bytes, max_image));
+        let io = Arc::new(PageIo::new(PageStore::open(storage.clone(), &live_vec)?, opts.cache_bytes, max_image, opts.compression));
         io.store.punch_free();
 
         // Replay the log into one memtable.
@@ -1310,7 +1321,7 @@ impl Inner {
         let limit = self.opts.tree.leaf_size;
         let bits = self.opts.tree.filter_bits;
         let capacity = (limit + limit / 16) as usize + 4096;
-        let mut b = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
+        let mut b = self.io.builder(self.next_page_id.fetch_add(1, Relaxed), capacity);
         let mut open = true;
         mem.table.for_each(&mut |key, value| {
             if !open {
@@ -1318,7 +1329,7 @@ impl Inner {
             }
             let e = EntryRef { key, value: value.as_put().map(|v| &v[..]) };
             if !b.is_empty() && b.data_bytes() + e.size() > limit {
-                let next = PageBuilder::with_capacity(self.next_page_id.fetch_add(1, Relaxed), capacity);
+                let next = self.io.builder(self.next_page_id.fetch_add(1, Relaxed), capacity);
                 let full = std::mem::replace(&mut b, next);
                 open = send(Arc::new(DataPage::unwritten(full.finish(bits))));
             }

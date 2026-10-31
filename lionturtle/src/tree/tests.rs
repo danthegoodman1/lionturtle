@@ -15,7 +15,13 @@ impl Harness {
     fn new(cfg: TreeConfig) -> Self {
         let disk = SimStorage::new(1, FaultConfig::default());
         let store = PageStore::open(Arc::new(disk), &[]).unwrap();
-        Self { io: PageIo::new(store, 1 << 20, 1 << 16), cfg, ids: AtomicU64::new(1), root: None, model: BTreeMap::new() }
+        Self {
+            io: PageIo::new(store, 1 << 20, 1 << 16, crate::page::Compression::None),
+            cfg,
+            ids: AtomicU64::new(1),
+            root: None,
+            model: BTreeMap::new(),
+        }
     }
 
     fn ctx(&self) -> Ctx<'_> {

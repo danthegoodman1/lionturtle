@@ -21,6 +21,7 @@ use super::{FaultConfig, Rng, SimStorage};
 use crate::db::{Db, DbIter, Options, Snapshot};
 use crate::error::Error;
 use crate::memtable::MemTableKind;
+use crate::page::Compression;
 use crate::tree::TreeConfig;
 use crate::types::WriteOp;
 use bytes::Bytes;
@@ -118,6 +119,9 @@ struct Sim {
     max_value: usize,
     /// Every key has one length and every value `max_value` bytes.
     fixed_size: bool,
+    /// Whether most values repeat a short random pattern, so that their
+    /// blocks compress, rather than being random throughout.
+    compressible: bool,
     iters: Vec<Iter>,
     snaps: Vec<Snap>,
     report: Report,
@@ -149,6 +153,7 @@ fn random_options(rng: &mut Rng) -> Options {
         merge_threads: 0,
         pace_checkpoints: false,
         preallocate_log: rng.chance(0.5),
+        compression: *rng.pick(&[Compression::None, Compression::Lz4]),
     }
 }
 
@@ -192,8 +197,12 @@ impl Sim {
             keys.insert(k);
         }
         let max_value = rng.range(0, (opts.tree.leaf_size / 4).max(1)) as usize;
+        let compressible = rng.chance(0.5);
         if verbose {
-            eprintln!("options: {opts:?}\nfaults: {:?}\nkeys: {nkeys}, max value: {max_value}, fixed size: {fixed_size}", disk.faults());
+            eprintln!(
+                "options: {opts:?}\nfaults: {:?}\nkeys: {nkeys}, max value: {max_value}, fixed size: {fixed_size}, compressible: {compressible}",
+                disk.faults()
+            );
         }
         Self {
             rng,
@@ -204,6 +213,7 @@ impl Sim {
             keys: keys.into_iter().collect(),
             max_value,
             fixed_size,
+            compressible,
             iters: Vec::new(),
             snaps: Vec::new(),
             report: Report::default(),
@@ -215,8 +225,18 @@ impl Sim {
         self.db.as_ref().expect("db open")
     }
 
-    /// Opens the store, retrying through transient read faults.
+    /// Opens the store, retrying through transient read faults. Some opens
+    /// switch compression, so stores mix pages stored both ways.
     fn open(&mut self) -> Result<(), String> {
+        if self.rng.chance(0.2) {
+            self.opts.compression = match self.opts.compression {
+                Compression::None => Compression::Lz4,
+                Compression::Lz4 => Compression::None,
+            };
+            if self.verbose {
+                eprintln!("compression: {:?}", self.opts.compression);
+            }
+        }
         let mut last_err = String::new();
         let faults = self.disk.faults();
         for attempt in 0..100 {
@@ -256,7 +276,15 @@ impl Sim {
     fn value(&mut self) -> Vec<u8> {
         let len = if self.fixed_size || self.rng.chance(0.1) { self.max_value } else { self.rng.range(0, self.max_value as u64) as usize };
         let mut v = vec![0u8; len];
-        self.rng.fill(&mut v);
+        if self.compressible && self.rng.chance(0.8) {
+            let period = (self.rng.range(1, 17) as usize).min(len);
+            self.rng.fill(&mut v[..period]);
+            for i in period..len {
+                v[i] = v[i - period];
+            }
+        } else {
+            self.rng.fill(&mut v);
+        }
         v
     }
 

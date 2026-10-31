@@ -28,6 +28,7 @@ fn reused_segments_keep_synced_writes() {
             wal_buffer_bytes: 0,
             background: false,
             preallocate_log: seed % 2 == 1,
+            compression: if seed % 3 == 0 { lionturtle::Compression::Lz4 } else { lionturtle::Compression::None },
             ..Options::default()
         };
         let open = || Db::open(Arc::new(disk.clone()), opts.clone()).unwrap();
@@ -81,6 +82,7 @@ fn shared_fsyncs_keep_acknowledged_writes() {
             background: true,
             merge_threads: 2,
             preallocate_log: seed % 2 == 1,
+            compression: if seed % 3 == 0 { lionturtle::Compression::Lz4 } else { lionturtle::Compression::None },
             ..Options::default()
         };
         let db = Arc::new(Db::open(Arc::new(disk.clone()), opts.clone()).unwrap());

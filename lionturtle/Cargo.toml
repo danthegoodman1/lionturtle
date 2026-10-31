@@ -20,6 +20,10 @@ bytes = "1"
 crc32c = "0.6"
 crossbeam-skiplist = "0.1"
 libc = "0.2"
+# The unsafe encoder and decoder are lz4_flex's fastest. checked-decode keeps
+# decoding of a corrupt block within its buffers, and alloc lets a block
+# decompress into a buffer it need not zero first.
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "checked-decode"] }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 parking_lot_core = "0.9"
 quick_cache = "0.6"

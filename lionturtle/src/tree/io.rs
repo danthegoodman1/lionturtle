@@ -5,8 +5,9 @@
 //! cache; after that its blocks come from the cache or from disk.
 
 use crate::error::Result;
-use crate::page::{Block, PageId, PageImage, PageMeta};
+use crate::page::{self, BLOCK_SIZE, Block, Compression, PageBuilder, PageId, PageImage, PageMeta};
 use crate::pagestore::{PagePtr, PageStore};
+use crate::storage::DIRECT_ALIGN;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use quick_cache::sync::Cache;
@@ -14,12 +15,15 @@ use std::cell::Cell;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 pub struct DataPage {
     pub meta: PageMeta,
     ptr: OnceLock<PagePtr>,
+    /// Where each block starts in the stored page, for a page this process
+    /// wrote compressed. A page read back from disk finds them in `meta`.
+    stored_map: OnceLock<Box<[u32]>>,
     pinned: Mutex<Option<Bytes>>,
     /// Whether the cache may hold the whole image. Writing caches it; once
     /// evicted it never returns, so a miss clears this and later reads skip
@@ -39,13 +43,19 @@ impl DataPage {
         // image's allocation.
         let mut meta = image.meta;
         meta.detach();
-        Self { meta, ptr: OnceLock::new(), pinned: Mutex::new(Some(image.bytes)), image_cached: AtomicBool::new(true) }
+        Self {
+            meta,
+            ptr: OnceLock::new(),
+            stored_map: OnceLock::new(),
+            pinned: Mutex::new(Some(image.bytes)),
+            image_cached: AtomicBool::new(true),
+        }
     }
 
     pub fn written(meta: PageMeta, ptr: PagePtr) -> Self {
         let lock = OnceLock::new();
         let _ = lock.set(ptr);
-        Self { meta, ptr: lock, pinned: Mutex::new(None), image_cached: AtomicBool::new(false) }
+        Self { meta, ptr: lock, stored_map: OnceLock::new(), pinned: Mutex::new(None), image_cached: AtomicBool::new(false) }
     }
 
     pub fn id(&self) -> PageId {
@@ -73,6 +83,36 @@ impl DataPage {
     pub fn data_bytes(&self) -> u64 {
         self.meta.data_bytes
     }
+
+    /// Whether the page was stored in the compressed layout, each block on
+    /// pages of its own, rather than as its image.
+    fn stored_compressed(&self) -> bool {
+        self.stored_map.get().is_some() || self.meta.is_stored_compressed()
+    }
+
+    /// Where stored block `b` starts, or where the blocks end for
+    /// `b == n_blocks`, in a page stored compressed.
+    fn stored_offset(&self, ptr: &PagePtr, b: usize) -> u64 {
+        if b == self.meta.n_blocks as usize {
+            return ptr.meta_off as u64;
+        }
+        match self.stored_map.get() {
+            Some(map) => map[b] as u64,
+            None => self.meta.stored_offset(b) as u64,
+        }
+    }
+
+    /// Byte span of `blocks` within the stored page.
+    fn stored_span(&self, ptr: &PagePtr, blocks: Range<usize>) -> (u64, u64) {
+        if !self.stored_compressed() {
+            return self.meta.span(blocks);
+        }
+        if blocks.is_empty() {
+            return (0, 0);
+        }
+        let start = self.stored_offset(ptr, blocks.start);
+        (start, self.stored_offset(ptr, blocks.end) - start)
+    }
 }
 
 #[derive(Clone)]
@@ -88,7 +128,7 @@ impl quick_cache::Weighter<(PageId, u32), Cached> for Weigh {
     fn weight(&self, _key: &(PageId, u32), val: &Cached) -> u64 {
         match val {
             Cached::Image(b) => b.len() as u64,
-            Cached::Block(_) => crate::page::BLOCK_SIZE as u64,
+            Cached::Block(b) => b.raw().len() as u64,
         }
     }
 }
@@ -263,10 +303,24 @@ pub struct PageIo {
     cache: Cache<(PageId, u32), Cached, Weigh, BuildKeyHasher>,
     pub counters: IoCounters,
     pub pacer: Pacer,
+    /// How pages written from here on are stored.
+    compression: Compression,
+    /// Buffers that pages are written from, kept so that each write reuses
+    /// memory already faulted in rather than zeroing a fresh allocation.
+    write_bufs: Mutex<Vec<Vec<u8>>>,
+    /// Largest buffer worth keeping: one for a page of the largest usual size.
+    max_write_buf: usize,
+    /// Bytes each block of a page built for compression holds: about what
+    /// compresses into one page, judged from recent pages.
+    block_target: AtomicUsize,
 }
 
+/// Share of a page that a block compressing at the learned ratio fills,
+/// leaving room for pages that compress worse than the ones before them.
+const COMPRESSED_FILL: f64 = 0.97;
+
 impl PageIo {
-    pub fn new(store: PageStore, cache_bytes: u64, max_image: u64) -> Self {
+    pub fn new(store: PageStore, cache_bytes: u64, max_image: u64, compression: Compression) -> Self {
         // Every shard must hold a few whole page images.
         let shards = (cache_bytes / (max_image.max(1) * 4)).clamp(1, 64) as usize;
         let options = quick_cache::OptionsBuilder::new()
@@ -280,7 +334,57 @@ impl PageIo {
             cache: Cache::with_options(options, Weigh, BuildKeyHasher::default(), Default::default()),
             counters: IoCounters::default(),
             pacer: Pacer::default(),
+            compression,
+            write_bufs: Mutex::new(Vec::new()),
+            max_write_buf: (max_image + max_image / 8) as usize + (2 << 20),
+            block_target: AtomicUsize::new(BLOCK_SIZE),
         }
+    }
+
+    /// A builder for a page this store will write, its blocks laid out for
+    /// how the store compresses.
+    pub fn builder(&self, id: PageId, capacity: usize) -> PageBuilder {
+        let b = PageBuilder::with_capacity(id, capacity);
+        match self.compression {
+            Compression::None => b,
+            Compression::Lz4 => b.for_compression(self.block_target.load(Relaxed)),
+        }
+    }
+
+    /// Aims later blocks at a size whose compressed form fits one page,
+    /// given that nearly every block of a page just written compressed by
+    /// `ratio` or better. Aiming at the worst blocks rather than the
+    /// average keeps a block from spilling into a second page, which costs
+    /// more than the space the average leaves unused. The target starts at
+    /// one page, where nothing can shrink by a page, and moves halfway to
+    /// each page's estimate.
+    fn learn_ratio(&self, ratio: Option<f64>) {
+        let Some(ratio) = ratio else { return };
+        let ratio = ratio.max(1e-3);
+        let target = ((COMPRESSED_FILL * page::PAGE_PAYLOAD as f64 / ratio) as usize).clamp(BLOCK_SIZE, page::MAX_COMPRESSED_BLOCK);
+        let old = self.block_target.load(Relaxed);
+        self.block_target.store((old + target) / 2, Relaxed);
+    }
+
+    /// Runs `f` on a buffer of `len` bytes, rounded up to a multiple of
+    /// [`DIRECT_ALIGN`], at an aligned address. Its contents are arbitrary.
+    fn with_write_buf<R>(&self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let len = len.next_multiple_of(DIRECT_ALIGN);
+        let need = len + DIRECT_ALIGN;
+        let kept = {
+            let mut bufs = self.write_bufs.lock();
+            bufs.iter().position(|b| b.len() >= need).map(|i| bufs.swap_remove(i))
+        };
+        let mut buf = kept.unwrap_or_else(|| vec![0u8; need]);
+        let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        let r = f(&mut buf[start..start + len]);
+        if buf.len() <= self.max_write_buf {
+            let mut bufs = self.write_bufs.lock();
+            if bufs.len() < self.page_writers() {
+                bufs.push(buf);
+            }
+        }
+        r
     }
 
     /// The page's whole image, if the cache holds it. Only merges, which read
@@ -320,13 +424,14 @@ impl PageIo {
             return Ok(block);
         }
         let ptr = page.ptr().expect("unpinned page is written");
+        let (off, len) = page.stored_span(&ptr, b..b + 1);
         let t = Instant::now();
-        let bytes = self.store.read(&ptr, info.offset as u64, info.len as u64)?;
+        let bytes = self.store.read(&ptr, off, len)?;
         if t.elapsed() > DEVICE_READ {
             PREFETCH_BUDGET.set(PREFETCH_RENEW);
         }
         self.counters.block_reads.fetch_add(1, Relaxed);
-        let block = Block::decode(bytes, id)?;
+        let block = if page.stored_compressed() { Block::decode_stored(bytes, id)? } else { Block::decode(bytes, id)? };
         self.cache.insert((id, b as u32), Cached::Block(block.clone()));
         Ok(block)
     }
@@ -357,8 +462,8 @@ impl PageIo {
         };
         for (page, b) in [first, second].into_iter().chain(cold) {
             if let Some(ptr) = page.ptr() {
-                let info = page.meta.block(*b);
-                self.store.prefetch(&ptr, info.offset as u64, info.len as u64);
+                let (off, len) = page.stored_span(&ptr, *b..*b + 1);
+                self.store.prefetch(&ptr, off, len);
             }
         }
     }
@@ -373,17 +478,17 @@ impl PageIo {
             return;
         }
         if let Some(ptr) = page.ptr() {
-            let (off, len) = page.meta.span(blocks);
+            let (off, len) = page.stored_span(&ptr, blocks);
             self.store.prefetch(&ptr, off, len);
         }
     }
 
-    /// The bytes of `blocks`, contiguous, for sequential reading, and whether
-    /// they came from disk (so their checksums need verifying). The first
-    /// returned byte is the start of `blocks.start`. Reads from disk bypass
-    /// the cache, since merges consume what they read.
+    /// The bytes of `blocks`, contiguous and laid out as in the image, for
+    /// sequential reading, and whether they still need their checksums
+    /// verified. The first returned byte is the start of `blocks.start`.
+    /// Reads from disk bypass the cache, since merges consume what they read.
     pub fn span(&self, page: &DataPage, blocks: Range<usize>) -> Result<(Bytes, bool)> {
-        let (off, len) = page.meta.span(blocks);
+        let (off, len) = page.meta.span(blocks.clone());
         let range = off as usize..(off + len) as usize;
         if let Some(image) = page.pinned() {
             return Ok((image.slice(range), false));
@@ -392,10 +497,38 @@ impl PageIo {
             return Ok((image.slice(range), false));
         }
         let ptr = page.ptr().expect("unpinned page is written");
+        let (stored_off, stored_len) = page.stored_span(&ptr, blocks.clone());
         self.counters.span_reads.fetch_add(1, Relaxed);
-        self.counters.span_read_bytes.fetch_add(len, Relaxed);
-        self.pacer.take(len);
-        Ok((self.store.read(&ptr, off, len)?, true))
+        self.counters.span_read_bytes.fetch_add(stored_len, Relaxed);
+        self.pacer.take(stored_len);
+        let stored = self.store.read(&ptr, stored_off, stored_len)?;
+        if !page.stored_compressed() {
+            return Ok((stored, true));
+        }
+        // Decompress each block straight into its place in the image layout.
+        // Each block's checksum is verified on the way, so the caller has
+        // none left to check.
+        let mut raw = vec![0u8; len as usize];
+        for b in blocks {
+            let s = (page.stored_offset(&ptr, b) - stored_off) as usize;
+            let e = (page.stored_offset(&ptr, b + 1) - stored_off) as usize;
+            let info = page.meta.block(b);
+            let at = (info.offset as u64 - off) as usize;
+            page::inflate_into(&stored[s..e], page.id(), &mut raw[at..at + info.len as usize])?;
+        }
+        Ok((Bytes::from(raw), false))
+    }
+
+    /// Threads that write a checkpoint's queued pages. Each writes one page
+    /// at a time and waits for it to reach the device, so two keep the drive
+    /// busy. With compression, each spends longer compressing a page than
+    /// writing it: on a RAM-backed store loading 3M records a second, two
+    /// left writers waiting on checkpoints for up to 0.4 s, and four never.
+    pub fn page_writers(&self) -> usize {
+        match self.compression {
+            Compression::None => 2,
+            Compression::Lz4 => 4,
+        }
     }
 
     /// Bytes per write of a page: [`PACED_WRITE`] while the checkpoint is
@@ -408,10 +541,30 @@ impl PageIo {
     /// page into the cache. Returns true if an arena file was created.
     pub fn write(&self, page: &DataPage) -> Result<bool> {
         let image = page.pinned().expect("unwritten page is pinned");
-        let ptr = self.store.allocate(page.id(), image.len() as u64, page.meta.meta_off)?;
-        let created = self.store.write(&ptr, &image, self.write_piece(), &|n| self.pacer.take(n))?;
+        let pace = |n| self.pacer.take(n);
+        // The stored page is built in an aligned buffer, checksummed as it
+        // goes, and written from there.
+        let (ptr, created) = match self.compression {
+            Compression::None => self.with_write_buf(image.len(), |out| {
+                out[..image.len()].copy_from_slice(&image);
+                page::seal_blocks(&mut out[..image.len()], &page.meta);
+                out[image.len()..].fill(0);
+                let ptr = self.store.allocate(page.id(), image.len() as u64, page.meta.meta_off)?;
+                Ok::<_, crate::Error>((ptr, self.store.write_aligned(&ptr, out, self.write_piece(), &pace)?))
+            })?,
+            Compression::Lz4 => self.with_write_buf(page::compressed_bound(&page.meta), |out| {
+                let stored = page::compress_image(&image, &page.meta, out);
+                self.learn_ratio(stored.fit_ratio);
+                let padded = stored.len.next_multiple_of(DIRECT_ALIGN);
+                out[stored.len..padded].fill(0);
+                let ptr = self.store.allocate(page.id(), stored.len as u64, stored.meta_off)?;
+                let created = self.store.write_aligned(&ptr, &out[..padded], self.write_piece(), &pace)?;
+                page.stored_map.set(stored.map).expect("page written once");
+                Ok::<_, crate::Error>((ptr, created))
+            })?,
+        };
         self.counters.pages_written.fetch_add(1, Relaxed);
-        self.counters.page_bytes_written.fetch_add(image.len() as u64, Relaxed);
+        self.counters.page_bytes_written.fetch_add(ptr.len as u64, Relaxed);
         // Cache the image before publishing the pointer, so a reader that
         // sees the page written finds the image.
         self.cache.insert((page.id(), IMAGE), Cached::Image(image));
@@ -556,5 +709,47 @@ mod tests {
             pacer.take(500);
         });
         assert!(t.elapsed() < Duration::from_secs(10), "waited {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn compressed_blocks_learn_to_fill_their_pages() {
+        use crate::page::EntryRef;
+        use crate::sim::{FaultConfig, SimStorage};
+        let store = PageStore::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), &[]).unwrap();
+        let io = PageIo::new(store, 1 << 20, 4 << 20, Compression::Lz4);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut fill = 0.0;
+        for id in 1..=6u64 {
+            // 120-byte values whose last 56 bytes repeat their first.
+            let mut b = io.builder(id, 2 << 20);
+            for i in 0..15_000u64 {
+                let mut value = [0u8; 120];
+                for chunk in value[..64].chunks_mut(8) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    chunk.copy_from_slice(&seed.to_le_bytes());
+                }
+                value.copy_within(..56, 64);
+                b.push(EntryRef { key: &(id << 32 | i).to_be_bytes(), value: Some(&value) });
+            }
+            let image = b.finish(10);
+            let (bytes, meta) = (image.bytes.clone(), image.meta.clone());
+            io.write(&DataPage::unwritten(image)).unwrap();
+
+            // Each block of the page, but for its last, fits one page.
+            let mut out = vec![0u8; page::compressed_bound(&meta)];
+            let stored = page::compress_image(&bytes, &meta, &mut out);
+            let n = stored.map.len() - 1;
+            assert_eq!(stored.map[n] as usize, n * BLOCK_SIZE, "page {id}: a block spilled into a second page");
+            let header = |at: u32, field: usize| u32::from_le_bytes(out[at as usize + field..][..4].try_into().unwrap());
+            let compressed = stored.map[..n].iter().filter(|&&at| header(at, 4) == u32::MAX);
+            let used: usize = compressed.map(|&at| 16 + header(at, 12) as usize).sum();
+            fill = used as f64 / (n * BLOCK_SIZE) as f64;
+        }
+        // The first pages, sized for one raw page each, teach the store how
+        // well the values compress; by the last, nearly all of every page
+        // holds compressed data.
+        assert!(fill > 0.9, "compressed blocks fill {fill:.3} of their pages");
     }
 }

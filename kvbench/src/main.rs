@@ -72,6 +72,12 @@ pub struct Args {
     pub pace: bool,
     /// Zero-fill lionturtle log segments ahead of their writes.
     pub preallocate_log: bool,
+    /// How every engine stores its data blocks: none, or each block on its
+    /// own with LZ4.
+    pub compression: lionturtle::Compression,
+    /// Share of each value that is random; the rest repeats it, so values
+    /// compress to about this share of their size.
+    pub compression_ratio: f64,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
     pub timeline: Option<String>,
@@ -144,6 +150,12 @@ fn parse_args() -> Args {
         rate: get("--rate").map_or_else(Vec::new, |r| parse_rate(&r)),
         pace: num("--pace", 1) == 1,
         preallocate_log: num("--preallocate-log", 0) == 1,
+        compression: match get("--compression").as_deref() {
+            None | Some("none") => lionturtle::Compression::None,
+            Some("lz4") => lionturtle::Compression::Lz4,
+            Some(other) => panic!("unknown --compression {other}; use none or lz4"),
+        },
+        compression_ratio: get("--compression-ratio").map_or(1.0, |v| v.parse().expect("--compression-ratio")),
         uniform: num("--uniform", 0) == 1,
         timeline: get("--timeline"),
     }
@@ -292,7 +304,7 @@ fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
     let handles: Vec<_> = (0..args.load_threads)
         .map(|t| {
             let (engine, next) = (engine.clone(), next.clone());
-            let (records, vsize) = (args.records, args.value_size);
+            let (records, vsize, ratio) = (args.records, args.value_size, args.compression_ratio);
             std::thread::spawn(move || {
                 let mut hist = new_hists();
                 let mut rng = Rng::new(0xC0FFEE + t as u64);
@@ -303,7 +315,7 @@ fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
                         break;
                     }
                     for i in start..(start + 1024).min(records) {
-                        rng.fill(&mut value);
+                        rng.fill_value(&mut value, ratio);
                         let t0 = Instant::now();
                         engine.put(&key_of(i), &value, false);
                         hist[2].record(t0.elapsed().as_nanos() as u64).ok();
@@ -355,6 +367,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
             let timeline = timeline.clone();
             let mix = mix.clone();
             let (vsize, sync, uniform, threads) = (args.value_size, args.sync, args.uniform, args.threads as f64);
+            let ratio = args.compression_ratio;
             let schedule = args.rate.clone();
             let seed = phase.as_bytes()[0] as u64 * 1000 + t as u64;
             std::thread::spawn(move || {
@@ -397,12 +410,12 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                             engine.get(&key_of(item));
                         }
                         Op::Update => {
-                            rng.fill(&mut value);
+                            rng.fill_value(&mut value, ratio);
                             engine.put(&key_of(item), &value, sync);
                         }
                         Op::Insert => {
                             let id = records.fetch_add(1, Ordering::Relaxed);
-                            rng.fill(&mut value);
+                            rng.fill_value(&mut value, ratio);
                             engine.put(&key_of(id), &value, sync);
                         }
                         Op::Scan => {
@@ -411,7 +424,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                         }
                         Op::Rmw => {
                             engine.get(&key_of(item));
-                            rng.fill(&mut value);
+                            rng.fill_value(&mut value, ratio);
                             engine.put(&key_of(item), &value, sync);
                         }
                     }

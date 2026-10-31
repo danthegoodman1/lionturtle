@@ -33,6 +33,16 @@
 #define LT_MEMTABLE_BTREE 2
 
 /**
+ * Data blocks stored as they are: the default.
+ */
+#define LT_COMPRESSION_NONE 0
+
+/**
+ * Each data block compressed on its own with LZ4.
+ */
+#define LT_COMPRESSION_LZ4 1
+
+/**
  * The outcome of a call. A call that returns anything but LT_OK leaves a
  * message for lt_last_error().
  */
@@ -103,6 +113,11 @@ typedef struct lt_options {
    * One of the LT_MEMTABLE_* values.
    */
   uint32_t memtable;
+  /**
+   * One of the LT_COMPRESSION_* values: how data pages written from now
+   * on are stored.
+   */
+  uint32_t compression;
   /**
    * Frozen memtables allowed to await checkpointing before writers wait.
    */
