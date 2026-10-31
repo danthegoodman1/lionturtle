@@ -8,6 +8,11 @@ lionturtle is an embedded key-value store in Rust for Linux and for macOS on App
 
 The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/ycsb-dark.png">
+  <img src="docs/images/ycsb-light.png" alt="YCSB on 50M records of 128 bytes with 16 client threads, in thousand operations per second for lionturtle, RocksDB and fjall: load 1,417, 867 and 382; workload A 1,180, 958 and 511; B 1,028, 902 and 705; C 1,041, 883 and 732; E 149, 135 and 43; F 680, 646 and 464. lionturtle runs 1.05 to 1.63 times RocksDB's rate.">
+</picture>
+
 ## Features
 
 **Fewer bytes written.** A key overwritten within one checkpoint reaches disk once. Loading 50M records wrote 5.8 bytes per user byte, against 7.6 for RocksDB and 8.7 for fjall.
@@ -39,7 +44,12 @@ YCSB on 50M records of 128 bytes, with 16 client threads under a 4 GB memory cap
 | E: 95% scan, 5% insert | 149 | 135 | 43 |
 | F: 50% read, 50% read-modify-write | 680 | 646 | 464 |
 
-Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns:
+Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns. Each engine ran five minutes at each fixed rate. As the rate rises, RocksDB's deferred compaction pushes its p99 past 600 ms, while lionturtle's stays under half a millisecond:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/durable-dark.png">
+  <img src="docs/images/durable-light.png" alt="p99 latency at 11k, 70k, 118k and 150k durable operations per second, on a log scale. Read p99: lionturtle 0.18, 0.23, 0.29 and 0.35 ms; RocksDB 0.20, 4.4, 20 and 603 ms; ScyllaDB 1.4 and 9.3 ms at 11k and 70k. Update p99: lionturtle 0.12, 0.25, 0.37 and 0.45 ms; RocksDB 0.41, 6.8, 21 and 610 ms; ScyllaDB 1.3 and 9.3 ms.">
+</picture>
 
 | Durable ops/s | Engine | Read p99 | Read p999 | Update p99 | Update p999 |
 |---|---|--:|--:|--:|--:|
@@ -166,6 +176,6 @@ lionturtle-c/tests/run.sh                              # C and C++ API tests
 cbindgen --config lionturtle-c/cbindgen.toml --crate lionturtle-c --output lionturtle-c/include/lionturtle.h
 ```
 
-The last command regenerates the C header after a change to `lionturtle-c/src/lib.rs`.
+The last command regenerates the C header after a change to `lionturtle-c/src/lib.rs`. The README's charts come from the data in `docs/images/charts.html`; after editing it, `docs/images/render.sh` renders them again with headless Firefox and ImageMagick.
 
 CI runs rustfmt, clippy with warnings as errors, the Rust, C and C++ tests on x86_64 and arm64 Linux and on Apple silicon macOS, a check that the C header matches the bindings, and 300 simulation seeds on every pull request, plus 10,000 seeds nightly. Each merge to `main` publishes a new version to crates.io and attaches the C libraries to its GitHub release.
