@@ -31,8 +31,8 @@ pub enum lt_status {
     LT_CORRUPTION = 2,
     /// An earlier write failed, and the store refuses work until reopened.
     LT_POISONED = 3,
-    /// An argument was out of range: a null pointer, an unknown option, or a
-    /// key or value over its size limit (64 KiB and 16 MiB).
+    /// An argument was out of range: a null pointer, an unknown option, a
+    /// key over 65,535 bytes, or a value over 16 MiB.
     LT_INVALID_ARGUMENT = 4,
     /// lionturtle panicked, which is a bug. The store may be unusable.
     LT_PANIC = 5,
