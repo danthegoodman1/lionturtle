@@ -24,7 +24,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(dir);
     let storage = Arc::new(FsStorage::new(dir).unwrap());
     let cfg = TreeConfig { leaf_size: leaf_kb << 10, parallel, ..Default::default() };
-    let io = PageIo::new(PageStore::open(storage, &[]).unwrap(), 1 << 30, cfg.leaf_size * 3);
+    let io = PageIo::new(PageStore::open(storage, &[]).unwrap(), 1 << 30, cfg.leaf_size * 3, lionturtle::Compression::None);
     let ids = AtomicU64::new(1);
     let ctx = Ctx { cfg: &cfg, io: &io, next_page_id: &ids };
     let mut root = None;

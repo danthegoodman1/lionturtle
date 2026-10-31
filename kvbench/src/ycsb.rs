@@ -32,6 +32,20 @@ impl Rng {
             chunk.copy_from_slice(&b[..chunk.len()]);
         }
     }
+
+    /// Fills a value that compresses to about `ratio` of its size, as
+    /// db_bench's --compression_ratio does: random bytes for that share of
+    /// it, repeated to fill the rest.
+    pub fn fill_value(&mut self, buf: &mut [u8], ratio: f64) {
+        let random = ((buf.len() as f64 * ratio).ceil() as usize).clamp(1, buf.len().max(1)).min(buf.len());
+        self.fill(&mut buf[..random]);
+        let mut filled = random;
+        while filled < buf.len() {
+            let n = random.min(buf.len() - filled);
+            buf.copy_within(..n, filled);
+            filled += n;
+        }
+    }
 }
 
 /// splitmix64's finalizer: a bijection on u64, so distinct ids give

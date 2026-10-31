@@ -743,6 +743,7 @@ dependencies = [
  "crc32c",
  "crossbeam-skiplist",
  "libc",
+ "lz4_flex 0.14.0",
  "mimalloc",
  "parking_lot",
  "parking_lot_core",

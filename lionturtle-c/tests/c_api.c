@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
   CHECK(argc == 2);
   lt_options opts = lt_options_default();
   opts.cache_bytes = 64 << 20;
+  opts.compression = LT_COMPRESSION_LZ4;
   lt_db *db = NULL;
   OK(lt_open(argv[1], &opts, &db));
 
@@ -112,12 +113,16 @@ int main(int argc, char **argv) {
   CHECK(lt_open(NULL, NULL, &none) == LT_INVALID_ARGUMENT && none == NULL);
   opts.memtable = 99;
   CHECK(lt_open(argv[1], &opts, &none) == LT_INVALID_ARGUMENT && none == NULL);
+  opts.memtable = LT_MEMTABLE_BBTREE;
+  opts.compression = 99;
+  CHECK(lt_open(argv[1], &opts, &none) == LT_INVALID_ARGUMENT && none == NULL);
 
   OK(lt_checkpoint(db));
   OK(lt_sync(db));
   lt_close(db);
 
-  /* Every write survives a reopen with default options. */
+  /* Every write survives a reopen with default options, which read the
+     pages the checkpoint stored compressed. */
   OK(lt_open(argv[1], NULL, &db));
   expect(db, NULL, "a", NULL);
   expect(db, NULL, "b", "2");

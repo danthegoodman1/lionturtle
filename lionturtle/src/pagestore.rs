@@ -243,13 +243,21 @@ impl PageStore {
     /// length before it. Returns true if this created an arena file.
     pub fn write(&self, ptr: &PagePtr, image: &[u8], piece: usize, pace: &dyn Fn(u64)) -> Result<bool> {
         debug_assert_eq!(image.len(), ptr.len as usize);
-        let (file, created) = self.direct_file(ptr.class)?;
         let len = image.len().next_multiple_of(DIRECT_ALIGN);
         let mut buf = vec![0u8; len + DIRECT_ALIGN];
         let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
         let buf = &mut buf[start..start + len];
         buf[..image.len()].copy_from_slice(image);
-        let piece = piece.min(len).max(DIRECT_ALIGN).next_multiple_of(DIRECT_ALIGN);
+        self.write_aligned(ptr, buf, piece, pace)
+    }
+
+    /// Writes a page to its slot from `buf`, whose address and length are
+    /// multiples of [`DIRECT_ALIGN`], as [`PageStore::write`] does.
+    pub fn write_aligned(&self, ptr: &PagePtr, buf: &[u8], piece: usize, pace: &dyn Fn(u64)) -> Result<bool> {
+        debug_assert_eq!(buf.len(), (ptr.len as usize).next_multiple_of(DIRECT_ALIGN));
+        debug_assert_eq!(buf.as_ptr().align_offset(DIRECT_ALIGN), 0);
+        let (file, created) = self.direct_file(ptr.class)?;
+        let piece = piece.min(buf.len()).max(DIRECT_ALIGN).next_multiple_of(DIRECT_ALIGN);
         for (i, part) in buf.chunks(piece).enumerate() {
             pace(part.len() as u64);
             file.write_all_at(part, ptr.offset() + (i * piece) as u64)?;

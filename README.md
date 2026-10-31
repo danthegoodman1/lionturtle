@@ -6,7 +6,7 @@
 
 lionturtle is an embedded key-value store in Rust for Linux and for macOS on Apple silicon. It is a modified version of [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)): it keeps TurtleKV's TurtleTree, paces its background I/O after [SILK](https://www.usenix.org/conference/atc19/presentation/balmau), and borrows group commit and log recycling from LSM stores such as RocksDB, to keep throughput high and tail latency low.
 
-The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
+The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every uncompressed YCSB workload measured, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/ycsb-dark.png">
@@ -26,6 +26,8 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 **Snapshots.** `Db::snapshot` returns a handle that any number of reads and iterators can share, and every read through it sees the same batches. Each iterator is a snapshot too.
 
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
+
+**Compression that reads one page per miss.** With `compression: Lz4`, each block holds about as many entries as compress into one 4 KiB page, so a read that misses the cache still reads one aligned page. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload by 12–32% ([results](BENCHMARKS.md#compression)).
 
 **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through crashes, torn writes, read errors and bit flips on a simulated disk, and checks every answer and every recovery against a model. A failing seed replays exactly.
 
@@ -138,6 +140,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `background` | true | Checkpoint on background threads; with false, callers drive `checkpoint_step` |
 | `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
 | `preallocate_log` | false | Zero-fill each log segment a few MiB ahead of its writes, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first segments and writes them twice. |
+| `compression` | `None` | `Lz4` sizes each data block to compress into one 4 KiB page and compresses it as its page is written, so a point read still reads one page. Cached blocks stay uncompressed, so only reads from disk decompress. A store may switch either way between opens. |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
@@ -153,7 +156,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | Transactions | None | Pessimistic and optimistic | Serializable single-writer; optimistic with conflict checks |
 | Namespaces | One keyspace | Column families | Keyspaces |
 | Iteration | Forward, reverse, prefix | Forward, reverse, prefix | Forward, reverse, prefix |
-| Compression | None | Several codecs | LZ4 |
+| Compression | LZ4 per block, opt-in | Several codecs | LZ4 |
 | Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while two frozen memtables await checkpoints | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 

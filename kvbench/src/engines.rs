@@ -60,6 +60,7 @@ impl Turtle {
             merge_threads: args.merge_threads,
             pace_checkpoints: args.pace,
             preallocate_log: args.preallocate_log,
+            compression: args.compression,
         };
         let storage = Arc::new(lionturtle::storage::FsStorage::new(&args.dir).unwrap());
         Self { db: lionturtle::Db::open(storage, opts).unwrap() }
@@ -137,12 +138,16 @@ impl Fjall {
             .unwrap();
         let memtable = args.memtable_bytes();
         let manual = args.fjall_manual_persist;
+        let compression = match args.compression {
+            lionturtle::Compression::None => fjall::CompressionType::None,
+            lionturtle::Compression::Lz4 => fjall::CompressionType::Lz4,
+        };
         let ks = db
             .keyspace("bench", move || {
                 fjall::KeyspaceCreateOptions::default()
                     .max_memtable_size(memtable)
                     .manual_journal_persist(manual)
-                    .data_block_compression_policy(fjall::config::CompressionPolicy::all(fjall::CompressionType::None))
+                    .data_block_compression_policy(fjall::config::CompressionPolicy::all(compression))
             })
             .unwrap();
         Self { db, ks }
@@ -196,7 +201,10 @@ impl Rocks {
         block.set_bloom_filter(10.0, false);
         block.set_cache_index_and_filter_blocks(false);
         opts.set_block_based_table_factory(&block);
-        opts.set_compression_type(rocksdb::DBCompressionType::None);
+        opts.set_compression_type(match args.compression {
+            lionturtle::Compression::None => rocksdb::DBCompressionType::None,
+            lionturtle::Compression::Lz4 => rocksdb::DBCompressionType::Lz4,
+        });
         // Buffer the log in memory like the other engines, unless writes
         // sync.
         opts.set_manual_wal_flush(!args.sync);

@@ -63,6 +63,7 @@ pub fn run(cfg: &PerfConfig) -> PerfReport {
         merge_threads: 0,
         pace_checkpoints: false,
         preallocate_log: false,
+        compression: Default::default(),
     };
     let db = Db::open(Arc::new(disk.clone()), opts).expect("open");
     let mut value = vec![0u8; cfg.value_size];

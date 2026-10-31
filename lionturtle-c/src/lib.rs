@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lionturtle::storage::FsStorage;
-use lionturtle::{Db, DbIter, Error, MemTableKind, Options, Result, Snapshot, TreeConfig, WriteOp};
+use lionturtle::{Compression, Db, DbIter, Error, MemTableKind, Options, Result, Snapshot, TreeConfig, WriteOp};
 
 /// The outcome of a call. A call that returns anything but LT_OK leaves a
 /// message for lt_last_error().
@@ -45,6 +45,11 @@ pub const LT_MEMTABLE_SKIPLIST: u32 = 1;
 /// Rust's BTreeMap behind a reader-writer lock.
 pub const LT_MEMTABLE_BTREE: u32 = 2;
 
+/// Data blocks stored as they are: the default.
+pub const LT_COMPRESSION_NONE: u32 = 0;
+/// Each data block compressed on its own with LZ4.
+pub const LT_COMPRESSION_LZ4: u32 = 1;
+
 /// Settings for lt_open(). Start from lt_options_default(); the
 /// Configuration section of lionturtle's README describes each field.
 #[repr(C)]
@@ -56,6 +61,9 @@ pub struct lt_options {
     pub cache_bytes: u64,
     /// One of the LT_MEMTABLE_* values.
     pub memtable: u32,
+    /// One of the LT_COMPRESSION_* values: how data pages written from now
+    /// on are stored.
+    pub compression: u32,
     /// Frozen memtables allowed to await checkpointing before writers wait.
     pub max_frozen: usize,
     /// Log bytes buffered before a write to the file.
@@ -90,6 +98,11 @@ impl lt_options {
             LT_MEMTABLE_BTREE => MemTableKind::BTree,
             other => return Err(invalid(format!("unknown memtable {other}"))),
         };
+        let compression = match self.compression {
+            LT_COMPRESSION_NONE => Compression::None,
+            LT_COMPRESSION_LZ4 => Compression::Lz4,
+            other => return Err(invalid(format!("unknown compression {other}"))),
+        };
         Ok(Options {
             tree: TreeConfig {
                 leaf_size: self.leaf_size,
@@ -107,6 +120,7 @@ impl lt_options {
             merge_threads: self.merge_threads,
             pace_checkpoints: self.pace_checkpoints,
             preallocate_log: self.preallocate_log,
+            compression,
         })
     }
 }
@@ -301,6 +315,10 @@ pub extern "C" fn lt_options_default() -> lt_options {
             MemTableKind::BBTree => LT_MEMTABLE_BBTREE,
             MemTableKind::SkipList => LT_MEMTABLE_SKIPLIST,
             MemTableKind::BTree => LT_MEMTABLE_BTREE,
+        },
+        compression: match o.compression {
+            Compression::None => LT_COMPRESSION_NONE,
+            Compression::Lz4 => LT_COMPRESSION_LZ4,
         },
         max_frozen: o.max_frozen,
         wal_buffer_bytes: o.wal_buffer_bytes,

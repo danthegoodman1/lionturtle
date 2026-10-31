@@ -15,4 +15,5 @@ pub mod tree;
 
 pub use db::{Db, DbIter, DbStats, Options, Snapshot};
 pub use memtable::MemTableKind;
+pub use page::Compression;
 pub use tree::TreeConfig;

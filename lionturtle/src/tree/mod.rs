@@ -281,11 +281,11 @@ impl Node {
 fn build_pages(ctx: &Ctx, merger: &mut Merger, target: u64, drop_tombstones: bool) -> Result<Vec<Arc<DataPage>>> {
     let capacity = (target + target / 16) as usize + 4096;
     let mut pages = Vec::new();
-    let mut b = PageBuilder::with_capacity(ctx.new_page_id(), capacity);
+    let mut b = ctx.io.builder(ctx.new_page_id(), capacity);
     while let Some(e) = merger.peek() {
         if !(drop_tombstones && e.value.is_none()) {
             if !b.is_empty() && b.data_bytes() + e.size() > target {
-                let next = PageBuilder::with_capacity(ctx.new_page_id(), capacity);
+                let next = ctx.io.builder(ctx.new_page_id(), capacity);
                 pages.push(ctx.finish(std::mem::replace(&mut b, next)));
             }
             b.push(e);
@@ -1348,10 +1348,6 @@ fn collect_unwritten(t: &Subtree, out: &mut Vec<Arc<DataPage>>, seen: &mut std::
     }
 }
 
-/// Threads that write a checkpoint's queued pages. Each writes one page at
-/// a time and waits for it to reach the device, so two keep the drive busy.
-const PAGE_WRITERS: usize = 2;
-
 /// Whether writing pages created an arena file, and the pointers of the
 /// pages written.
 pub type Written = (bool, Vec<PagePtr>);
@@ -1393,7 +1389,7 @@ impl<'scope> PageWriter<'scope> {
     pub fn spawn<'env>(scope: &'scope std::thread::Scope<'scope, 'env>, io: &'env PageIo, reserve: u64, busy_ns: &'env AtomicU64) -> Self {
         let shared = Arc::new(WriterShared::default());
         shared.state.lock().reserve = reserve;
-        let threads = (0..PAGE_WRITERS)
+        let threads = (0..io.page_writers())
             .map(|_| {
                 let shared = shared.clone();
                 scope.spawn(move || {
