@@ -69,6 +69,9 @@ pub struct lt_options {
     /// Spread each background checkpoint's I/O over most of the time its
     /// memtable took to fill.
     pub pace_checkpoints: bool,
+    /// Zero-fill each log segment ahead of its writes, so that durable
+    /// writes on a new store overwrite allocated space.
+    pub preallocate_log: bool,
     /// Leaf and flush batch size in bytes.
     pub leaf_size: u64,
     /// Buffer levels per node.
@@ -103,6 +106,7 @@ impl lt_options {
             background: self.background,
             merge_threads: self.merge_threads,
             pace_checkpoints: self.pace_checkpoints,
+            preallocate_log: self.preallocate_log,
         })
     }
 }
@@ -303,6 +307,7 @@ pub extern "C" fn lt_options_default() -> lt_options {
         merge_threads: o.merge_threads,
         background: o.background,
         pace_checkpoints: o.pace_checkpoints,
+        preallocate_log: o.preallocate_log,
         leaf_size: o.tree.leaf_size,
         max_levels: o.tree.max_levels,
         filter_bits: o.tree.filter_bits,

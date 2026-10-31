@@ -127,6 +127,11 @@ typedef struct lt_options {
    */
   bool pace_checkpoints;
   /**
+   * Zero-fill each log segment ahead of its writes, so that durable
+   * writes on a new store overwrite allocated space.
+   */
+  bool preallocate_log;
+  /**
    * Leaf and flush batch size in bytes.
    */
   uint64_t leaf_size;

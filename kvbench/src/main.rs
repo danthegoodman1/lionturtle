@@ -70,6 +70,8 @@ pub struct Args {
     pub rate: Vec<(f64, f64)>,
     /// Pace lionturtle checkpoints.
     pub pace: bool,
+    /// Zero-fill lionturtle log segments ahead of their writes.
+    pub preallocate_log: bool,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
     pub timeline: Option<String>,
@@ -141,6 +143,7 @@ fn parse_args() -> Args {
         scylla_host: get("--scylla-host").unwrap_or_else(|| "127.0.0.1:9042".into()),
         rate: get("--rate").map_or_else(Vec::new, |r| parse_rate(&r)),
         pace: num("--pace", 1) == 1,
+        preallocate_log: num("--preallocate-log", 0) == 1,
         uniform: num("--uniform", 0) == 1,
         timeline: get("--timeline"),
     }

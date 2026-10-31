@@ -66,6 +66,14 @@ pub struct Options {
     /// next memtable takes to fill, rather than run it at full speed, so
     /// client reads queue behind less of it. See [`PACE_SHARE`].
     pub pace_checkpoints: bool,
+    /// Zero-fill each log segment a few MiB ahead of its writes, so that a
+    /// durable write overwrites allocated space instead of extending the
+    /// file, and its sync has no file size or block allocation to journal.
+    /// On ext4 over NVMe, that halved the cost of each sync. A reused
+    /// segment already gets this, so the option speeds up only segments
+    /// with none to reuse: a new store's first few, and any that outgrow
+    /// the one they reuse. It writes those segments twice, once as zeros.
+    pub preallocate_log: bool,
 }
 
 /// A paced checkpoint aims to finish its I/O within this share of the time
@@ -89,6 +97,7 @@ impl Default for Options {
             background: true,
             merge_threads: 8,
             pace_checkpoints: true,
+            preallocate_log: false,
         }
     }
 }
@@ -96,6 +105,15 @@ impl Default for Options {
 impl Options {
     fn memtable_limit(&self) -> u64 {
         self.checkpoint_distance.max(1) * self.tree.leaf_size
+    }
+
+    /// How to zero-fill log segments, if at all. Each fill ends in a sync,
+    /// so a fill of a quarter of a memtable keeps them few per segment, and
+    /// the 16 MiB cap bounds the wait while a new segment fills its first.
+    fn preallocate(&self) -> Option<wal::PreallocConfig> {
+        let align = crate::storage::DIRECT_ALIGN as u64;
+        let chunk = (self.memtable_limit() / 4).clamp(align, 16 << 20).next_multiple_of(align);
+        self.preallocate_log.then_some(wal::PreallocConfig { chunk, background: self.background })
     }
 }
 
@@ -688,7 +706,7 @@ impl Db {
         }
         let active_id = max_id + 1;
         let recycler = wal::Recycler::open(&*storage, active_id)?;
-        let wal = WalWriter::create(&*storage, active_id, recycler.take())?;
+        let wal = WalWriter::create(&*storage, active_id, recycler.take(), opts.preallocate())?;
         let active = Arc::new(Mem::new(active_id, &opts, last_seq));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
@@ -1194,7 +1212,7 @@ impl Inner {
         // so that recovery always replays a prefix of history.
         w.wal.sync()?;
         let id = w.active.id + 1;
-        let wal = WalWriter::create(&*self.storage, id, self.recycler.take())?;
+        let wal = WalWriter::create(&*self.storage, id, self.recycler.take(), self.opts.preallocate())?;
         let mem = Arc::new(Mem::new(id, &self.opts, w.next_seq - 1));
         {
             let _g = self.version_lock.lock();

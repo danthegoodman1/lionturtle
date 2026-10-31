@@ -148,6 +148,7 @@ fn random_options(rng: &mut Rng) -> Options {
         background: false,
         merge_threads: 0,
         pace_checkpoints: false,
+        preallocate_log: rng.chance(0.5),
     }
 }
 

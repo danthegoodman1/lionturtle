@@ -44,6 +44,7 @@ fn small_options(memtable: MemTableKind) -> Options {
         background: true,
         merge_threads: 2,
         pace_checkpoints: true,
+        preallocate_log: false,
     }
 }
 
@@ -186,6 +187,7 @@ fn atomic_batches(memtable: MemTableKind) {
         background: true,
         merge_threads: 2,
         pace_checkpoints: true,
+        preallocate_log: false,
     };
     let db = Arc::new(Db::open(Arc::new(SimStorage::new(7, FaultConfig::default())), opts).unwrap());
     // Pair `p` is keys 2p and 2p + 1; writer `w` owns the pairs with p % WRITERS == w,

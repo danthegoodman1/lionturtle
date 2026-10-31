@@ -127,6 +127,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `merge_threads` | 8 | Threads for parallel merges and page writes; 0 uses the caller's rayon pool. Each adds reads in flight and holds memory. |
 | `background` | true | Checkpoint on background threads; with false, callers drive `checkpoint_step` |
 | `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
+| `preallocate_log` | false | Zero-fill each log segment a few MiB ahead of its writes, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first segments and writes them twice. |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
