@@ -390,6 +390,25 @@ pub struct Version {
     frozen: Vec<Arc<Mem>>,
     tree: Option<Subtree>,
     _epoch: Arc<Epoch>,
+    /// Declared after `_epoch`, so a version counts as live until its
+    /// epoch has released what it could.
+    _live: LiveVersion,
+}
+
+/// Counts a version in [`Inner::live_versions`] while it exists.
+struct LiveVersion(Arc<AtomicUsize>);
+
+impl LiveVersion {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for LiveVersion {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
+    }
 }
 
 struct Writer {
@@ -549,6 +568,10 @@ struct Inner {
     io: Arc<PageIo>,
     next_page_id: AtomicU64,
     version: ArcSwap<Version>,
+    /// Versions in existence: the current one, and older ones that readers
+    /// or background threads still hold. Garbage pages wait for every
+    /// version older than the current one to drop.
+    live_versions: Arc<AtomicUsize>,
     /// Serializes version replacements.
     version_lock: Mutex<()>,
     writer: Mutex<Writer>,
@@ -669,7 +692,9 @@ impl Db {
         let active = Arc::new(Mem::new(active_id, &opts, last_seq));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
-        let version = Version { active: active.clone(), frozen, tree: root, _epoch: epoch.clone() };
+        let live_versions = Arc::new(AtomicUsize::new(0));
+        let version =
+            Version { active: active.clone(), frozen, tree: root, _epoch: epoch.clone(), _live: LiveVersion::new(&live_versions) };
         let merge_pool = (opts.tree.parallel && opts.merge_threads > 0).then(|| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(opts.merge_threads)
@@ -682,6 +707,7 @@ impl Db {
             next_page_id: AtomicU64::new(sb.next_page_id),
             io,
             version: ArcSwap::from_pointee(version),
+            live_versions,
             version_lock: Mutex::new(()),
             writer: Mutex::new(Writer {
                 wal,
@@ -883,11 +909,13 @@ impl Db {
     /// readers. Reads every page; for tests and simulation.
     pub fn check_invariants(&self) -> Result<()> {
         let inner = &self.inner;
+        // A commit holds `durable` from replacing the version until it lets
+        // go of the old one, so no commit is half done while this runs.
+        let durable = inner.durable.lock();
         let v = inner.version.load_full();
         if let Some(t) = &v.tree {
             tree::check_invariants(&inner.io, &inner.opts.tree, t)?;
         }
-        let durable = inner.durable.lock();
         let allocated: HashSet<(u8, u32)> = inner.io.store.allocated().into_iter().collect();
         let mut expected = durable.live.clone();
         for a in inner.pending.lock().iter() {
@@ -899,8 +927,10 @@ impl Db {
         }
         let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
         assert!(live.is_subset(&allocated), "a live page is not allocated");
-        if Arc::strong_count(&v) <= 2 {
-            // No reader pins an older version, so no garbage awaits release.
+        // With no older version left, no garbage awaits release. A
+        // background thread can hold an older version for a moment after a
+        // commit, so a check after `checkpoint` may find one.
+        if inner.live_versions.load(SeqCst) == 1 {
             let leaked: Vec<_> = allocated.difference(&live).collect();
             assert!(leaked.is_empty(), "leaked page slots: {leaked:?}");
         }
@@ -1176,7 +1206,13 @@ impl Inner {
                 self.io.pacer.stop();
             }
             let epoch = v._epoch.clone();
-            self.version.store(Arc::new(Version { active: mem.clone(), frozen, tree: v.tree.clone(), _epoch: epoch }));
+            self.version.store(Arc::new(Version {
+                active: mem.clone(),
+                frozen,
+                tree: v.tree.clone(),
+                _epoch: epoch,
+                _live: LiveVersion::new(&self.live_versions),
+            }));
         }
         w.wal = wal;
         w.flush_claimed = 0;
@@ -1489,11 +1525,20 @@ impl Inner {
             let cur = self.version.load();
             let frozen = cur.frozen.iter().filter(|m| m.id != mem.id).cloned().collect();
             old_epoch.retire(garbage, epoch.clone());
-            self.version.store(Arc::new(Version { active: cur.active.clone(), frozen, tree: root, _epoch: epoch }));
+            self.version.store(Arc::new(Version {
+                active: cur.active.clone(),
+                frozen,
+                tree: root,
+                _epoch: epoch,
+                _live: LiveVersion::new(&self.live_versions),
+            }));
         }
         drop(old_epoch);
-        drop(durable);
+        // Reclaiming moves freed slots to the free pool after punching their
+        // holes; holding `durable` meanwhile keeps a leak check from finding
+        // them in neither.
         self.io.store.reclaim();
+        drop(durable);
         self.timing.commit_ns.fetch_add(since(t), Relaxed);
         self.checkpoints.fetch_add(1, Relaxed);
         for id in wal::list_segments(&*self.storage)? {
