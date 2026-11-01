@@ -18,9 +18,10 @@ sudo fstrim /mnt/data
 cp -r --sparse=always $B/keep-$e $B/run
 sync
 python3 -c 'import os, sys
-for d, _, fs in os.walk(sys.argv[1]):
-    for f in fs:
-        fd = os.open(os.path.join(d, f), os.O_RDONLY); os.fsync(fd); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' $B/keep-$e $B/run
+for root in sys.argv[1:]:
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            fd = os.open(os.path.join(d, f), os.O_RDONLY); os.fsync(fd); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' $B/keep-$e $B/run
 sleep 60
 ratearg=(--rate $rate); [ $rate = - ] && ratearg=()
 pre=(); [ $e = rocksdb ] && pre=(env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2)
