@@ -1567,9 +1567,9 @@ impl Inner {
             }));
         }
         drop(old_epoch);
-        // Reclaiming moves freed slots to the free pool after punching their
-        // holes; holding `durable` meanwhile keeps a leak check from finding
-        // them in neither.
+        // Reclaiming returns freed slots to the free pool and takes slots
+        // left free out of it while it punches their holes; holding `durable`
+        // meanwhile keeps a leak check from finding a slot in neither.
         self.io.store.reclaim();
         drop(durable);
         self.timing.commit_ns.fetch_add(since(t), Relaxed);

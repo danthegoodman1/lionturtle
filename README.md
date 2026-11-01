@@ -69,8 +69,8 @@ ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over
 
 - **Memory.** RSS runs about twice RocksDB's: 2.8 GB against 1.3 GB under 128 durable writers.
 - **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.91 s against RocksDB's 83 ms, though update p99.9 was 11 ms against 14 ms.
-- **Scans.** A scan merges every buffer level on its path. At 400M records with LZ4, scans ran 1.12 times RocksDB's rate, with a median of 55 µs against 49 and p99.9 of 1.8 ms against 0.76 ms.
-- **Deep read tails under writes.** At 400M records with LZ4, read p99.9 on workload A was 498 µs against RocksDB's 242.
+- **Scans.** A scan merges every buffer level on its path. At 400M records with LZ4, scans ran 1.13 times RocksDB's rate, with a median of 56 µs against 49 and p99.9 of 2.1 ms against 0.76 ms.
+- **Deep read tails under writes.** At 400M records with LZ4, read p99.9 on workload A was 310 µs against RocksDB's 242.
 
 ## Quick start
 
