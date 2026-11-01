@@ -248,6 +248,8 @@ To isolate the CPU cost, lionturtle and RocksDB ran 20M records of the same valu
 
 LZ4 cost lionturtle at most 3.0% on any workload. Mean read latency on C fell from 1.40 to 1.36 µs, and RocksDB's rose from 2.23 to 2.35 µs.
 
+Values that compress too little cost nothing to store with LZ4 on, since lionturtle then stores its pages as it would without compression. The same tmpfs runs with random values, and with values whose last tenth repeats their first (`--compression-ratio 0.9`), stayed within 2.4% of the runs without LZ4 on every workload, except E on random values at −5.6%, where runs of one configuration spread by 10%. Compressing every block of the 0.9 values instead cut page writes by 12% and cost 4–5% on A, B and C. On the workstation's drive under a 4 GB cap, with 50M records, it shrank the store by 6%, read as much from the drive, and slowed the load by 4.5% and A by 1%.
+
 ```console
 bench/compression.sh bench-data/ycsb > compression.jsonl
 ./target/release/kvbench --engine lionturtle --dir /dev/shm/kvbench --records 20000000 --ops 20000000 --threads 16 \

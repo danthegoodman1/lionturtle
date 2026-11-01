@@ -33,12 +33,13 @@
 #define LT_MEMTABLE_BTREE 2
 
 /**
- * Data blocks stored as they are: the default.
+ * Data blocks stored as they are.
  */
 #define LT_COMPRESSION_NONE 0
 
 /**
- * Each data block compressed on its own with LZ4.
+ * Each data block compressed on its own with LZ4, while blocks compress
+ * enough to be worth it: the default.
  */
 #define LT_COMPRESSION_LZ4 1
 

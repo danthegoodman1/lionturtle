@@ -88,3 +88,53 @@ fn compression_shrinks_stored_pages() {
     let (plain, lz4) = (written(Compression::None), written(Compression::Lz4));
     assert!(lz4 * 2 < plain, "LZ4 wrote {lz4} bytes, uncompressed {plain}");
 }
+
+/// 120 random bytes, different for each key and round.
+fn random_value(i: u64, round: u64) -> Vec<u8> {
+    let mut x = (i << 16 | round) ^ 0x9E37_79B9_7F4A_7C15;
+    (0..15)
+        .flat_map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()
+        })
+        .collect()
+}
+
+fn fill_random(db: &Db, rounds: std::ops::Range<u64>) {
+    for round in rounds {
+        for i in 0..KEYS {
+            db.put(&key(i), &random_value(i, round)).unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+}
+
+#[test]
+fn incompressible_pages_store_as_without_compression() {
+    let written = |c| {
+        let db = Db::open(Arc::new(SimStorage::new(3, FaultConfig::default())), options(c)).unwrap();
+        fill_random(&db, 0..3);
+        for i in 0..KEYS {
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(&random_value(i, 2)[..]), "key {i}");
+        }
+        db.stats().page_bytes_written
+    };
+    let (plain, lz4) = (written(Compression::None), written(Compression::Lz4));
+    assert_eq!(lz4, plain, "LZ4 wrote {lz4} bytes of incompressible pages, uncompressed {plain}");
+}
+
+#[test]
+fn compression_resumes_when_values_compress() {
+    let written = |c| {
+        let db = Db::open(Arc::new(SimStorage::new(4, FaultConfig::default())), options(c)).unwrap();
+        fill_random(&db, 0..2);
+        let before = db.stats().page_bytes_written;
+        fill(&db, 2..5);
+        verify(&db, 4);
+        db.stats().page_bytes_written - before
+    };
+    let (plain, lz4) = (written(Compression::None), written(Compression::Lz4));
+    assert!(lz4 * 2 < plain, "LZ4 wrote {lz4} bytes once values compressed, uncompressed {plain}");
+}

@@ -319,6 +319,12 @@ pub struct PageIo {
 /// leaving room for pages that compress worse than the ones before them.
 const COMPRESSED_FILL: f64 = 0.97;
 
+/// Smallest block target that pages are laid out for compression at. Below
+/// it, each page on disk would hold under an eighth more entries than
+/// without compression, too little to pay for compressing every block as it
+/// is written and decompressing every block read from disk.
+const MIN_COMPRESSED_BLOCK: usize = BLOCK_SIZE + BLOCK_SIZE / 8;
+
 impl PageIo {
     pub fn new(store: PageStore, cache_bytes: u64, max_image: u64, compression: Compression) -> Self {
         // Every shard must hold a few whole page images.
@@ -342,12 +348,14 @@ impl PageIo {
     }
 
     /// A builder for a page this store will write, its blocks laid out for
-    /// how the store compresses.
+    /// how the store compresses: for compression while blocks compress well
+    /// enough to reach [`MIN_COMPRESSED_BLOCK`], and padded otherwise.
     pub fn builder(&self, id: PageId, capacity: usize) -> PageBuilder {
         let b = PageBuilder::with_capacity(id, capacity);
+        let target = self.block_target.load(Relaxed);
         match self.compression {
-            Compression::None => b,
-            Compression::Lz4 => b.for_compression(self.block_target.load(Relaxed)),
+            Compression::Lz4 if target >= MIN_COMPRESSED_BLOCK => b.for_compression(target),
+            _ => b,
         }
     }
 
@@ -543,16 +551,13 @@ impl PageIo {
         let image = page.pinned().expect("unwritten page is pinned");
         let pace = |n| self.pacer.take(n);
         // The stored page is built in an aligned buffer, checksummed as it
-        // goes, and written from there.
-        let (ptr, created) = match self.compression {
-            Compression::None => self.with_write_buf(image.len(), |out| {
-                out[..image.len()].copy_from_slice(&image);
-                page::seal_blocks(&mut out[..image.len()], &page.meta);
-                out[image.len()..].fill(0);
-                let ptr = self.store.allocate(page.id(), image.len() as u64, page.meta.meta_off)?;
-                Ok::<_, crate::Error>((ptr, self.store.write_aligned(&ptr, out, self.write_piece(), &pace)?))
-            })?,
-            Compression::Lz4 => self.with_write_buf(page::compressed_bound(&page.meta), |out| {
+        // goes, and written from there. A page laid out for compression is
+        // stored compressed, and any other as its image; while the store
+        // compresses, the latter's blocks are sampled, so the store notices
+        // when they begin to compress well.
+        let compress = self.compression == Compression::Lz4;
+        let (ptr, created) = if compress && !page.meta.blocks_fill_pages() {
+            self.with_write_buf(page::compressed_bound(&page.meta), |out| {
                 let stored = page::compress_image(&image, &page.meta, out);
                 self.learn_ratio(stored.fit_ratio);
                 let padded = stored.len.next_multiple_of(DIRECT_ALIGN);
@@ -561,7 +566,21 @@ impl PageIo {
                 let created = self.store.write_aligned(&ptr, &out[..padded], self.write_piece(), &pace)?;
                 page.stored_map.set(stored.map).expect("page written once");
                 Ok::<_, crate::Error>((ptr, created))
-            })?,
+            })?
+        } else {
+            let len = image.len().next_multiple_of(DIRECT_ALIGN);
+            let scratch = if compress { page::sample_bound(&page.meta) } else { 0 };
+            self.with_write_buf(len + scratch, |buf| {
+                let (out, scratch) = buf.split_at_mut(len);
+                if compress {
+                    self.learn_ratio(page::sample_ratio(&image, &page.meta, scratch));
+                }
+                out[..image.len()].copy_from_slice(&image);
+                page::seal_blocks(&mut out[..image.len()], &page.meta);
+                out[image.len()..].fill(0);
+                let ptr = self.store.allocate(page.id(), image.len() as u64, page.meta.meta_off)?;
+                Ok::<_, crate::Error>((ptr, self.store.write_aligned(&ptr, out, self.write_piece(), &pace)?))
+            })?
         };
         self.counters.pages_written.fetch_add(1, Relaxed);
         self.counters.page_bytes_written.fetch_add(ptr.len as u64, Relaxed);
@@ -751,5 +770,51 @@ mod tests {
         // well the values compress; by the last, nearly all of every page
         // holds compressed data.
         assert!(fill > 0.9, "compressed blocks fill {fill:.3} of their pages");
+    }
+
+    #[test]
+    fn pages_store_as_images_while_blocks_compress_too_little() {
+        use crate::page::EntryRef;
+        use crate::sim::{FaultConfig, SimStorage};
+        let store = PageStore::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), &[]).unwrap();
+        let io = PageIo::new(store, 1 << 20, 4 << 20, Compression::Lz4);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_id = 0u64;
+        // Writes a page of 120-byte values, random throughout or with their
+        // last 56 bytes repeating their first, and returns whether it was
+        // laid out for compression and whether it was stored compressed.
+        let mut write = |compressible: bool| {
+            next_id += 1;
+            let mut b = io.builder(next_id, 2 << 20);
+            for i in 0..15_000u64 {
+                let mut value = [0u8; 120];
+                for chunk in value.chunks_mut(8) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    chunk.copy_from_slice(&seed.to_le_bytes());
+                }
+                if compressible {
+                    value.copy_within(..56, 64);
+                }
+                b.push(EntryRef { key: &(next_id << 32 | i).to_be_bytes(), value: Some(&value) });
+            }
+            let page = DataPage::unwritten(b.finish(10));
+            let laid_out = !page.meta.blocks_fill_pages();
+            io.write(&page).unwrap();
+            (laid_out, page.stored_compressed())
+        };
+        // Random values never leave the padded layout.
+        for _ in 0..4 {
+            assert_eq!(write(false), (false, false));
+        }
+        // Once values compress, the sampled blocks show it within a page.
+        assert_eq!(write(true), (false, false));
+        for _ in 0..4 {
+            assert_eq!(write(true), (true, true));
+        }
+        // Once they stop, the store returns to storing images.
+        let back = (0..6).position(|_| write(false) == (false, false));
+        assert!(back.is_some_and(|n| n <= 4), "still compressing after {back:?} pages");
     }
 }

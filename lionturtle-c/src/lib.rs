@@ -45,9 +45,10 @@ pub const LT_MEMTABLE_SKIPLIST: u32 = 1;
 /// Rust's BTreeMap behind a reader-writer lock.
 pub const LT_MEMTABLE_BTREE: u32 = 2;
 
-/// Data blocks stored as they are: the default.
+/// Data blocks stored as they are.
 pub const LT_COMPRESSION_NONE: u32 = 0;
-/// Each data block compressed on its own with LZ4.
+/// Each data block compressed on its own with LZ4, while blocks compress
+/// enough to be worth it: the default.
 pub const LT_COMPRESSION_LZ4: u32 = 1;
 
 /// Settings for lt_open(). Start from lt_options_default(); the

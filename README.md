@@ -27,7 +27,7 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
-**Compression that reads one page per miss.** With `compression: Lz4`, each block holds about as many entries as compress into one 4 KiB page, so a read that misses the cache still reads one aligned page. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 22–39% ([results](BENCHMARKS.md#compression)).
+**Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 22–39% ([results](BENCHMARKS.md#compression)).
 
 **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through crashes, torn writes, read errors and bit flips on a simulated disk, and checks every answer and every recovery against a model. A failing seed replays exactly.
 
@@ -140,7 +140,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `background` | true | Checkpoint on background threads; with false, callers drive `checkpoint_step` |
 | `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
 | `preallocate_log` | false | Zero-fill each log segment a few MiB ahead of its writes, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first segments and writes them twice. |
-| `compression` | `None` | `Lz4` sizes each data block to compress into one 4 KiB page and compresses it as its page is written, so a point read still reads one page. Cached blocks stay uncompressed, so only reads from disk decompress. A store may switch either way between opens. |
+| `compression` | `Lz4` | `Lz4` sizes each data block to compress into one 4 KiB page and compresses it as its page is written, so a point read still reads one page. Cached blocks stay uncompressed, so only reads from disk decompress. While blocks would hold under an eighth more entries per page, pages are stored as with `None`, and one block in eight is compressed to tell when that changes. A store may switch either way between opens. lionturtle 0.4.0 and later read compressed pages; earlier versions report them as corrupt. |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
@@ -158,7 +158,7 @@ Under a memory cap that counts page cache, such as a container's, transparent hu
 | Transactions | None | Pessimistic and optimistic | Serializable single-writer; optimistic with conflict checks |
 | Namespaces | One keyspace | Column families | Keyspaces |
 | Iteration | Forward, reverse, prefix | Forward, reverse, prefix | Forward, reverse, prefix |
-| Compression | LZ4 per block, opt-in | Several codecs | LZ4 |
+| Compression | LZ4 per block, on by default | Several codecs | LZ4 |
 | Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while two frozen memtables await checkpoints | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 

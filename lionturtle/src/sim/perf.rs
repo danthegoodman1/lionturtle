@@ -9,6 +9,7 @@
 use super::{FaultConfig, SimStorage};
 use crate::db::{Db, Options};
 use crate::memtable::MemTableKind;
+use crate::page::Compression;
 use crate::tree::TreeConfig;
 use std::sync::Arc;
 
@@ -63,7 +64,9 @@ pub fn run(cfg: &PerfConfig) -> PerfReport {
         merge_threads: 0,
         pace_checkpoints: false,
         preallocate_log: false,
-        compression: Default::default(),
+        // The experiment measures the tree's amplification, and its values,
+        // zero past their first eight bytes, would mostly measure LZ4's.
+        compression: Compression::None,
     };
     let db = Db::open(Arc::new(disk.clone()), opts).expect("open");
     let mut value = vec![0u8; cfg.value_size];
