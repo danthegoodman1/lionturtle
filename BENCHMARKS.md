@@ -216,37 +216,37 @@ echo 3200000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq
 
 ## Compression
 
-50M records of 8-byte keys and 120-byte values whose second half repeats the first (`--compression-ratio 0.5`), on a workstation with an Intel Core Ultra 9 285 (24 cores), 125 GB of RAM and a 2 TB Micron consumer NVMe drive (MTFDKBA2T0TGD, ext4, volatile write cache), under a 4 GB memory cap that covers page cache. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads, and ran without compression and with LZ4 on every data block. `bench/compression.sh` runs each configuration twice, the second pass in reverse order, and trims the drive before each run. The table gives the mean of the two passes, which agreed within 6%, except RocksDB with LZ4 on C, within 11%.
+50M records of 8-byte keys and 120-byte values whose second half repeats the first (`--compression-ratio 0.5`), on a workstation with an Intel Core Ultra 9 285 (24 cores), 125 GB of RAM and a 2 TB Micron consumer NVMe drive (MTFDKBA2T0TGD, ext4, volatile write cache), under a 4 GB memory cap that covers page cache. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads, and ran without compression and with LZ4 on every data block. `bench/compression.sh` runs each configuration twice, the second pass in reverse order, and trims the drive before each run. The table gives the mean of the two passes, which agreed within 8%, except lionturtle's uncompressed load (2,117 thousand inserts per second against 1,763), lionturtle with LZ4 on B (11%) and fjall with LZ4 on E (11%).
 
 | Workload (thousand ops/s) | lionturtle | lionturtle LZ4 | RocksDB | RocksDB LZ4 | fjall | fjall LZ4 |
 |---|--:|--:|--:|--:|--:|--:|
-| Load (inserts) | 1,803 | 2,286 | 1,139 | 1,364 | 434 | 453 |
-| A: 50% read, 50% update | 1,126 | 1,264 | 1,050 | 1,377 | 658 | 728 |
-| B: 95% read, 5% update | 1,492 | 1,758 | 963 | 1,805 | 913 | 1,125 |
-| C: 100% read | 1,672 | 1,962 | 952 | 1,969 | 966 | 1,150 |
-| E: 95% scan of up to 100 keys, 5% insert | 244 | 322 | 146 | 359 | 50 | 50 |
-| F: 50% read, 50% read-modify-write | 761 | 882 | 696 | 1,115 | 571 | 677 |
-| Write amplification during load | 5.8 | 3.9 | 7.5 | 4.4 | 8.6 | 5.1 |
-| Disk after A (GB) | 9.1 | 5.6 | 7.8 | 4.9 | 7.9 | 4.8 |
-| Read from the drive on C (GB) | 30.7 | 25.4 | 49.6 | 26.0 | 80.4 | 54.4 |
-| RSS during C (GB) | 2.0 | 2.1 | 1.6 | 1.6 | 2.0 | 1.9 |
+| Load (inserts) | 1,940 | 2,108 | 1,141 | 1,384 | 427 | 446 |
+| A: 50% read, 50% update | 1,170 | 1,433 | 1,007 | 1,369 | 647 | 728 |
+| B: 95% read, 5% update | 1,733 | 2,298 | 944 | 1,924 | 953 | 1,212 |
+| C: 100% read | 1,994 | 2,600 | 972 | 2,062 | 986 | 1,243 |
+| E: 95% scan of up to 100 keys, 5% insert | 274 | 381 | 154 | 338 | 50 | 52 |
+| F: 50% read, 50% read-modify-write | 816 | 1,000 | 737 | 1,113 | 566 | 702 |
+| Write amplification during load | 5.8 | 3.9 | 7.4 | 4.4 | 8.8 | 5.0 |
+| Disk after A (GB) | 9.1 | 5.5 | 7.7 | 4.7 | 7.8 | 5.0 |
+| Read from the drive on C (GB) | 24.7 | 17.4 | 50.1 | 23.8 | 78.5 | 48.3 |
+| RSS during C (GB) | 1.9 | 1.9 | 1.5 | 1.6 | 1.8 | 1.8 |
 
-- **lionturtle.** LZ4 raised every workload's throughput, by 12% on A to 32% on E, and cut the pages written during the load from 29.2 to 17.2 GB. A block that misses the cache costs one 4 KiB read either way, and with LZ4 that page holds about 1.7 times as many entries, so the page cache covers more of the store: C read 17% less from the drive.
-- **RocksDB.** It gains the most. Its uncompressed blocks hold about 4 KiB plus a 5-byte trailer at unaligned offsets, so nearly every one spans two pages, and C read 1.6 times as much from the drive as lionturtle. LZ4 halves that. With LZ4 on both, RocksDB matches lionturtle on B and C and leads on A by 9%, E by 11% and F by 26%, while lionturtle loads 1.68 times as fast. RocksDB's files are smaller and its RSS lower, which during C left its page cache about 2.7 GB for 4.5 GB of files, against lionturtle's 2.2 GB for 5.6 GB. On A, lionturtle's read p99 was 198 µs against RocksDB's 87; on C, without writes, it was 62 µs against 83.
-- **fjall.** With LZ4, C read 32% less from the drive and ran 19% faster.
+- **lionturtle.** LZ4 raised throughput by 22% on A and F to 39% on E, raised the load's by 9%, and cut the pages written during the load from 29.3 to 17.3 GB. A block that misses the cache costs one 4 KiB read either way, and with LZ4 that page holds about 1.7 times as many entries, so the page cache covers more of the store: C read 30% less from the drive.
+- **RocksDB.** It gains the most. Its uncompressed blocks hold about 4 KiB plus a 5-byte trailer at unaligned offsets, so nearly every one spans two pages, and C read twice as much from the drive as lionturtle. LZ4 halves that. With LZ4 on both, lionturtle leads by 5% on A, 19% on B, 26% on C and 13% on E, and loads 1.52 times as fast; RocksDB leads by 11% on F. Checkpoint pacing accounts for F: in runs of A and F alone on copies of one loaded store, `--pace 0` raised lionturtle's F from 1,065 to 1,227 thousand ops/s, against RocksDB's 1,180, and its A by 8%. On A, lionturtle's read p99 was 164 µs against RocksDB's 86; on C, without writes, it was 59 µs against 81.
+- **fjall.** With LZ4, C read 38% less from the drive and ran 26% faster.
 
 To isolate the CPU cost, lionturtle and RocksDB ran 20M records of the same values on tmpfs with a 256 MB block cache, so a read that misses the block cache copies from memory instead of waiting on a drive. On C, one lionturtle read in five missed the block cache, and with LZ4 each of those decompressed its block: 2.2 million blocks per second. Medians of three alternating runs:
 
 | Workload (thousand ops/s) | lionturtle | lionturtle LZ4 | Change | RocksDB | RocksDB LZ4 | Change |
 |---|--:|--:|--:|--:|--:|--:|
-| Load (inserts) | 2,980 | 2,965 | −0.5% | 1,407 | 1,410 | +0.2% |
-| A: 50% read, 50% update | 5,118 | 5,152 | +0.7% | 2,530 | 2,482 | −1.9% |
-| B: 95% read, 5% update | 9,850 | 9,814 | −0.4% | 5,390 | 5,268 | −2.3% |
-| C: 100% read | 10,906 | 10,730 | −1.6% | 6,304 | 6,080 | −3.6% |
-| E: 95% scan of up to 100 keys, 5% insert | 704 | 719 | +2.1% | 856 | 1,002 | +17.1% |
-| F: 50% read, 50% read-modify-write | 4,642 | 4,534 | −2.3% | 2,474 | 2,452 | −0.9% |
+| Load (inserts) | 2,928 | 2,896 | −1.1% | 1,402 | 1,403 | +0.1% |
+| A: 50% read, 50% update | 5,160 | 5,212 | +1.0% | 2,513 | 2,515 | +0.1% |
+| B: 95% read, 5% update | 9,591 | 9,808 | +2.3% | 5,354 | 5,283 | −1.3% |
+| C: 100% read | 10,684 | 10,974 | +2.7% | 6,298 | 5,938 | −5.7% |
+| E: 95% scan of up to 100 keys, 5% insert | 709 | 788 | +11.2% | 773 | 975 | +26.1% |
+| F: 50% read, 50% read-modify-write | 4,600 | 4,461 | −3.0% | 2,471 | 2,426 | −1.8% |
 
-LZ4 cost lionturtle at most 2.3% on any workload. Mean read latency on C rose from 1.37 to 1.39 µs, and RocksDB's from 2.20 to 2.30 µs.
+LZ4 cost lionturtle at most 3.0% on any workload. Mean read latency on C fell from 1.40 to 1.36 µs, and RocksDB's rose from 2.23 to 2.35 µs.
 
 ```console
 bench/compression.sh bench-data/ycsb > compression.jsonl
@@ -269,6 +269,7 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 - Each run is one process in one memory cgroup, with page cache counted against the cap.
 - No engine compresses data unless `--compression lz4` turns on LZ4 for all of them, and no engine fsyncs per write. RocksDB buffers its log manually, fjall persists its journal manually, and lionturtle buffers up to 1 MiB of log. `--sync 1` makes every write in the timed phases durable before it returns; `bench/sync.sh` runs that comparison.
 - RocksDB runs on jemalloc, its production allocator. lionturtle and fjall run on mimalloc.
+- kvbench turns off transparent huge pages for its process. mimalloc asks for them on its arenas, and under a memory cap they leave less of it for page cache: on C at 50M records with LZ4 under a 4 GB cap, lionturtle kept 1.2 GB of page cache with them and 2.3 GB without, and ran 37% faster without. Between two runs of `bench/compression.sh`, turning them off raised lionturtle's throughput after the load by 13–33% with LZ4 and 4–19% without, and moved RocksDB's by at most 7%. The Compression section ran with them off; every other section ran with them on.
 - lionturtle's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
 - Latency runs need a quiet drive. Each read of an NVMe drive's temperature in `/sys/class/hwmon` sends the drive a SMART log request, and the workstation's drive holds reads about 3.4 ms behind each one; monitoring agents that poll every second put a floor under every second's p99. Eight ClickHouse processes, polling together, made that floor about 40 ms.
 - Runs on an SSD need it trimmed. A drive that has not been told which blocks were freed copies them during garbage collection, and on the workstation's drive, mounted without `discard` and trimmed weekly, identical runs drifted 30% apart after a few hundred GB of copies were written and deleted. Run `sudo fstrim /` before each run; after one full trim, six alternating runs of three builds landed within 2% of each other.
