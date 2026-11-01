@@ -75,14 +75,18 @@ pub struct Options {
     /// the one they reuse. It writes those segments twice, once as zeros.
     pub preallocate_log: bool,
     /// How data pages written from now on are stored. With
-    /// [`Compression::Lz4`], each block holds about as many entries as
-    /// compress into one 4 KiB page, judged from the pages written before,
-    /// and is compressed on its own as its page is written. Fewer bytes reach
-    /// the drive and the files shrink, while a point read still reads one
-    /// aligned page. Blocks in memory and in the block cache stay
-    /// uncompressed, so only a read from disk decompresses, about 1 µs for a
-    /// block that compressed by half. A store may switch either way between
-    /// opens: each page records how it was stored.
+    /// [`Compression::Lz4`], the default, each block holds about as many
+    /// entries as compress into one 4 KiB page, judged from the pages
+    /// written before, and is compressed on its own as its page is written.
+    /// Fewer bytes reach the drive and the files shrink, while a point read
+    /// still reads one aligned page. Blocks in memory and in the block cache
+    /// stay uncompressed, so only a read from disk decompresses, about 1 µs
+    /// for a block that compressed by half. While blocks would gain less
+    /// than an eighth more entries per page, pages are stored as they would
+    /// be without compression, and one block in eight is compressed only to
+    /// tell when that changes. A store may switch either way between opens:
+    /// each page records how it was stored. lionturtle 0.4.0 and later read
+    /// compressed pages; earlier versions report them as corrupt.
     pub compression: Compression,
 }
 
@@ -108,7 +112,7 @@ impl Default for Options {
             merge_threads: 8,
             pace_checkpoints: true,
             preallocate_log: false,
-            compression: Compression::None,
+            compression: Compression::Lz4,
         }
     }
 }

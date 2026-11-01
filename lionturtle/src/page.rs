@@ -41,7 +41,10 @@
 //! than the block itself, and otherwise as it would be without compression.
 //! `COMPRESSED` is a count no block can hold, which tells the two apart. The
 //! index keeps describing the image, so pages in memory and in the cache stay
-//! uncompressed, and only reads from disk decompress.
+//! uncompressed, and only reads from disk decompress. While blocks compress
+//! too little to be worth it, a compressing store builds its pages padded
+//! and stores them as their images, and [`sample_ratio`] compresses a sample
+//! of their blocks to tell when that changes.
 
 use crate::bloom;
 use crate::error::{Result, corruption};
@@ -70,9 +73,10 @@ pub const PAGE_PAYLOAD: usize = BLOCK_SIZE - STORED_HEADER;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Compression {
     /// Blocks are stored as they sit in memory, one per 4 KiB.
-    #[default]
     None,
-    /// Each block is compressed on its own with LZ4.
+    /// Each block is compressed on its own with LZ4, while blocks compress
+    /// enough to be worth it.
+    #[default]
     Lz4,
 }
 
@@ -204,6 +208,15 @@ impl PageMeta {
     /// Whether this region was read from a page stored compressed.
     pub fn is_stored_compressed(&self) -> bool {
         self.map_off != 0
+    }
+
+    /// Whether every block starts on a page boundary and spans whole pages,
+    /// as in a page built to be stored as its image.
+    pub fn blocks_fill_pages(&self) -> bool {
+        (0..self.n_blocks as usize).all(|i| {
+            let info = self.block(i);
+            (info.offset as usize).is_multiple_of(BLOCK_SIZE) && (info.len as usize).is_multiple_of(BLOCK_SIZE)
+        })
     }
 
     /// Offset of stored block `i` within the stored page.
@@ -797,15 +810,12 @@ pub fn compress_image(image: &[u8], meta: &PageMeta, out: &mut [u8]) -> StoredPa
     let mut at = 0usize;
     let mut ratios: Vec<f32> = Vec::new();
     for i in 0..n {
-        let info = meta.block(i);
-        let block = &image[info.offset as usize..(info.offset + info.len) as usize];
-        // The block without any padding: entries, then their offsets.
-        let raw_len = u32_at(block, 8) as usize + 4 * u32_at(block, 4) as usize;
-        let raw = &block[..raw_len];
+        let raw = raw_block(image, meta, i);
+        let raw_len = raw.len();
         let raw_pages = raw_len.div_ceil(BLOCK_SIZE);
         // A block of one page cannot shrink by a page, so compressing it
         // only tells how well blocks compress; a sample tells enough.
-        let compressed = if raw_pages > 1 || i % 8 == 0 {
+        let compressed = if raw_pages > 1 || i % SAMPLE_EVERY == 0 {
             let dst = &mut out[at + STORED_HEADER..at + STORED_HEADER + lz4_flex::block::get_maximum_output_size(raw_len)];
             let c = lz4_flex::block::compress_into(raw, dst).ok();
             if i + 1 < n || ratios.is_empty() {
@@ -841,11 +851,53 @@ pub fn compress_image(image: &[u8], meta: &PageMeta, out: &mut [u8]) -> StoredPa
     }
     let meta_off = at as u32;
     let len = at + meta.write_stored(meta_off, &map, &mut out[at..]);
-    let fit_ratio = (!ratios.is_empty()).then(|| {
+    StoredPage { len, meta_off, map: map.into_boxed_slice(), fit_ratio: fit_ratio(&mut ratios) }
+}
+
+/// One block in this many is compressed only to learn how well blocks
+/// compress.
+const SAMPLE_EVERY: usize = 8;
+
+/// Block `i` of `image` without its padding: entries, then their offsets.
+fn raw_block<'a>(image: &'a [u8], meta: &PageMeta, i: usize) -> &'a [u8] {
+    let info = meta.block(i);
+    let block = &image[info.offset as usize..(info.offset + info.len) as usize];
+    &block[..u32_at(block, 8) as usize + 4 * u32_at(block, 4) as usize]
+}
+
+/// The ratio that all but about one in a hundred of `ratios` met or beat.
+fn fit_ratio(ratios: &mut [f32]) -> Option<f64> {
+    (!ratios.is_empty()).then(|| {
         let k = (ratios.len() - 1) * 99 / 100;
         *ratios.select_nth_unstable_by(k, f32::total_cmp).1 as f64
-    });
-    StoredPage { len, meta_off, map: map.into_boxed_slice(), fit_ratio }
+    })
+}
+
+/// Bytes of scratch [`sample_ratio`] needs for a page.
+pub fn sample_bound(meta: &PageMeta) -> usize {
+    (0..meta.n_blocks as usize)
+        .step_by(SAMPLE_EVERY)
+        .map(|i| lz4_flex::block::get_maximum_output_size(meta.block(i).len as usize))
+        .max()
+        .unwrap_or(0)
+}
+
+/// How well the blocks of a page stored as its image would compress: the
+/// ratio, compressed over raw bytes, that all but about one in a hundred of
+/// a sample of its blocks met or beat, judged as [`compress_image`] judges
+/// [`StoredPage::fit_ratio`]. `scratch` must hold [`sample_bound`] bytes.
+pub fn sample_ratio(image: &[u8], meta: &PageMeta, scratch: &mut [u8]) -> Option<f64> {
+    let n = meta.n_blocks as usize;
+    let mut ratios: Vec<f32> = Vec::with_capacity(n.div_ceil(SAMPLE_EVERY));
+    for i in (0..n).step_by(SAMPLE_EVERY) {
+        if i + 1 == n && !ratios.is_empty() {
+            break;
+        }
+        let raw = raw_block(image, meta, i);
+        let c = lz4_flex::block::compress_into(raw, &mut scratch[..lz4_flex::block::get_maximum_output_size(raw.len())]).ok();
+        ratios.push(c.map_or(1.0, |c| c as f32 / raw.len() as f32));
+    }
+    fit_ratio(&mut ratios)
 }
 
 /// Compares a key against an optional exclusive upper bound.
