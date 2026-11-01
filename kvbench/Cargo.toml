@@ -15,6 +15,7 @@ bytes = "1"
 parking_lot = "0.12"
 fjall = "3"
 hdrhistogram = "7"
+libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 lionturtle = { path = "../lionturtle" }
 rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4"] }

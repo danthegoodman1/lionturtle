@@ -17,6 +17,19 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Turns off transparent huge pages for this process. mimalloc asks for
+/// them on its arenas, and under a memory cap the huge pages cost page
+/// cache: on YCSB C at 50M records with LZ4 under 4 GB, lionturtle's page
+/// cache held 1.2 GB with them and 2.3 GB without, and it ran 37% faster
+/// without. RocksDB runs on jemalloc, which asks for none.
+fn disable_huge_pages() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_SET_THP_DISABLE only reads its integer arguments.
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
+}
+
 mod engines;
 mod ycsb;
 
@@ -461,6 +474,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
 }
 
 fn main() {
+    disable_huge_pages();
     let args = parse_args();
     // Without a load phase, the run reuses the data a kept run left behind.
     if args.phases.iter().any(|p| p == "load") {

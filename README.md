@@ -27,13 +27,13 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
-**Compression that reads one page per miss.** With `compression: Lz4`, each block holds about as many entries as compress into one 4 KiB page, so a read that misses the cache still reads one aligned page. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload by 12–32% ([results](BENCHMARKS.md#compression)).
+**Compression that reads one page per miss.** With `compression: Lz4`, each block holds about as many entries as compress into one 4 KiB page, so a read that misses the cache still reads one aligned page. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 22–39% ([results](BENCHMARKS.md#compression)).
 
 **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through crashes, torn writes, read errors and bit flips on a simulated disk, and checks every answer and every recovery against a model. A failing seed replays exactly.
 
 ## Performance
 
-These runs used an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive). [BENCHMARKS.md](BENCHMARKS.md) has every result, the setup, and the commands to reproduce them. Every benchmark ran on Linux. macOS has no O_DIRECT or RWF_DSYNC, so there lionturtle buffers its files and ends each durable write with `F_FULLFSYNC`, which flushes the drive's cache.
+These runs used an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive) with transparent huge pages on. Under a memory cap, huge pages leave lionturtle less page cache: on the workstation, turning them off raised its uncompressed YCSB throughput by up to 19% and moved RocksDB's by at most 6%. [BENCHMARKS.md](BENCHMARKS.md) has every result, the setup, and the commands to reproduce them. Every benchmark ran on Linux. macOS has no O_DIRECT or RWF_DSYNC, so there lionturtle buffers its files and ends each durable write with `F_FULLFSYNC`, which flushes the drive's cache.
 
 YCSB on 50M records of 128 bytes, with 16 client threads under a 4 GB memory cap, in thousand ops/s:
 
@@ -145,6 +145,8 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
 | `tree.max_pivots` | 64 | Pivots per node before it splits |
+
+Under a memory cap that counts page cache, such as a container's, transparent huge pages in the application's heap leave less of the cap for the page cache that lionturtle reads through. mimalloc asks for them on its arenas. Set `MIMALLOC_ALLOW_THP=0`, or call `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` at startup, as kvbench does: on YCSB C at 50M records with LZ4 under a 4 GB cap, huge pages halved lionturtle's page cache and cost it 27% of its throughput.
 
 ## Compared with RocksDB and fjall
 
