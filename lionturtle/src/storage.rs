@@ -44,6 +44,11 @@ pub trait File: Send + Sync {
     /// Makes every completed write to this file durable.
     fn sync_data(&self) -> io::Result<()>;
     fn len(&self) -> io::Result<u64>;
+    /// Extends the file to at least `len` bytes. The new range reads as
+    /// zeros and holds no disk space.
+    fn extend(&self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
     /// Hints that reads are random, disabling kernel readahead.
     fn advise_random(&self) {}
     /// Releases the disk space behind `[offset, offset + len)`, which then
@@ -61,6 +66,8 @@ pub trait File: Send + Sync {
     /// Starts reading `[offset, offset + len)` into the page cache without
     /// waiting, so a later read of it waits less.
     fn prefetch(&self, _offset: u64, _len: u64) {}
+    /// Drops `[offset, offset + len)` from the page cache.
+    fn drop_cache(&self, _offset: u64, _len: u64) {}
 }
 
 /// Storage backed by a directory on the local file system.
@@ -171,6 +178,13 @@ impl File for FsFile {
         Ok(self.0.metadata()?.len())
     }
 
+    fn extend(&self, len: u64) -> io::Result<()> {
+        if self.0.metadata()?.len() < len {
+            self.0.set_len(len)?;
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn advise_random(&self) {
         // SAFETY: posix_fadvise only reads its integer arguments.
@@ -184,6 +198,14 @@ impl File for FsFile {
         // SAFETY: posix_fadvise only reads its integer arguments.
         unsafe {
             libc::posix_fadvise(self.0.as_raw_fd(), offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_WILLNEED);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drop_cache(&self, offset: u64, len: u64) {
+        // SAFETY: posix_fadvise only reads its integer arguments.
+        unsafe {
+            libc::posix_fadvise(self.0.as_raw_fd(), offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
         }
     }
 

@@ -17,7 +17,7 @@ Each section names its machine and setup. [How the benchmarks run](#how-the-benc
 
 ## YCSB at 50M records
 
-50M records of 8-byte keys and 120-byte values (6.4 GB of user data) on an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive under ext4), under a 4 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads, and ran once on a freshly trimmed drive.
+50M records of 8-byte keys and 120-byte values (6.4 GB of user data) on an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive under ext4), under a 4 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads, and ran once on a freshly trimmed drive. lionturtle's disk figures come from a later run on another instance of the same type.
 
 With LZ4 on every engine, on values whose second half repeats the first (`--compression-ratio 0.5`), so they compress to about half their size:
 
@@ -30,7 +30,7 @@ With LZ4 on every engine, on values whose second half repeats the first (`--comp
 | E: 95% scan of up to 100 keys, 5% insert | 232 | 217 | 49 | 1.07× |
 | F: 50% read, 50% read-modify-write | 910 | 872 | 588 | 1.04× |
 | Write amplification during load | 4.0 | 4.5 | 5.0 | |
-| Disk after load (GB) | 4.8 | 4.8 | 4.4 | |
+| Disk after load (GB) | 5.2 | 4.8 | 4.4 | |
 | RSS during reads (GB) | 1.9 | 1.6 | 1.7 | |
 
 | Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
@@ -54,7 +54,7 @@ Without compression, on random values:
 | E: 95% scan of up to 100 keys, 5% insert | 169 | 139 | 45 | 1.21× |
 | F: 50% read, 50% read-modify-write | 727 | 641 | 469 | 1.13× |
 | Write amplification during load | 5.8 | 7.7 | 8.7 | |
-| Disk after load (GB) | 8.2 | 8.9 | 7.2 | |
+| Disk after load (GB) | 8.1 | 8.9 | 7.2 | |
 | RSS during reads (GB) | 1.9 | 1.6 | 1.8 | |
 
 | Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
@@ -67,59 +67,59 @@ Without compression, on random values:
 
 ## YCSB at 400M records
 
-400M records (51 GB of user data) on an EC2 i7ie.48xlarge (192 vCPUs, 16 NVMe drives in RAID 0 under XFS), under a 16 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 4 GB block cache, 128 MiB memtables and 32 client threads; RocksDB loaded with 8, its fastest. The engines ran one after another on one instance, with the drives trimmed before each. E ran 5M operations and every other workload 50M.
+400M records (51 GB of user data) on an EC2 i7ie.48xlarge (192 vCPUs, 16 NVMe drives in RAID 0 under XFS), under a 16 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 4 GB block cache, 128 MiB memtables and 32 client threads; RocksDB loaded with 8, its fastest. RocksDB and fjall ran one after the other on one instance, and lionturtle later on another of the same type, with the drives trimmed before each. E ran 5M operations and every other workload 50M.
 
 With LZ4 on every engine, on values that compress by half:
 
 | Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
 |---|--:|--:|--:|--:|
-| Load (inserts) | 872 | 475 | 297 | 1.84× |
-| A: 50% read, 50% update | 1,308 | 1,129 | 391 | 1.16× |
-| B: 95% read, 5% update | 1,513 | 1,370 | 1,114 | 1.10× |
-| C: 100% read | 1,577 | 1,403 | 1,159 | 1.12× |
-| E: 95% scan of up to 100 keys, 5% insert | 299 | 268 | 54 | 1.12× |
-| F: 50% read, 50% read-modify-write | 987 | 871 | 453 | 1.13× |
+| Load (inserts) | 908 | 475 | 297 | 1.91× |
+| A: 50% read, 50% update | 1,350 | 1,129 | 391 | 1.20× |
+| B: 95% read, 5% update | 1,533 | 1,370 | 1,114 | 1.12× |
+| C: 100% read | 1,599 | 1,403 | 1,159 | 1.14× |
+| E: 95% scan of up to 100 keys, 5% insert | 302 | 268 | 54 | 1.13× |
+| F: 50% read, 50% read-modify-write | 1,002 | 871 | 453 | 1.15× |
 | Write amplification during load | 5.8 | 7.9 | 9.7 | |
-| Disk after load (GB) | 36.7 | 31.8 | 33.5 | |
+| Disk after load (GB) | 36.6 | 31.8 | 33.5 | |
 | RSS during reads (GB) | 7.0 | 6.0 | 5.9 | |
 
 | Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
 |---|--:|--:|--:|--:|--:|--:|
-| A | 171 µs | 498 µs | 126 µs | 242 µs | 139 µs | 314 µs |
-| B | 111 µs | 195 µs | 122 µs | 215 µs | 140 µs | 243 µs |
-| C | 110 µs | 185 µs | 120 µs | 208 µs | 140 µs | 240 µs |
-| E (scans) | 345 µs | 1.8 ms | 451 µs | 755 µs | 8.0 ms | 10.2 ms |
-| F | 120 µs | 376 µs | 124 µs | 225 µs | 141 µs | 266 µs |
+| A | 138 µs | 310 µs | 126 µs | 242 µs | 139 µs | 314 µs |
+| B | 110 µs | 189 µs | 122 µs | 215 µs | 140 µs | 243 µs |
+| C | 108 µs | 179 µs | 120 µs | 208 µs | 140 µs | 240 µs |
+| E (scans) | 344 µs | 2.1 ms | 451 µs | 755 µs | 8.0 ms | 10.2 ms |
+| F | 115 µs | 203 µs | 124 µs | 225 µs | 141 µs | 266 µs |
 
-Most reads hit memory: median read latency on C was 0.9 µs for lionturtle, 4.0 µs for RocksDB and 4.9 µs for fjall. The rest wait on the drives. lionturtle's deepest read tails run longer under writes: read p99.9 on A was 498 µs against RocksDB's 242, and scan p99.9 on E was 1.8 ms against 755 µs. Scan p50 on E was 55, 49 and 187 µs.
+Most reads hit memory: median read latency on C was 0.9 µs for lionturtle, 4.0 µs for RocksDB and 4.9 µs for fjall. The rest wait on the drives. On A, lionturtle's read p99.9 was 310 µs against RocksDB's 242, and on F 203 µs against 225. Scan p99.9 on E was 2.1 ms against 755 µs, and scan p50 56, 49 and 187 µs.
 
 Without compression, on random values:
 
 | Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
 |---|--:|--:|--:|--:|
-| Load (inserts) | 858 | 466 | 299 | 1.84× |
-| A: 50% read, 50% update | 1,269 | 1,028 | 372 | 1.23× |
-| B: 95% read, 5% update | 1,279 | 1,173 | 940 | 1.09× |
-| C: 100% read | 1,382 | 1,172 | 946 | 1.18× |
-| E: 95% scan of up to 100 keys, 5% insert | 232 | 209 | 38 | 1.11× |
-| F: 50% read, 50% read-modify-write | 857 | 745 | 432 | 1.15× |
+| Load (inserts) | 856 | 466 | 299 | 1.84× |
+| A: 50% read, 50% update | 1,286 | 1,028 | 372 | 1.25× |
+| B: 95% read, 5% update | 1,329 | 1,173 | 940 | 1.13× |
+| C: 100% read | 1,430 | 1,172 | 946 | 1.22× |
+| E: 95% scan of up to 100 keys, 5% insert | 237 | 209 | 38 | 1.13× |
+| F: 50% read, 50% read-modify-write | 897 | 745 | 432 | 1.20× |
 | Write amplification during load | 9.0 | 13.5 | 15.6 | |
-| Disk after load (GB) | 61.7 | 59.4 | 56.1 | |
+| Disk after load (GB) | 62.2 | 59.4 | 56.1 | |
 | RSS during reads (GB) | 6.9 | 5.9 | 6.1 | |
 
 | Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
 |---|--:|--:|--:|--:|--:|--:|
-| A | 148 µs | 636 µs | 134 µs | 307 µs | 146 µs | 344 µs |
-| B | 112 µs | 201 µs | 127 µs | 222 µs | 147 µs | 300 µs |
-| C | 110 µs | 192 µs | 125 µs | 226 µs | 146 µs | 396 µs |
-| E (scans) | 466 µs | 3.4 ms | 539 µs | 855 µs | 11.7 ms | 15.6 ms |
-| F | 128 µs | 591 µs | 131 µs | 320 µs | 149 µs | 322 µs |
+| A | 128 µs | 246 µs | 134 µs | 307 µs | 146 µs | 344 µs |
+| B | 110 µs | 192 µs | 127 µs | 222 µs | 147 µs | 300 µs |
+| C | 108 µs | 183 µs | 125 µs | 226 µs | 146 µs | 396 µs |
+| E (scans) | 451 µs | 2.8 ms | 539 µs | 855 µs | 11.7 ms | 15.6 ms |
+| F | 120 µs | 237 µs | 131 µs | 320 µs | 149 µs | 322 µs |
 
 ## Where lionturtle wins and where it pays
 
 - **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. At 50M records with LZ4, loads lead by 1.67×, and the mixed workloads A and F by 1.04–1.19×.
 - **Point reads.** A get checks the memtables, skipping any whose Bloom filter rules the key out, then walks root to leaf. At each node it checks one Bloom filter per buffer level and reads at most one 4 KiB block. Page metadata (block index and filters) stays in memory, so a miss in the cache costs one device read.
-- **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs. At 400M records with LZ4, lionturtle's scans ran 1.12 times RocksDB's rate, but scan p99.9 on E was 1.8 ms against 755 µs.
+- **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs. At 400M records with LZ4, lionturtle's scans ran 1.13 times RocksDB's rate, but scan p99.9 on E was 2.1 ms against 755 µs.
 - **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint, a checkpoint holds the pages it creates until it writes them, up to half the cache, and each merge thread's allocator heap keeps buffers other threads freed. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap: 2.8 GB against 1.3 GB under 128 durable writers in [Durable writes under load](#durable-writes-under-load).
 
 ## Durable writes under load
