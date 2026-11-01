@@ -20,5 +20,5 @@ capture() { # chart theme page-color window-height
 
 capture ycsb light '#ffffff' 2400
 capture ycsb dark '#0d1117' 2400
-capture durable light '#ffffff' 1600
-capture durable dark '#0d1117' 1600
+capture durable light '#ffffff' 2600
+capture durable dark '#0d1117' 2600

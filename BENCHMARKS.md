@@ -17,82 +17,146 @@ Each section names its machine and setup. [How the benchmarks run](#how-the-benc
 
 ## YCSB at 50M records
 
-50M records of 8-byte keys and 120-byte values (6.4 GB of user data) on an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive under ext4), under a 4 GB memory cap that covers page cache. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads.
+50M records of 8-byte keys and 120-byte values (6.4 GB of user data) on an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive under ext4), under a 4 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 1 GB block cache, 128 MiB memtables and 16 client threads, and ran once on a freshly trimmed drive.
+
+With LZ4 on every engine, on values whose second half repeats the first (`--compression-ratio 0.5`), so they compress to about half their size:
 
 | Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
 |---|--:|--:|--:|--:|
-| Load (inserts) | 1,417 | 867 | 382 | 1.63× |
-| A: 50% read, 50% update | 1,180 | 958 | 511 | 1.23× |
-| B: 95% read, 5% update | 1,028 | 902 | 705 | 1.14× |
-| C: 100% read | 1,041 | 883 | 732 | 1.18× |
-| E: 95% scan of up to 100 keys, 5% insert | 149 | 135 | 43 | 1.10× |
-| F: 50% read, 50% read-modify-write | 680 | 646 | 464 | 1.05× |
-| Write amplification during load | 5.8 | 7.6 | 8.7 | |
-| Disk after load (GB) | 8.0 | 7.7 | 8.2 | |
-| RSS during reads (GB) | 2.0 | 1.6 | 2.0 | |
+| Load (inserts) | 1,735 | 1,038 | 417 | 1.67× |
+| A: 50% read, 50% update | 1,465 | 1,232 | 565 | 1.19× |
+| B: 95% read, 5% update | 1,518 | 1,298 | 1,090 | 1.17× |
+| C: 100% read | 1,639 | 1,331 | 1,054 | 1.23× |
+| E: 95% scan of up to 100 keys, 5% insert | 232 | 217 | 49 | 1.07× |
+| F: 50% read, 50% read-modify-write | 910 | 872 | 588 | 1.04× |
+| Write amplification during load | 4.0 | 4.5 | 5.0 | |
+| Disk after load (GB) | 4.8 | 4.8 | 4.4 | |
+| RSS during reads (GB) | 1.9 | 1.6 | 1.7 | |
 
-Read p99 on workload C was 105 µs for lionturtle, 118 µs for RocksDB and 138 µs for fjall. Scan p50 on E was 39, 37 and 124 µs.
+| Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| A | 130 µs | 250 µs | 119 µs | 316 µs | 131 µs | 247 µs |
+| B | 107 µs | 152 µs | 116 µs | 157 µs | 135 µs | 228 µs |
+| C | 106 µs | 136 µs | 116 µs | 153 µs | 134 µs | 226 µs |
+| E (scans) | 305 µs | 443 µs | 339 µs | 400 µs | 6.4 ms | 7.6 ms |
+| F | 116 µs | 218 µs | 119 µs | 211 µs | 139 µs | 248 µs |
+
+Reads that hit memory took 0.6 µs at the median on C for lionturtle, 1.8 µs for RocksDB and 1.9 µs for fjall. Over C, lionturtle read 17 GB from the drive, RocksDB 24 GB and fjall 48 GB. Scan p50 on E was 34, 36 and 57 µs.
+
+Without compression, on random values:
+
+| Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
+|---|--:|--:|--:|--:|
+| Load (inserts) | 1,632 | 1,025 | 405 | 1.59× |
+| A: 50% read, 50% update | 1,244 | 983 | 525 | 1.27× |
+| B: 95% read, 5% update | 1,131 | 883 | 720 | 1.28× |
+| C: 100% read | 1,193 | 887 | 730 | 1.35× |
+| E: 95% scan of up to 100 keys, 5% insert | 169 | 139 | 45 | 1.21× |
+| F: 50% read, 50% read-modify-write | 727 | 641 | 469 | 1.13× |
+| Write amplification during load | 5.8 | 7.7 | 8.7 | |
+| Disk after load (GB) | 8.2 | 8.9 | 7.2 | |
+| RSS during reads (GB) | 1.9 | 1.6 | 1.8 | |
+
+| Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| A | 141 µs | 309 µs | 135 µs | 416 µs | 149 µs | 494 µs |
+| B | 109 µs | 195 µs | 127 µs | 233 µs | 151 µs | 252 µs |
+| C | 108 µs | 156 µs | 126 µs | 230 µs | 149 µs | 247 µs |
+| E (scans) | 453 µs | 632 µs | 489 µs | 597 µs | 6.8 ms | 8.0 ms |
+| F | 125 µs | 258 µs | 131 µs | 271 µs | 159 µs | 328 µs |
 
 ## YCSB at 400M records
 
-400M records (51 GB of user data) on an EC2 i7ie.48xlarge (192 vCPUs, 16 NVMe drives in RAID 0 under XFS), under a 16 GB memory cap that covers page cache. Every engine got a 4 GB block cache, 128 MiB memtables and 32 client threads; RocksDB loaded with 8, its fastest.
+400M records (51 GB of user data) on an EC2 i7ie.48xlarge (192 vCPUs, 16 NVMe drives in RAID 0 under XFS), under a 16 GB memory cap that covers page cache, with the CPUs' C6 idle state disabled. Every engine got a 4 GB block cache, 128 MiB memtables and 32 client threads; RocksDB loaded with 8, its fastest. The engines ran one after another on one instance, with the drives trimmed before each. E ran 5M operations and every other workload 50M.
+
+With LZ4 on every engine, on values that compress by half:
 
 | Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
 |---|--:|--:|--:|--:|
-| Load (inserts) | 877 | 458 | 311 | 1.92× |
-| A: 50% read, 50% update | 1,236 | 1,010 | 379 | 1.22× |
-| B: 95% read, 5% update | 1,250 | 1,105 | 904 | 1.13× |
-| C: 100% read | 1,320 | 1,093 | 910 | 1.21× |
-| E: 95% scan of up to 100 keys, 5% insert | 227 | 220 | 37 | 1.03× |
-| F: 50% read, 50% read-modify-write | 808 | 731 | 430 | 1.11× |
-| Write amplification during load | 9.0 | 13.5 | 15.2 | |
-| Disk after load (GB) | 61.9 | 56.7 | 56.0 | |
-| RSS during reads (GB) | 7.1 | 6.1 | 6.6 | |
+| Load (inserts) | 872 | 475 | 297 | 1.84× |
+| A: 50% read, 50% update | 1,308 | 1,129 | 391 | 1.16× |
+| B: 95% read, 5% update | 1,513 | 1,370 | 1,114 | 1.10× |
+| C: 100% read | 1,577 | 1,403 | 1,159 | 1.12× |
+| E: 95% scan of up to 100 keys, 5% insert | 299 | 268 | 54 | 1.12× |
+| F: 50% read, 50% read-modify-write | 987 | 871 | 453 | 1.13× |
+| Write amplification during load | 5.8 | 7.9 | 9.7 | |
+| Disk after load (GB) | 36.7 | 31.8 | 33.5 | |
+| RSS during reads (GB) | 7.0 | 6.0 | 5.9 | |
 
-Most reads hit memory: median read latency on C was under 5 µs for every engine. The rest wait on the drives, and read p99 on C was 113 µs for lionturtle, 134 µs for RocksDB and 153 µs for fjall. Scan p50 on E was 61, 45 and 322 µs. The three engines ran one after another on one instance, with the drives trimmed before each and the CPUs' C6 idle state disabled.
+| Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| A | 171 µs | 498 µs | 126 µs | 242 µs | 139 µs | 314 µs |
+| B | 111 µs | 195 µs | 122 µs | 215 µs | 140 µs | 243 µs |
+| C | 110 µs | 185 µs | 120 µs | 208 µs | 140 µs | 240 µs |
+| E (scans) | 345 µs | 1.8 ms | 451 µs | 755 µs | 8.0 ms | 10.2 ms |
+| F | 120 µs | 376 µs | 124 µs | 225 µs | 141 µs | 266 µs |
+
+Most reads hit memory: median read latency on C was 0.9 µs for lionturtle, 4.0 µs for RocksDB and 4.9 µs for fjall. The rest wait on the drives. lionturtle's deepest read tails run longer under writes: read p99.9 on A was 498 µs against RocksDB's 242, and scan p99.9 on E was 1.8 ms against 755 µs. Scan p50 on E was 55, 49 and 187 µs.
+
+Without compression, on random values:
+
+| Workload (thousand ops/s) | lionturtle | RocksDB | fjall | vs RocksDB |
+|---|--:|--:|--:|--:|
+| Load (inserts) | 858 | 466 | 299 | 1.84× |
+| A: 50% read, 50% update | 1,269 | 1,028 | 372 | 1.23× |
+| B: 95% read, 5% update | 1,279 | 1,173 | 940 | 1.09× |
+| C: 100% read | 1,382 | 1,172 | 946 | 1.18× |
+| E: 95% scan of up to 100 keys, 5% insert | 232 | 209 | 38 | 1.11× |
+| F: 50% read, 50% read-modify-write | 857 | 745 | 432 | 1.15× |
+| Write amplification during load | 9.0 | 13.5 | 15.6 | |
+| Disk after load (GB) | 61.7 | 59.4 | 56.1 | |
+| RSS during reads (GB) | 6.9 | 5.9 | 6.1 | |
+
+| Read latency | lionturtle p99 | p99.9 | RocksDB p99 | p99.9 | fjall p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| A | 148 µs | 636 µs | 134 µs | 307 µs | 146 µs | 344 µs |
+| B | 112 µs | 201 µs | 127 µs | 222 µs | 147 µs | 300 µs |
+| C | 110 µs | 192 µs | 125 µs | 226 µs | 146 µs | 396 µs |
+| E (scans) | 466 µs | 3.4 ms | 539 µs | 855 µs | 11.7 ms | 15.6 ms |
+| F | 128 µs | 591 µs | 131 µs | 320 µs | 149 µs | 322 µs |
 
 ## Where lionturtle wins and where it pays
 
-- **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. At 50M records, loads lead by 1.63×, and the mixed workloads A and F by 1.05–1.23×.
+- **Writes.** A checkpoint merges a whole memtable into the tree at once, and buffer levels absorb several checkpoints before data reaches the leaves. At 50M records with LZ4, loads lead by 1.67×, and the mixed workloads A and F by 1.04–1.19×.
 - **Point reads.** A get checks the memtables, skipping any whose Bloom filter rules the key out, then walks root to leaf. At each node it checks one Bloom filter per buffer level and reads at most one 4 KiB block. Page metadata (block index and filters) stays in memory, so a miss in the cache costs one device read.
-- **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs.
-- **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint, a checkpoint holds the pages it creates until it writes them, up to half the cache, and each merge thread's allocator heap keeps buffers other threads freed. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap: 3.0 GB against 1.5 GB under 128 durable writers in [Durable writes under load](#durable-writes-under-load).
+- **Scans.** A scan merges the leaf with every buffer level on its root-to-leaf path: up to nine sorted runs with the default four levels. In a cold key range each run can need its own device read. A scan starts those reads together before reading any, along with the leaf's next block when it expects to read more than half a block, so a cold range costs about one read latency. An LSM tree keeps about 90% of its data in the last level, so its scans touch fewer runs. At 400M records with LZ4, lionturtle's scans ran 1.12 times RocksDB's rate, but scan p99.9 on E was 1.8 ms against 755 µs.
+- **Memory.** Page metadata stays resident: about 1 GB per 400M keys, outside the block cache. Memtables keep every version of a key until the next checkpoint, a checkpoint holds the pages it creates until it writes them, up to half the cache, and each merge thread's allocator heap keeps buffers other threads freed. RSS at equal cache sizes runs above RocksDB's, which leaves less page cache under a cap: 2.8 GB against 1.3 GB under 128 durable writers in [Durable writes under load](#durable-writes-under-load).
 
 ## Durable writes under load
 
-Workload A with uniform keys, half reads and half updates, on 20M records of 1 KB: 20 GB against a 3 GB memory cap that covers page cache, so nearly every read goes to the drive. Every update is durable before it returns: `--sync 1` for the embedded engines, and ScyllaDB's commitlog in batch mode. 128 client threads drive each engine, each engine caches 256 MB, and each run starts from a fresh copy of the same loaded store. The machine is an EC2 i7ie.6xlarge (24 vCPUs) with one of its 7.5 TB instance-store NVMe drives under ext4, deep idle states off, and the drive trimmed before each run.
+Workload A with uniform keys, half reads and half updates, on 20M records of 1 KB: 20 GB against a 3 GB memory cap that covers page cache, so nearly every read goes to the drive. Every update is durable before it returns: `--sync 1` for the embedded engines, and ScyllaDB's commitlog in batch mode. 128 client threads drive each engine, each engine caches 256 MB, and each run starts from a fresh copy of the same loaded store, out of the page cache. The embedded engines ran with LZ4 on; the values are random, so it saves little. The machine is an EC2 i7ie.6xlarge (24 vCPUs) with one of its 7.5 TB instance-store NVMe drives under ext4, deep idle states off, and the drive trimmed before each run. ScyllaDB's rows come from an earlier run with the same setup; kvbench's changes since then leave its path unchanged.
 
 At a fixed offered load, five minutes each:
 
-| Durable ops/s | Engine | Read p50 | Read p99 | Read p999 | Update p50 | Update p99 | Update p999 | Seconds with read p99 over 10 ms |
+| Durable ops/s | Engine | Read p50 | Read p99 | Read p99.9 | Update p50 | Update p99 | Update p99.9 | Seconds with read p99 over 10 ms |
 |---|---|--:|--:|--:|--:|--:|--:|--:|
-| 11k | lionturtle | 92 µs | 0.18 ms | 0.28 ms | 36 µs | 0.12 ms | 0.16 ms | 0 of 300 |
-| | RocksDB | 106 µs | 0.20 ms | 0.45 ms | 182 µs | 0.41 ms | 3.6 ms | 0 |
+| 11k | lionturtle | 91 µs | 0.18 ms | 0.30 ms | 35 µs | 0.11 ms | 0.15 ms | 0 of 300 |
+| | RocksDB | 104 µs | 0.19 ms | 0.47 ms | 177 µs | 0.41 ms | 3.2 ms | 0 |
 | | ScyllaDB | 193 µs | 1.4 ms | 2.8 ms | 107 µs | 1.3 ms | 2.3 ms | 0 |
-| 70k | lionturtle | 98 µs | 0.23 ms | 1.0 ms | 86 µs | 0.25 ms | 1.4 ms | 0 |
-| | RocksDB | 112 µs | 4.4 ms | 399 ms | 407 µs | 6.8 ms | 403 ms | 12 |
+| 70k | lionturtle | 97 µs | 0.24 ms | 0.96 ms | 83 µs | 0.27 ms | 1.4 ms | 0 |
+| | RocksDB | 110 µs | 3.1 ms | 12 ms | 403 µs | 5.4 ms | 14 ms | 12 |
 | | ScyllaDB | 540 µs | 9.3 ms | 31 ms | 529 µs | 9.3 ms | 30 ms | 62 |
-| 118k | lionturtle | 104 µs | 0.29 ms | 4.0 ms | 142 µs | 0.37 ms | 4.4 ms | 2 |
-| | RocksDB | 122 µs | 20 ms | 157 ms | 514 µs | 21 ms | 159 ms | 122 |
-| 150k | lionturtle | 109 µs | 0.35 ms | 7.6 ms | 159 µs | 0.45 ms | 8.7 ms | 6 |
-| | RocksDB | 130 µs | 603 ms | 1.4 s | 562 µs | 610 ms | 1.4 s | 184 |
+| 118k | lionturtle | 103 µs | 0.30 ms | 2.8 ms | 141 µs | 0.40 ms | 3.0 ms | 0 |
+| | RocksDB | 119 µs | 62 ms | 1.4 s | 477 µs | 63 ms | 1.4 s | 117 |
+| 150k | lionturtle | 107 µs | 0.41 ms | 8.5 ms | 157 µs | 0.53 ms | 9.6 ms | 6 |
+| | RocksDB | 127 µs | 231 ms | 1.2 s | 579 µs | 235 ms | 1.2 s | 180 |
 
 70k ops/s is half of ScyllaDB's closed-loop peak, and 118k half of RocksDB's over its first 40 seconds. In closed loop, where each client issues its next operation when the last returns:
 
 | Closed loop, 128 clients | lionturtle | RocksDB | ScyllaDB |
 |---|--:|--:|--:|
-| Throughput, sustained | 226k ops/s | 206k | 88k |
-| Throughput over the first 40 seconds | 229k | 237k | 130k–152k |
-| Update p50, sustained | 300 µs | 919 µs | 1.25 ms |
-| Update p99 | 0.94 ms | 4.4 ms | 3.1 ms |
-| Update p999 | 18 ms | 15 ms | 12 ms |
-| Update max | 0.92 s | 75 ms | 53 ms |
-| Read p99 | 0.48 ms | 0.56 ms | 7.9 ms |
-| Read p999 | 1.1 ms | 0.91 ms | 24 ms |
-| Write amplification | 8.2 | 12.1 | |
-| Peak RSS | 3.0 GB | 1.5 GB | |
+| Throughput, sustained | 261k ops/s | 212k | 88k |
+| Throughput over the first 40 seconds | 265k | 237k | 130k–152k |
+| Update p50, sustained | 294 µs | 906 µs | 1.25 ms |
+| Update p99 | 0.91 ms | 4.1 ms | 3.1 ms |
+| Update p99.9 | 11 ms | 14 ms | 12 ms |
+| Update max | 0.91 s | 83 ms | 53 ms |
+| Read p99 | 0.49 ms | 0.59 ms | 7.9 ms |
+| Read p99.9 | 0.77 ms | 0.94 ms | 24 ms |
+| Write amplification | 8.2 | 12.0 | |
+| Peak RSS | 2.8 GB | 1.3 GB | |
 
-Sustained runs lasted 10 to 17 minutes: 140M operations for the embedded engines and 90M for ScyllaDB, which slowed from 96k ops/s in its first minute to 77k in its sixteenth. RocksDB starts faster and slows down too. It defers compaction to keep writes moving: over ten minutes its pending compaction grew to 4.7 GB, its write amplification rose from about 8 over the first 40 seconds to 12.1, and its throughput fell from 219k ops/s in the first minute to 194k–213k after. The deferred compaction competes with reads: at 70k ops/s it held a read 663 ms, and at 150k its read p99 was 603 ms. lionturtle checkpoints each memtable as it fills and held 216k–234k ops/s in every minute. When merging falls behind, its writers wait instead: at the closed-loop peak its update p999 was 18 ms against RocksDB's 15 ms, and its slowest update took 0.92 s against 75 ms.
+Sustained runs lasted 9 to 17 minutes: 140M operations for the embedded engines and 90M for ScyllaDB, which slowed from 96k ops/s in its first minute to 77k in its sixteenth. RocksDB slows too. It defers compaction to keep writes moving: over 11 minutes its pending compaction grew to 7.4 GB, and its throughput fell from 232k ops/s in the first minute to 200k–215k after. The deferred compaction competes with reads: at 118k ops/s its read p99 was 62 ms, and at 150k 231 ms. lionturtle checkpoints each memtable as it fills and held 254k–265k ops/s in every minute. When merging falls behind, its writers wait instead: its slowest update took 0.91 s against RocksDB's 83 ms, while its update p99.9 was 11 ms against 14 ms.
 
 ScyllaDB reports single-digit-millisecond read p99s while it compacts: on one i4i.4xlarge at about half its peak load, a 50/50 read/write workload held read p99 at 6.06 ms through a major compaction ([ScyllaDB 5.0 on i4i](https://www.scylladb.com/2022/09/07/benchmarking-scylladb-5-0-on-aws-i4i-4xlarge/)). `bench/scylla.sh` runs ScyllaDB 2026.3.4 as one node with 8 shards, an `iotune` profile of the drive and the same 3 GB cap, and kvbench calls it over CQL on loopback. The comparison favors the embedded engines in three ways:
 
@@ -100,7 +164,7 @@ ScyllaDB reports single-digit-millisecond read p99s while it compacts: on one i4
 - **Memory.** ScyllaDB recommends at least 1 GB per shard; under the cap its 8 shards share 2.5 GB.
 - **Cores.** Its shards run on 8 of the 24 vCPUs with `--overprovisioned`, sharing them with the client threads.
 
-With buffered writes from 16 client threads instead, as in the tables above, the closed-loop peak was 235k ops/s for lionturtle and 232k for RocksDB, two runs each.
+With buffered writes from 16 client threads instead, as in the YCSB tables, the closed-loop peak was 256k ops/s for lionturtle in both of two runs and 217k–219k for RocksDB.
 
 The drive keeps reads fast beside heavy writes. In fio, 4 KiB reads at 72k IOPS beside 600 MB/s of writes held read p99.99 under 0.9 ms, whether the kernel wrote the data back or the writer issued it directly in 256 KiB or 4 MiB pieces. In the same test, the workstation's consumer NVMe drive held read p99.99 near 50 ms for every write pattern but 4 MiB direct writes, which held it at 6 ms, so every engine's tails run longer there.
 
@@ -110,12 +174,12 @@ REGION=us-west-2 bench/aws/launch.sh i7ie.6xlarge <subnet> lionturtle-bench
 ONE_DRIVE=1 bench/aws/setup.sh
 sudo cpupower idle-set -D 10
 k=~/lionturtle/target/release/kvbench
-load="--records 20000000 --value-size 1000 --cache-mb 256 --phases load --settle 1 --keep 1"
+load="--records 20000000 --value-size 1000 --cache-mb 256 --phases load --settle 1 --keep 1 --compression lz4"
 systemd-run --user --scope -p MemoryMax=3G $k --engine lionturtle --threads 16 --dir /mnt/data/keep-lionturtle $load
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 systemd-run --user --scope -p MemoryMax=3G \
   $k --engine rocksdb --threads 8 --dir /mnt/data/keep-rocksdb $load
-THREADS=128 bench/aws/run.sh lionturtle tk-70k 70000 21000000 --sync 1    # five minutes at 70k
-THREADS=128 bench/aws/run.sh rocksdb rocks-long - 140000000 --sync 1   # closed loop, ten minutes
+THREADS=128 bench/aws/run.sh lionturtle lt-70k 70000 21000000 --sync 1 --compression lz4    # five minutes at 70k
+THREADS=128 bench/aws/run.sh rocksdb rocks-long - 140000000 --sync 1 --compression lz4   # closed loop
 # ScyllaDB: load with the periodic commitlog, flush and compact, then restart it in batch mode.
 sudo sysctl -w fs.aio-max-nr=1048576
 bench/scylla.sh /mnt/data/scylla periodic &
@@ -180,13 +244,13 @@ Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB m
 | Workstation NVMe, 1 | 0.5 | 0.3 | 0.5 | 0.5 |
 | Workstation NVMe, 16 | 4.1 | 2.4 | 4.7 | 0.5 |
 | Workstation NVMe, 64 | 16.0 | 7.7 | 15.1 | 0.4 |
-| EC2 i7ie.6xlarge, 1 | 38.2 | 7.9 | 34.3 | 32.2 |
-| EC2 i7ie.6xlarge, 16 | 188.5 | 61.6 | 175.9 | 29.9 |
-| EC2 i7ie.6xlarge, 64 | 369.6 | 139.7 | 242.6 | 16.3 |
+| EC2 i7ie.6xlarge, 1 | 37.2 | 7.9 | 35.2 | 32.4 |
+| EC2 i7ie.6xlarge, 16 | 191.1 | 63.1 | 179.7 | 30.4 |
+| EC2 i7ie.6xlarge, 64 | 383.7 | 141.8 | 251.8 | 16.2 |
 
-The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. The i7ie's instance-store drive (ext4) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 26 µs on average for lionturtle on one thread.
+The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. The i7ie's instance-store drive (ext4) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 27 µs on average for lionturtle on one thread.
 
-The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit. With it enabled, RocksDB with recycled logs fell from 176 to 29 thousand durable updates per second at 16 threads and from 243 to 54 thousand at 64, RocksDB's one-thread mean rose from 127 to 548 µs, and fjall fell to 4 thousand per second at 64 threads. lionturtle fell from 189 to 127 thousand at 16 threads and held within 4% at 1 and 64. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
+The EC2 rows ran with the CPUs' C6 idle state disabled. C6 takes 190 µs to exit. In an earlier run with it enabled, RocksDB with recycled logs fell to 29 thousand durable updates per second at 16 threads and 54 thousand at 64, RocksDB's one-thread mean rose from 127 to 548 µs, and fjall fell to 4 thousand per second at 64 threads. lionturtle fell to 127 thousand at 16 threads and held within 4% of its C6-off rate at 1 and 64. For latency-sensitive storage, disable deep idle states: `sudo cpupower idle-set -D 10` disables those with an exit latency of 10 µs or more.
 
 The i7ie.6xlarge has one CPU socket; the i7ie.48xlarge has two, and writers on different sockets pass the log's state across the link between them. There, binding the process to one socket's CPUs raised 64-thread durable throughput by 17% for lionturtle, from 319 to 373 thousand per second, and by 10% for RocksDB with recycled logs, at the cost of the other socket's cores for reads and background work:
 
@@ -248,7 +312,7 @@ To isolate the CPU cost, lionturtle and RocksDB ran 20M records of the same valu
 
 LZ4 cost lionturtle at most 3.0% on any workload. Mean read latency on C fell from 1.40 to 1.36 µs, and RocksDB's rose from 2.23 to 2.35 µs.
 
-Values that compress too little cost nothing to store with LZ4 on, since lionturtle then stores its pages as it would without compression. The same tmpfs runs with random values, and with values whose last tenth repeats their first (`--compression-ratio 0.9`), stayed within 2.4% of the runs without LZ4 on every workload, except E on random values at −5.6%, where runs of one configuration spread by 10%. Compressing every block of the 0.9 values instead cut page writes by 12% and cost 4–5% on A, B and C. On the workstation's drive under a 4 GB cap, with 50M records, it shrank the store by 6%, read as much from the drive, and slowed the load by 4.5% and A by 1%.
+Values that compress too little cost nothing to store with LZ4 on, since lionturtle then stores its pages as it would without compression. The same tmpfs runs with random values, and with values whose last tenth repeats their first (`--compression-ratio 0.9`), stayed within 2.4% of the runs without LZ4 on every workload, except E on random values at −5.6%, where runs of one configuration spread by 10%. Compressing every block of the 0.9 values instead cut page writes by 12% and cost 4–5% on A, B and C. On the i7ie.6xlarge under a 4 GB cap, with 50M records and two runs of each, compressing every block of those values cut page writes by 6%, read 1% more from the drive, slowed the load by 7%, and left A and C within 2%. Values that compress to 0.75 of their size clear the cutoff: lionturtle compressed them, cutting page writes by 19% and drive reads on C by 11%, and ran A 6% and C 11% faster than without LZ4.
 
 ```console
 bench/compression.sh bench-data/ycsb > compression.jsonl
@@ -271,7 +335,7 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 - Each run is one process in one memory cgroup, with page cache counted against the cap.
 - No engine compresses data unless `--compression lz4` turns on LZ4 for all of them, and no engine fsyncs per write. RocksDB buffers its log manually, fjall persists its journal manually, and lionturtle buffers up to 1 MiB of log. `--sync 1` makes every write in the timed phases durable before it returns; `bench/sync.sh` runs that comparison.
 - RocksDB runs on jemalloc, its production allocator. lionturtle and fjall run on mimalloc.
-- kvbench turns off transparent huge pages for its process. mimalloc asks for them on its arenas, and under a memory cap they leave less of it for page cache: on C at 50M records with LZ4 under a 4 GB cap, lionturtle kept 1.2 GB of page cache with them and 2.3 GB without, and ran 37% faster without. Between two runs of `bench/compression.sh`, turning them off raised lionturtle's throughput after the load by 13–33% with LZ4 and 4–19% without, and moved RocksDB's by at most 7%. The Compression section ran with them off; every other section ran with them on.
+- kvbench turns off transparent huge pages for its process. mimalloc asks for them on its arenas, and under a memory cap they leave less of it for page cache: on C at 50M records with LZ4 under a 4 GB cap, lionturtle kept 1.2 GB of page cache with them and 2.3 GB without, and ran 37% faster without. Between two runs of `bench/compression.sh`, turning them off raised lionturtle's throughput after the load by 13–33% with LZ4 and 4–19% without, and moved RocksDB's by at most 7%. Reads during sustained writes, Clock speed and the workstation rows of Synchronous writes ran with them on; every other section ran with them off.
 - lionturtle's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
 - Latency runs need a quiet drive. Each read of an NVMe drive's temperature in `/sys/class/hwmon` sends the drive a SMART log request, and the workstation's drive holds reads about 3.4 ms behind each one; monitoring agents that poll every second put a floor under every second's p99. Eight ClickHouse processes, polling together, made that floor about 40 ms.
 - Runs on an SSD need it trimmed. A drive that has not been told which blocks were freed copies them during garbage collection, and on the workstation's drive, mounted without `discard` and trimmed weekly, identical runs drifted 30% apart after a few hundred GB of copies were written and deleted. Run `sudo fstrim /` before each run; after one full trim, six alternating runs of three builds landed within 2% of each other.
@@ -281,10 +345,14 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 
 ```console
 cargo build --release -p kvbench --features rocksdb
+lz4="--compression lz4 --compression-ratio 0.5"   # or --compression none for the uncompressed tables
 systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-  ./target/release/kvbench --engine lionturtle --records 50000000 --ops 50000000 --threads 16
+  ./target/release/kvbench --engine lionturtle --records 50000000 --ops 50000000 --threads 16 $lz4
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-  ./target/release/kvbench --engine rocksdb --records 50000000 --ops 50000000 --threads 16
+  ./target/release/kvbench --engine rocksdb --records 50000000 --ops 50000000 --threads 16 $lz4
+# 400M records on an i7ie.48xlarge, after bench/aws/setup.sh:
+systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 ./target/release/kvbench --engine lionturtle \
+  --dir /mnt/data/run --records 400000000 --ops 50000000 --threads 32 --cache-mb 4096 $lz4
 ```
 
-Each phase prints one JSON line with throughput, latency percentiles, bytes read and written, write amplification, RSS and disk use. On EC2, `bench/aws/launch.sh` starts a tagged spot instance, `setup.sh` builds RAID 0 over its instance-store drives, or ext4 on one with `ONE_DRIVE=1`, and compiles the benchmarks, `exp.sh` runs one engine's YCSB sequence under a 16 GB cap with profiles of the read phases, `run.sh` runs workload A once on a fresh copy of a loaded store, and `teardown.sh` removes every tagged resource.
+Each phase prints one JSON line with throughput, latency percentiles, bytes read and written, write amplification, RSS and disk use. On EC2, `bench/aws/launch.sh` starts a tagged spot instance, `setup.sh` builds RAID 0 over its instance-store drives, or ext4 on one with `ONE_DRIVE=1`, and compiles the benchmarks, `exp.sh` runs one engine's YCSB sequence at 400M records under a 16 GB cap with profiles of the read phases, `run.sh` runs workload A once on a fresh copy of a loaded store, and `teardown.sh` removes every tagged resource.

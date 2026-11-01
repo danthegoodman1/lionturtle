@@ -81,7 +81,7 @@ h3 { font-size: 1.05rem; font-weight: 650; }
 .axis span { position: absolute; top: 4px; transform: translateX(-50%); font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .axis-cap { grid-column: 2; font-size: 0.76rem; color: var(--muted); }
 
-/* Durable writes: p99 against offered load, one panel per operation, shared log axis */
+/* Durable writes: p99 and p99.9 against offered load, one panel per operation and percentile, shared log axis */
 .durable { display: flex; flex-direction: column; gap: 16px; }
 .multiples { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .panel { padding: 16px 16px 10px; display: flex; flex-direction: column; gap: 8px; }
@@ -102,10 +102,10 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="ycsb">
     <div class="hero-head">
-      <h1>lionturtle loads <em>1.6×</em> as fast as RocksDB and leads every YCSB workload</h1>
+      <h1>lionturtle loads <em>1.7×</em> as fast as RocksDB and leads every YCSB workload</h1>
       <div class="hero-meta">
-        <span><b>YCSB</b> · 50M records of 128 bytes · 16 client threads</span>
-        <span>4 GB memory cap · 1 GB block cache · 128 MiB memtables</span>
+        <span><b>YCSB</b> · 50M records of 128 bytes · LZ4 on every engine</span>
+        <span>16 client threads · 4 GB memory cap · 1 GB block cache</span>
         <span>EC2 i7ie.6xlarge · instance-store NVMe</span>
       </div>
     </div>
@@ -116,7 +116,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
         <span><i class="sw" style="background:var(--third)"></i>fjall</span>
       </div>
-      <span>Bytes written per user byte during load: lionturtle 5.8, RocksDB 7.6, fjall 8.7.</span>
+      <span>Values compress to half their size. Bytes written per user byte during load: lionturtle 4.0, RocksDB 4.5, fjall 5.0.</span>
     </div>
   </div>
 
@@ -136,20 +136,24 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
 <script>
 const D = {
-  // BENCHMARKS.md, YCSB at 50M records: thousand ops/s for lionturtle, RocksDB, fjall
+  // BENCHMARKS.md, YCSB at 50M records with LZ4: thousand ops/s for lionturtle, RocksDB, fjall
   ycsb: [
-    ["Load", "inserts", 1417, 867, 382],
-    ["Workload A", "50% read, 50% update", 1180, 958, 511],
-    ["Workload B", "95% read, 5% update", 1028, 902, 705],
-    ["Workload C", "100% read", 1041, 883, 732],
-    ["Workload E", "95% scan, 5% insert", 149, 135, 43],
-    ["Workload F", "50% read, 50% read-modify-write", 680, 646, 464],
+    ["Load", "inserts", 1735, 1038, 417],
+    ["Workload A", "50% read, 50% update", 1465, 1232, 565],
+    ["Workload B", "95% read, 5% update", 1518, 1298, 1090],
+    ["Workload C", "100% read", 1639, 1331, 1054],
+    ["Workload E", "95% scan, 5% insert", 232, 217, 49],
+    ["Workload F", "50% read, 50% read-modify-write", 910, 872, 588],
   ],
-  // BENCHMARKS.md, durable writes under load: p99 in ms at each offered rate
+  // BENCHMARKS.md, durable writes under load: latency in ms at each offered rate
   durable: {
     rates: [11000, 70000, 118000, 150000],
-    read: { lt: [0.18, 0.23, 0.29, 0.35], rocks: [0.20, 4.4, 20, 603], third: [1.4, 9.3] },
-    update: { lt: [0.12, 0.25, 0.37, 0.45], rocks: [0.41, 6.8, 21, 610], third: [1.3, 9.3] },
+    panels: [
+      ["Read p99", { lt: [0.18, 0.24, 0.30, 0.41], rocks: [0.19, 3.1, 62, 231], third: [1.4, 9.3] }],
+      ["Read p99.9", { lt: [0.30, 0.96, 2.8, 8.5], rocks: [0.47, 12, 1400, 1200], third: [2.8, 31] }],
+      ["Update p99", { lt: [0.11, 0.27, 0.40, 0.53], rocks: [0.41, 5.4, 63, 235], third: [1.3, 9.3] }],
+      ["Update p99.9", { lt: [0.15, 1.4, 3.0, 9.6], rocks: [3.2, 14, 1400, 1200], third: [2.3, 30] }],
+    ],
   },
 };
 
@@ -165,7 +169,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 
 (function ycsb() {
   const host = document.getElementById("ycsb-chart");
-  const MAX = 1650, ticks = [0, 500, 1000, 1500];
+  const MAX = 1800, ticks = [0, 500, 1000, 1500];
   const pos = v => (v / MAX) * 100;
   host.append(el("div", "colhead", "Workload"), el("div", "colhead", "Thousand ops/s"), el("div", "colhead r", "vs RocksDB"));
   for (const [name, sub, lt, rocks, fjall] of D.ycsb) {
@@ -191,14 +195,14 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 (function durable() {
   const host = document.getElementById("multiples");
   const S = D.durable, W = 480, H = 300, L = 58, R = 92, T = 14, B = 46;
-  const LO = Math.log10(0.1), HI = Math.log10(1000);
+  const LO = Math.log10(0.1), HI = Math.log10(2000);
   const x = v => L + (v / 150000) * (W - L - R);
   const y = v => T + (1 - (Math.log10(v) - LO) / (HI - LO)) * (H - T - B);
   const NS = "http://www.w3.org/2000/svg";
   const sv = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
   const ms = v => v >= 1000 ? v / 1000 + " s" : v + " ms";
   const series = [["third", "ScyllaDB"], ["rocks", "RocksDB"], ["lt", "lionturtle"]];
-  for (const [title, data] of [["Read p99", S.read], ["Update p99", S.update]]) {
+  for (const [title, data] of S.panels) {
     const p = el("div", "card panel"); p.append(el("h3", null, title));
     const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${title} at ${S.rates.map(fmt).join(", ")} durable ops/s, log scale. ` +
       series.map(([k, n]) => `${n}: ${data[k].map(ms).join(", ")}`).join("; ") + "." });
