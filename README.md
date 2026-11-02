@@ -19,6 +19,8 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **Short tails with durable writes.** Checkpoints pace their I/O after the [SILK](https://www.usenix.org/conference/atc19/presentation/balmau) paper: each gets only the bandwidth it needs to finish before writers would wait on it. With every update durable at 150k ops/s, read p99 was 0.41 ms against 231 ms for RocksDB.
 
+**Short tails for buffered writes.** A write appends to a log buffer that stays resident between flushes. At 400M records with LZ4, update p99.9 on YCSB B was 44 µs against RocksDB's 526, and insert p99.9 on E 19 µs against 352 ([results](BENCHMARKS.md#ycsb-at-400m-records)).
+
 **Shared syncs.** Synchronous writers share each log write and fsync, and the log writes over retired segments. On a drive with power-loss protection, a durable write costs one 4 KiB write: 27 µs on EC2 instance store.
 
 **Atomic batches.** A batch survives a crash whole or not at all, and no reader sees half of one. Writers commit independently, so one slow insert delays no other writer.
@@ -69,8 +71,8 @@ ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over
 
 - **Memory.** RSS runs about twice RocksDB's: 2.8 GB against 1.3 GB under 128 durable writers.
 - **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.91 s against RocksDB's 83 ms, though update p99.9 was 11 ms against 14 ms.
-- **Scans.** A scan merges every buffer level on its path. At 400M records with LZ4, scans ran 1.13 times RocksDB's rate, with a median of 56 µs against 49 and p99.9 of 2.1 ms against 0.76 ms.
-- **Deep read tails under writes.** At 400M records with LZ4, read p99.9 on workload A was 310 µs against RocksDB's 242.
+- **Scans.** A scan merges every buffer level on its path. At 400M records with LZ4, scans ran 1.11 times RocksDB's rate, with a median of 57 µs against 49 and p99.9 of 1.9 ms against 0.76 ms.
+- **Deep read tails under writes.** At 400M records with LZ4, read p99.9 on workload A was 303 µs against RocksDB's 242.
 
 ## Quick start
 
