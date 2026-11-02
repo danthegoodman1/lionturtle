@@ -462,7 +462,8 @@ impl PageIo {
 
     /// Starts the disk reads of the cold blocks among `blocks` together, so
     /// their latencies overlap instead of adding up. A lone cold block is
-    /// left to its synchronous read, which would gain nothing.
+    /// left to its synchronous read, which would gain nothing. The reads
+    /// start on background threads where the storage asks for them.
     pub fn prefetch(&self, blocks: &[(&DataPage, usize)]) {
         let mut cold = blocks.iter().filter(|(page, b)| self.is_cold(page, *b));
         let (Some(first), Some(second)) = (cold.next(), cold.next()) else {
@@ -471,7 +472,7 @@ impl PageIo {
         for (page, b) in [first, second].into_iter().chain(cold) {
             if let Some(ptr) = page.ptr() {
                 let (off, len) = page.stored_span(&ptr, *b..*b + 1);
-                self.store.prefetch(&ptr, off, len);
+                self.store.prefetch_background(&ptr, off, len);
             }
         }
     }

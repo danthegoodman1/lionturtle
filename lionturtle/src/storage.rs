@@ -30,6 +30,12 @@ pub trait Storage: Send + Sync {
     fn list(&self) -> io::Result<Vec<String>>;
     /// Makes earlier creations, removals and renames durable.
     fn sync_dir(&self) -> io::Result<()>;
+    /// Whether scans should hand their prefetches to background threads.
+    /// A Linux prefetch allocates its page cache in the calling thread, and
+    /// under a memory limit each allocation may first have to reclaim memory.
+    fn prefetch_in_background(&self) -> bool {
+        false
+    }
 }
 
 pub trait File: Send + Sync {
@@ -128,6 +134,11 @@ impl Storage for FsStorage {
 
     fn sync_dir(&self) -> io::Result<()> {
         std::fs::File::open(&self.dir)?.sync_all()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prefetch_in_background(&self) -> bool {
+        true
     }
 }
 
