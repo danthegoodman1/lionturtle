@@ -230,6 +230,11 @@ struct Pending {
     buf: Vec<u8>,
     /// File offset of `buf[0]`: the bytes handed to writes so far.
     offset: u64,
+    /// A flushed buffer kept for the next flush. Appends then fill memory
+    /// that is already resident: in a fresh buffer each new page faults,
+    /// and under a memory limit one fault can wait milliseconds in reclaim
+    /// while the writer lock is held.
+    spare: Vec<u8>,
 }
 
 /// One aligned block of a direct write.
@@ -439,7 +444,11 @@ impl Log {
             p.buf.clear();
             small
         } else {
-            std::mem::replace(&mut p.buf, Vec::with_capacity(1 << 20))
+            let next = match std::mem::take(&mut p.spare) {
+                spare if spare.capacity() > 0 => spare,
+                _ => Vec::with_capacity(1 << 20),
+            };
+            std::mem::replace(&mut p.buf, next)
         };
         p.offset += buf.len() as u64;
         Flush { buf, offset, log: self.clone(), io }
@@ -536,16 +545,26 @@ impl Flush {
         self.write_as(true)
     }
 
-    fn write_as(mut self, durable: bool) -> Result<()> {
-        if !self.buf.is_empty() {
+    fn write_as(self, durable: bool) -> Result<()> {
+        let Flush { mut buf, offset, log, mut io } = self;
+        if !buf.is_empty() {
             // A failed write leaves `base` short of later offsets, and
             // `Staging::write` returns that failure.
-            debug_assert!(self.io.failed || self.io.base + self.io.tail.len() as u64 == self.offset);
-            if let Some(p) = &self.log.prealloc {
-                p.before_write(self.io.base + (self.io.tail.len() + self.buf.len()).next_multiple_of(DIRECT_ALIGN) as u64);
+            debug_assert!(io.failed || io.base + io.tail.len() as u64 == offset);
+            if let Some(p) = &log.prealloc {
+                p.before_write(io.base + (io.tail.len() + buf.len()).next_multiple_of(DIRECT_ALIGN) as u64);
             }
-            self.io.write(&*self.log.file, &self.buf, durable)?;
-            self.log.complete(self.offset, self.buf.len());
+            io.write(&*log.file, &buf, durable)?;
+            log.complete(offset, buf.len());
+        }
+        // Appends take `pending` before `io`, so `io` goes first.
+        drop(io);
+        if buf.capacity() >= 64 << 10 {
+            buf.clear();
+            let mut p = log.pending.lock();
+            if p.spare.capacity() < buf.capacity() {
+                p.spare = buf;
+            }
         }
         Ok(())
     }
@@ -570,7 +589,7 @@ impl WalWriter {
         storage.sync_dir()?;
         let log = Arc::new(Log {
             file,
-            pending: Mutex::new(Pending { buf: Vec::with_capacity(1 << 20), offset: 0 }),
+            pending: Mutex::new(Pending { buf: Vec::with_capacity(1 << 20), offset: 0, spare: Vec::new() }),
             io: Arc::new(Mutex::new(Staging { base: 0, tail: Vec::with_capacity(DIRECT_ALIGN), blocks: Vec::new(), failed: false })),
             completed: AtomicU64::new(0),
             synced: AtomicU64::new(0),
@@ -741,6 +760,26 @@ fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)>
 mod tests {
     use super::*;
     use crate::sim::{FaultConfig, SimStorage};
+
+    #[test]
+    fn flushes_reuse_their_buffers() {
+        let disk = SimStorage::new(4, FaultConfig::default());
+        let mut w = WalWriter::create(&disk, 1, None, None).unwrap();
+        let big = [WriteOp::put("k", "v".repeat(100 << 10))];
+        let first = w.log.pending.lock().buf.as_ptr();
+        w.append(1, &big);
+        w.flush().unwrap();
+        w.append(2, &big);
+        w.flush().unwrap();
+        // Each flush returns its buffer, so appends alternate between two
+        // buffers and are back on the first.
+        assert_eq!(w.log.pending.lock().buf.as_ptr(), first);
+        w.append(3, &big);
+        w.sync().unwrap();
+        let mut seen = Vec::new();
+        replay(&disk, 1, 0, |seq, _| seen.push(seq)).unwrap();
+        assert_eq!(seen, [1, 2, 3]);
+    }
 
     #[test]
     fn roundtrip_and_torn_tail() {
