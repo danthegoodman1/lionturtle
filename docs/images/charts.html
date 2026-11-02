@@ -249,7 +249,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
   const sv = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
   const us = v => v >= 1000 ? +(v / 1000).toFixed(1) + " ms" : Math.round(v) + " µs";
   const engines = [["lt", "lionturtle"], ["rocks", "RocksDB"], ["third", "fjall"]];
-  const sections = [["READS · SCANS ON E", L.reads], ["WRITES", L.writes]];
+  const sections = [["WRITES", L.writes], ["READS · SCANS ON E", L.reads]];
   const H = sections.reduce((h, [, rows]) => h + HEAD + rows.length * (2 * LINE + GROUP), 0) + 34;
   const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
   const ticks = [10, 100, 1000, 10000], grid = sv("g"), marks = sv("g");
@@ -277,7 +277,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
   for (const t of ticks) svg.append(sv("text", { x: x(t), y: top + 18, "text-anchor": "middle" }, us(t)));
   svg.append(sv("text", { x: (X0 + X1) / 2, y: top + 34, "text-anchor": "middle" }, "latency, log scale"));
   const desc = rows => rows.map(([n, sub, ...v]) => `${n} ${sub}: ` + engines.map(([, e], i) => `${e} ${us(v[i][0])} and ${us(v[i][1])}`).join(", ")).join("; ");
-  svg.setAttribute("aria-label", `YCSB p99 and p99.9 latency, log scale. Reads: ${desc(L.reads)}. Writes: ${desc(L.writes)}.`);
+  svg.setAttribute("aria-label", `YCSB p99 and p99.9 latency, log scale. Writes: ${desc(L.writes)}. Reads: ${desc(L.reads)}.`);
   document.getElementById("latency-chart").append(svg);
   document.getElementById("latency-title").innerHTML = L.title;
 })();

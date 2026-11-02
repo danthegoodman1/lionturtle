@@ -4,13 +4,13 @@
 [![docs.rs](https://img.shields.io/docsrs/lionturtle)](https://docs.rs/lionturtle)
 [![CI](https://github.com/danthegoodman1/lionturtle/actions/workflows/ci.yml/badge.svg)](https://github.com/danthegoodman1/lionturtle/actions/workflows/ci.yml)
 
-lionturtle is an embedded key-value store in Rust for Linux and for macOS on Apple silicon. It is a modified version of [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)): it keeps TurtleKV's TurtleTree, paces its background I/O after [SILK](https://www.usenix.org/conference/atc19/presentation/balmau), and borrows group commit and log recycling from LSM stores such as RocksDB, to keep throughput high and tail latency low.
+lionturtle is an embedded key-value store in Rust for Linux and for macOS on Apple silicon. It is a modified version of [TurtleKV](https://github.com/mathworks/turtle_kv) ([paper](https://arxiv.org/abs/2509.10714)): it keeps TurtleKV's TurtleTree, paces its background I/O after [SILK](https://www.usenix.org/conference/atc19/presentation/balmau), and borrows group commit and log recycling from LSM stores such as RocksDB, to keep tail latency low and throughput high.
 
-The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. lionturtle writes fewer bytes than RocksDB and fjall, outpaces both on every YCSB workload measured, with LZ4 and without, and keeps read tails short while every write is durable. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
+The TurtleTree is a Bε-tree that merges each full memtable into the tree as one checkpoint, and its nodes buffer several checkpoints before data reaches the leaves. On YCSB, lionturtle's update and insert p99.9 runs 5–15× below RocksDB's, and its read tails stay short while every write is durable. It also writes fewer bytes than RocksDB and fjall and outpaces both on every workload measured, with LZ4 and without. [DESIGN.md](DESIGN.md#differences-from-the-c-turtlekv) lists where it departs from the C++ TurtleKV.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/ycsb-dark.png">
-  <img src="docs/images/ycsb-light.png" alt="YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads, in thousand operations per second for lionturtle, RocksDB and fjall: load 1,710, 1,008 and 394; workload A 1,473, 1,180 and 562; B 1,496, 1,248 and 1,066; C 1,617, 1,209 and 1,130; E 224, 214 and 50; F 917, 841 and 578. lionturtle runs 1.05 to 1.70 times RocksDB's rate.">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
+  <img src="docs/images/latency-light.png" alt="p99 to p99.9 latency for lionturtle, RocksDB and fjall on YCSB with 50M records of 128 bytes that compress by half, LZ4 on every engine and 16 client threads, on a log scale. Write p99.9: load 60 µs, 332 µs and 492 µs; A updates 30 µs, 456 µs and 347 µs; B updates 32 µs, 453 µs and 101 µs; E inserts 15 µs, 125 µs and 28 µs; F read-modify-writes 248 µs, 542 µs and 288 µs. Read p99.9: A 248 µs, 291 µs and 246 µs; B 155 µs, 170 µs and 229 µs; C 138 µs, 166 µs and 225 µs; E scans 457 µs, 472 µs and 7.4 ms; F 218 µs, 224 µs and 251 µs. lionturtle's update and insert p99.9 stays within 60 µs, 5 to 15 times below RocksDB's.">
 </picture>
 
 ## Features
@@ -37,22 +37,26 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 These runs used an EC2 i7ie.6xlarge (24 vCPUs, one instance-store NVMe drive). [BENCHMARKS.md](BENCHMARKS.md) has every result, the setup, and the commands to reproduce them. Every benchmark ran on Linux. macOS has no O_DIRECT or RWF_DSYNC, so there lionturtle buffers its files and ends each durable write with `F_FULLFSYNC`, which flushes the drive's cache.
 
-YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads under a 4 GB memory cap, in thousand ops/s:
+YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads under a 4 GB memory cap. Latency in µs, as p99 / p99.9:
 
-| Workload | lionturtle | RocksDB | fjall |
+| Operation | lionturtle | RocksDB | fjall |
 |---|--:|--:|--:|
-| Load | 1,710 | 1,008 | 394 |
-| A: 50% read, 50% update | 1,473 | 1,180 | 562 |
-| B: 95% read, 5% update | 1,496 | 1,248 | 1,066 |
-| C: 100% read | 1,617 | 1,209 | 1,130 |
-| E: 95% scan, 5% insert | 224 | 214 | 50 |
-| F: 50% read, 50% read-modify-write | 917 | 841 | 578 |
+| Load: inserts | 22 / 60 | 28 / 332 | 299 / 492 |
+| A: updates | 8 / 30 | 21 / 456 | 223 / 347 |
+| B: updates | 7 / 32 | 13 / 453 | 21 / 101 |
+| E: inserts | 6 / 15 | 18 / 125 | 18 / 28 |
+| F: read-modify-writes | 120 / 248 | 130 / 542 | 177 / 288 |
+| A: reads | 129 / 248 | 120 / 291 | 130 / 246 |
+| B: reads | 107 / 155 | 118 / 170 | 136 / 229 |
+| C: reads | 106 / 138 | 118 / 166 | 134 / 225 |
+| E: scans | 310 / 457 | 365 / 472 | 6,435 / 7,397 |
+| F: reads | 116 / 218 | 120 / 224 | 140 / 251 |
 
-Without compression, lionturtle led RocksDB by 1.13–1.66×. Latency in the same runs, from p99 to p99.9:
+Throughput in the same runs, where lionturtle led RocksDB by 1.05–1.70×, and by 1.13–1.66× without compression:
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
-  <img src="docs/images/latency-light.png" alt="p99 to p99.9 latency for lionturtle, RocksDB and fjall in the same YCSB runs, on a log scale. Read p99.9: A 248 µs, 291 µs and 246 µs; B 155 µs, 170 µs and 229 µs; C 138 µs, 166 µs and 225 µs; E scans 457 µs, 472 µs and 7.4 ms; F 218 µs, 224 µs and 251 µs. Write p99.9: load 60 µs, 332 µs and 492 µs; A updates 30 µs, 456 µs and 347 µs; B updates 32 µs, 453 µs and 101 µs; E inserts 15 µs, 125 µs and 28 µs; F read-modify-writes 248 µs, 542 µs and 288 µs. lionturtle's update and insert p99.9 stays within 60 µs, 5 to 15 times below RocksDB's.">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/ycsb-dark.png">
+  <img src="docs/images/ycsb-light.png" alt="YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads, in thousand operations per second for lionturtle, RocksDB and fjall: load 1,710, 1,008 and 394; workload A 1,473, 1,180 and 562; B 1,496, 1,248 and 1,066; C 1,617, 1,209 and 1,130; E 224, 214 and 50; F 917, 841 and 578. lionturtle runs 1.05 to 1.70 times RocksDB's rate.">
 </picture>
 
 Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns. Each engine ran five minutes at each fixed rate. As the rate rises, RocksDB's deferred compaction pushes its p99 to 860 ms and its p99.9 past a second, while lionturtle's p99 stays under half a millisecond:
