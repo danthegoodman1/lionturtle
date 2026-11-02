@@ -60,6 +60,7 @@ h3 { font-size: 1.05rem; font-weight: 650; }
 .hero-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px 32px; }
 .hero h1 { font-size: 3.1rem; font-weight: 780; font-stretch: 80%; line-height: 1.02; letter-spacing: -0.015em; max-width: 20ch; }
 .hero h1 em { font-style: normal; color: var(--lt); }
+.hero h1 .nw { white-space: nowrap; }
 .hero-meta { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--ink-2); }
 .hero-meta b { color: var(--ink); font-weight: 600; }
 .hero .foot { border-top: 1px solid var(--grid); padding-top: 14px; }
@@ -80,6 +81,16 @@ h3 { font-size: 1.05rem; font-weight: 650; }
 .axis { grid-column: 2; position: relative; height: 22px; border-top: 1px solid var(--axis); }
 .axis span { position: absolute; top: 4px; transform: translateX(-50%); font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .axis-cap { grid-column: 2; font-size: 0.76rem; color: var(--muted); }
+
+/* YCSB latency: a segment per engine from p99 to p99.9, reads and writes stacked on one log axis */
+#latency-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+#latency-chart text { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+#latency-chart .sec { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; fill: var(--muted); }
+#latency-chart .name { font-family: var(--font-body); font-size: 14px; font-weight: 600; fill: var(--ink); }
+#latency-chart .sub { font-family: var(--font-body); font-size: 12px; fill: var(--muted); }
+#latency-chart .val { fill: var(--ink-2); }
+#latency-chart .val.lead { fill: var(--ink); font-weight: 600; }
+.mk { display: inline-block; vertical-align: middle; }
 
 /* Durable writes: p99 and p99.9 against offered load, one panel per operation and percentile, shared log axis */
 .durable { display: flex; flex-direction: column; gap: 16px; }
@@ -116,7 +127,28 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
         <span><i class="sw" style="background:var(--third)"></i>fjall</span>
       </div>
-      <span>Values compress to half their size. Bytes written per user byte during load: lionturtle 4.0, RocksDB 4.5, fjall 5.0.</span>
+      <span>Values compress to half their size. Bytes written per user byte during load: lionturtle 4.0, RocksDB 4.3, fjall 5.1.</span>
+    </div>
+  </div>
+
+  <div class="card hero lat" id="latency">
+    <div class="hero-head">
+      <h1 id="latency-title"></h1>
+      <div class="hero-meta">
+        <span><b>YCSB</b> · 50M records of 128 bytes · LZ4 on every engine</span>
+        <span>16 client threads · 4 GB memory cap · 1 GB block cache</span>
+        <span>EC2 i7ie.6xlarge · instance-store NVMe</span>
+      </div>
+    </div>
+    <div id="latency-chart"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--lt)"></i>lionturtle</span>
+        <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--third)"></i>fjall</span>
+        <span><svg class="mk" width="46" height="12" viewBox="0 0 46 12"><line x1="6" x2="40" y1="6" y2="6" stroke="var(--ink-2)" stroke-width="2"/><circle cx="6" cy="6" r="4.5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/><circle cx="40" cy="6" r="4" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/></svg>p99 to p99.9, labeled with p99.9</span>
+      </div>
+      <span>The same runs as the throughput chart. A read-modify-write includes its read.</span>
     </div>
   </div>
 
@@ -138,21 +170,39 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 const D = {
   // BENCHMARKS.md, YCSB at 50M records with LZ4: thousand ops/s for lionturtle, RocksDB, fjall
   ycsb: [
-    ["Load", "inserts", 1735, 1038, 417],
-    ["Workload A", "50% read, 50% update", 1465, 1232, 565],
-    ["Workload B", "95% read, 5% update", 1518, 1298, 1090],
-    ["Workload C", "100% read", 1639, 1331, 1054],
-    ["Workload E", "95% scan, 5% insert", 232, 217, 49],
-    ["Workload F", "50% read, 50% read-modify-write", 910, 872, 588],
+    ["Load", "inserts", 1710, 1008, 394],
+    ["Workload A", "50% read, 50% update", 1473, 1180, 562],
+    ["Workload B", "95% read, 5% update", 1496, 1248, 1066],
+    ["Workload C", "100% read", 1617, 1209, 1130],
+    ["Workload E", "95% scan, 5% insert", 224, 214, 50],
+    ["Workload F", "50% read, 50% read-modify-write", 917, 841, 578],
   ],
+  // BENCHMARKS.md, YCSB at 50M records with LZ4: [p99, p99.9] in µs for lionturtle, RocksDB, fjall
+  latency: {
+    title: "Update and insert p99.9 stays within <em>60 µs</em>, <span class=\"nw\">5–15×</span> below RocksDB's",
+    reads: [
+      ["A", "reads", [129, 248], [120, 291], [130, 246]],
+      ["B", "reads", [107, 155], [118, 170], [136, 229]],
+      ["C", "reads", [106, 138], [118, 166], [134, 225]],
+      ["E", "scans", [310, 457], [365, 472], [6435, 7397]],
+      ["F", "reads", [116, 218], [120, 224], [140, 251]],
+    ],
+    writes: [
+      ["Load", "inserts", [22, 60], [28, 332], [299, 492]],
+      ["A", "updates", [8, 30], [21, 456], [223, 347]],
+      ["B", "updates", [7, 32], [13, 453], [21, 101]],
+      ["E", "inserts", [6, 15], [18, 125], [18, 28]],
+      ["F", "read-modify-writes", [120, 248], [130, 542], [177, 288]],
+    ],
+  },
   // BENCHMARKS.md, durable writes under load: latency in ms at each offered rate
   durable: {
     rates: [11000, 70000, 118000, 150000],
     panels: [
-      ["Read p99", { lt: [0.18, 0.24, 0.30, 0.41], rocks: [0.19, 3.1, 62, 231], third: [1.4, 9.3] }],
-      ["Read p99.9", { lt: [0.30, 0.96, 2.8, 8.5], rocks: [0.47, 12, 1400, 1200], third: [2.8, 31] }],
-      ["Update p99", { lt: [0.11, 0.27, 0.40, 0.53], rocks: [0.41, 5.4, 63, 235], third: [1.3, 9.3] }],
-      ["Update p99.9", { lt: [0.15, 1.4, 3.0, 9.6], rocks: [3.2, 14, 1400, 1200], third: [2.3, 30] }],
+      ["Read p99", { lt: [0.19, 0.24, 0.31, 0.37], rocks: [0.20, 3.2, 12, 860], third: [1.4, 9.3] }],
+      ["Read p99.9", { lt: [0.28, 0.88, 3.5, 6.7], rocks: [0.47, 14, 26, 1500], third: [2.8, 31] }],
+      ["Update p99", { lt: [0.12, 0.26, 0.39, 0.47], rocks: [0.42, 5.4, 14, 863], third: [1.3, 9.3] }],
+      ["Update p99.9", { lt: [0.16, 1.1, 3.8, 7.8], rocks: [3.4, 17, 27, 1500], third: [2.3, 30] }],
     ],
   },
 };
@@ -190,6 +240,46 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
   host.append(axis, el("div", "axis-cap", "Thousand operations per second"));
   host.setAttribute("aria-label", "Thousand YCSB operations per second for lionturtle, RocksDB and fjall: " +
     D.ycsb.map(([n, , a, b, c]) => `${n} ${fmt(a)}, ${fmt(b)} and ${fmt(c)}`).join("; ") + ".");
+})();
+
+(function latency() {
+  const L = D.latency, W = 960, X0 = 178, X1 = W - 64, LO = Math.log10(5), HI = Math.log10(10000);
+  const x = v => X0 + (Math.log10(v) - LO) / (HI - LO) * (X1 - X0);
+  const LINE = 16, GROUP = 22, HEAD = 34, NS = "http://www.w3.org/2000/svg";
+  const sv = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+  const us = v => v >= 1000 ? +(v / 1000).toFixed(1) + " ms" : Math.round(v) + " µs";
+  const engines = [["lt", "lionturtle"], ["rocks", "RocksDB"], ["third", "fjall"]];
+  const sections = [["READS · SCANS ON E", L.reads], ["WRITES", L.writes]];
+  const H = sections.reduce((h, [, rows]) => h + HEAD + rows.length * (2 * LINE + GROUP), 0) + 34;
+  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const ticks = [10, 100, 1000, 10000], grid = sv("g"), marks = sv("g");
+  svg.append(grid, marks);
+  let top = 0;
+  for (const [title, rows] of sections) {
+    marks.append(sv("text", { x: 0, y: top + 18, class: "sec" }, title));
+    let y = top + HEAD + 8;
+    for (const [name, sub, ...vals] of rows) {
+      marks.append(sv("text", { x: 0, y: y + LINE - 3, class: "name" }, name === "Load" ? "Load" : "Workload " + name));
+      marks.append(sv("text", { x: 0, y: y + LINE + 13, class: "sub" }, sub));
+      vals.forEach(([p99, p999], i) => {
+        const [k] = engines[i], c = `var(--${k})`, yy = y + i * LINE;
+        marks.append(sv("line", { x1: x(p99), x2: x(p999), y1: yy, y2: yy, stroke: c, "stroke-width": 2 }));
+        marks.append(sv("circle", { cx: x(p99), cy: yy, r: 4.5, fill: c, stroke: "var(--surface)", "stroke-width": 2 }));
+        marks.append(sv("circle", { cx: x(p999), cy: yy, r: 4, fill: "var(--surface)", stroke: c, "stroke-width": 2 }));
+        marks.append(sv("text", { x: x(p999) + 10, y: yy + 4, class: i ? "val" : "val lead" }, us(p999)));
+      });
+      y += 2 * LINE + GROUP;
+    }
+    top = y - 8;
+  }
+  for (const t of ticks) grid.append(sv("line", { x1: x(t), x2: x(t), y1: HEAD - 6, y2: top, stroke: "var(--grid)", "stroke-width": 1 }));
+  grid.append(sv("line", { x1: X0, x2: X1, y1: top, y2: top, stroke: "var(--axis)", "stroke-width": 1 }));
+  for (const t of ticks) svg.append(sv("text", { x: x(t), y: top + 18, "text-anchor": "middle" }, us(t)));
+  svg.append(sv("text", { x: (X0 + X1) / 2, y: top + 34, "text-anchor": "middle" }, "latency, log scale"));
+  const desc = rows => rows.map(([n, sub, ...v]) => `${n} ${sub}: ` + engines.map(([, e], i) => `${e} ${us(v[i][0])} and ${us(v[i][1])}`).join(", ")).join("; ");
+  svg.setAttribute("aria-label", `YCSB p99 and p99.9 latency, log scale. Reads: ${desc(L.reads)}. Writes: ${desc(L.writes)}.`);
+  document.getElementById("latency-chart").append(svg);
+  document.getElementById("latency-title").innerHTML = L.title;
 })();
 
 (function durable() {
