@@ -10,14 +10,14 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/ycsb-dark.png">
-  <img src="docs/images/ycsb-light.png" alt="YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads, in thousand operations per second for lionturtle, RocksDB and fjall: load 1,735, 1,038 and 417; workload A 1,465, 1,232 and 565; B 1,518, 1,298 and 1,090; C 1,639, 1,331 and 1,054; E 232, 217 and 49; F 910, 872 and 588. lionturtle runs 1.04 to 1.67 times RocksDB's rate.">
+  <img src="docs/images/ycsb-light.png" alt="YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine and 16 client threads, in thousand operations per second for lionturtle, RocksDB and fjall: load 1,710, 1,008 and 394; workload A 1,473, 1,180 and 562; B 1,496, 1,248 and 1,066; C 1,617, 1,209 and 1,130; E 224, 214 and 50; F 917, 841 and 578. lionturtle runs 1.05 to 1.70 times RocksDB's rate.">
 </picture>
 
 ## Features
 
-**Fewer bytes written.** A key overwritten within one checkpoint reaches disk once. Loading 50M records without compression wrote 5.8 bytes per user byte, against 7.7 for RocksDB and 8.7 for fjall.
+**Fewer bytes written.** A key overwritten within one checkpoint reaches disk once. Loading 50M records without compression wrote 5.8 bytes per user byte, against 7.7 for RocksDB and 9.3 for fjall.
 
-**Short tails with durable writes.** Checkpoints pace their I/O after the [SILK](https://www.usenix.org/conference/atc19/presentation/balmau) paper: each gets only the bandwidth it needs to finish before writers would wait on it. With every update durable at 150k ops/s, read p99 was 0.41 ms against 231 ms for RocksDB.
+**Short tails with durable writes.** Checkpoints pace their I/O after the [SILK](https://www.usenix.org/conference/atc19/presentation/balmau) paper: each gets only the bandwidth it needs to finish before writers would wait on it. With every update durable at 150k ops/s, read p99 was 0.37 ms against 860 ms for RocksDB.
 
 **Short tails for buffered writes.** A write appends to a log buffer that stays resident between flushes. At 400M records with LZ4, update p99.9 on YCSB B was 44 µs against RocksDB's 526, and insert p99.9 on E 19 µs against 352 ([results](BENCHMARKS.md#ycsb-at-400m-records)).
 
@@ -29,7 +29,7 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
-**Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 18–37% ([results](BENCHMARKS.md#ycsb-at-50m-records)).
+**Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 40% and raised throughput on every YCSB workload after the load by 17–40% ([results](BENCHMARKS.md#ycsb-at-50m-records)).
 
 **Checked by deterministic simulation.** Each VOPR seed runs a random store configuration through crashes, torn writes, read errors and bit flips on a simulated disk, and checks every answer and every recovery against a model. A failing seed replays exactly.
 
@@ -41,36 +41,41 @@ YCSB on 50M records of 128 bytes that compress by half, with LZ4 on every engine
 
 | Workload | lionturtle | RocksDB | fjall |
 |---|--:|--:|--:|
-| Load | 1,735 | 1,038 | 417 |
-| A: 50% read, 50% update | 1,465 | 1,232 | 565 |
-| B: 95% read, 5% update | 1,518 | 1,298 | 1,090 |
-| C: 100% read | 1,639 | 1,331 | 1,054 |
-| E: 95% scan, 5% insert | 232 | 217 | 49 |
-| F: 50% read, 50% read-modify-write | 910 | 872 | 588 |
+| Load | 1,710 | 1,008 | 394 |
+| A: 50% read, 50% update | 1,473 | 1,180 | 562 |
+| B: 95% read, 5% update | 1,496 | 1,248 | 1,066 |
+| C: 100% read | 1,617 | 1,209 | 1,130 |
+| E: 95% scan, 5% insert | 224 | 214 | 50 |
+| F: 50% read, 50% read-modify-write | 917 | 841 | 578 |
 
-Without compression, lionturtle led RocksDB by 1.13–1.59×.
+Without compression, lionturtle led RocksDB by 1.13–1.66×. Latency in the same runs, from p99 to p99.9:
 
-Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns. Each engine ran five minutes at each fixed rate. As the rate rises, RocksDB's deferred compaction pushes its p99 past 200 ms and its p99.9 past a second, while lionturtle's p99 stays near half a millisecond:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
+  <img src="docs/images/latency-light.png" alt="p99 to p99.9 latency for lionturtle, RocksDB and fjall in the same YCSB runs, on a log scale. Read p99.9: A 248 µs, 291 µs and 246 µs; B 155 µs, 170 µs and 229 µs; C 138 µs, 166 µs and 225 µs; E scans 457 µs, 472 µs and 7.4 ms; F 218 µs, 224 µs and 251 µs. Write p99.9: load 60 µs, 332 µs and 492 µs; A updates 30 µs, 456 µs and 347 µs; B updates 32 µs, 453 µs and 101 µs; E inserts 15 µs, 125 µs and 28 µs; F read-modify-writes 248 µs, 542 µs and 288 µs. lionturtle's update and insert p99.9 stays within 60 µs, 5 to 15 times below RocksDB's.">
+</picture>
+
+Durable writes: workload A on 20M records of 1 KB, with 128 client threads under a 3 GB memory cap, and every update durable before it returns. Each engine ran five minutes at each fixed rate. As the rate rises, RocksDB's deferred compaction pushes its p99 to 860 ms and its p99.9 past a second, while lionturtle's p99 stays under half a millisecond:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/durable-dark.png">
-  <img src="docs/images/durable-light.png" alt="p99 and p99.9 latency at 11k, 70k, 118k and 150k durable operations per second, on a log scale. Read p99: lionturtle 0.18, 0.24, 0.30 and 0.41 ms; RocksDB 0.19, 3.1, 62 and 231 ms; ScyllaDB 1.4 and 9.3 ms at 11k and 70k. Read p99.9: lionturtle 0.30, 0.96, 2.8 and 8.5 ms; RocksDB 0.47, 12, 1,400 and 1,200 ms; ScyllaDB 2.8 and 31 ms. Update p99: lionturtle 0.11, 0.27, 0.40 and 0.53 ms; RocksDB 0.41, 5.4, 63 and 235 ms; ScyllaDB 1.3 and 9.3 ms. Update p99.9: lionturtle 0.15, 1.4, 3.0 and 9.6 ms; RocksDB 3.2, 14, 1,400 and 1,200 ms; ScyllaDB 2.3 and 30 ms.">
+  <img src="docs/images/durable-light.png" alt="p99 and p99.9 latency at 11k, 70k, 118k and 150k durable operations per second, on a log scale. Read p99: lionturtle 0.19, 0.24, 0.31 and 0.37 ms; RocksDB 0.20, 3.2, 12 and 860 ms; ScyllaDB 1.4 and 9.3 ms at 11k and 70k. Read p99.9: lionturtle 0.28, 0.88, 3.5 and 6.7 ms; RocksDB 0.47, 14, 26 and 1,500 ms; ScyllaDB 2.8 and 31 ms. Update p99: lionturtle 0.12, 0.26, 0.39 and 0.47 ms; RocksDB 0.42, 5.4, 14 and 863 ms; ScyllaDB 1.3 and 9.3 ms. Update p99.9: lionturtle 0.16, 1.1, 3.8 and 7.8 ms; RocksDB 3.4, 17, 27 and 1,500 ms; ScyllaDB 2.3 and 30 ms.">
 </picture>
 
 | Durable ops/s | Engine | Read p99 | Read p99.9 | Update p99 | Update p99.9 |
 |---|---|--:|--:|--:|--:|
-| 70k | lionturtle | 0.24 ms | 0.96 ms | 0.27 ms | 1.4 ms |
-| | RocksDB | 3.1 ms | 12 ms | 5.4 ms | 14 ms |
+| 70k | lionturtle | 0.24 ms | 0.88 ms | 0.26 ms | 1.1 ms |
+| | RocksDB | 3.2 ms | 14 ms | 5.4 ms | 17 ms |
 | | ScyllaDB | 9.3 ms | 31 ms | 9.3 ms | 30 ms |
-| 150k | lionturtle | 0.41 ms | 8.5 ms | 0.53 ms | 9.6 ms |
-| | RocksDB | 231 ms | 1.2 s | 235 ms | 1.2 s |
+| 150k | lionturtle | 0.37 ms | 6.7 ms | 0.47 ms | 7.8 ms |
+| | RocksDB | 860 ms | 1.5 s | 863 ms | 1.5 s |
 
-ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 9 minutes or more, sustained throughput was 261k ops/s for lionturtle, 212k for RocksDB and 88k for ScyllaDB.
+ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 9 minutes or more, sustained throughput was 253k ops/s for lionturtle, 205k for RocksDB and 88k for ScyllaDB.
 
 ### Trade-offs
 
 - **Memory.** RSS runs about twice RocksDB's: 2.8 GB against 1.3 GB under 128 durable writers.
-- **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.91 s against RocksDB's 83 ms, though update p99.9 was 11 ms against 14 ms.
+- **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.80 s against RocksDB's 86 ms, though update p99.9 was 11 ms against 19 ms.
 - **Scans.** A scan merges every buffer level on its path. At 400M records with LZ4, scans ran 1.11 times RocksDB's rate, with a median of 57 µs against 49 and p99.9 of 1.9 ms against 0.76 ms.
 - **Deep read tails under writes.** At 400M records with LZ4, read p99.9 on workload A was 303 µs against RocksDB's 242.
 
