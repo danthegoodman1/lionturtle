@@ -108,6 +108,9 @@ pub const PUNCH_AFTER: u64 = 2;
 
 /// Bytes an arena grows past the slot that outgrew it.
 const GROWTH: u64 = 64 << 20;
+/// Threads that issue background prefetches. Each prefetch may wait to
+/// reclaim memory, and several let one wait without holding up the rest.
+const PREFETCH_THREADS: usize = 8;
 
 /// Blocks of [`DIRECT_ALIGN`] bytes that `len` bytes span.
 fn blocks(len: u64) -> u32 {
@@ -142,6 +145,9 @@ pub struct PageStore {
     freed: Mutex<Vec<PagePtr>>,
     /// Reclaims so far.
     reclaims: AtomicU64,
+    /// Runs [`PageStore::prefetch_background`] where the storage asks for
+    /// background prefetches.
+    prefetcher: Option<rayon::ThreadPool>,
 }
 
 impl PageStore {
@@ -176,6 +182,15 @@ impl PageStore {
             a.free = (0..a.next).filter(|s| !used[class].contains(s)).map(|s| (full, s)).collect();
         }
         let direct = (0..CLASSES).map(|_| OnceLock::new()).collect();
+        // Without the pool, prefetches run in the caller.
+        let prefetcher = match storage.prefetch_in_background() {
+            true => rayon::ThreadPoolBuilder::new()
+                .num_threads(PREFETCH_THREADS)
+                .thread_name(|i| format!("lionturtle-prefetch-{i}"))
+                .build()
+                .ok(),
+            false => None,
+        };
         Ok(Self {
             storage,
             files,
@@ -185,6 +200,7 @@ impl PageStore {
             alloc: Mutex::new(alloc),
             freed: Mutex::new(Vec::new()),
             reclaims: AtomicU64::new(0),
+            prefetcher,
         })
     }
 
@@ -393,6 +409,19 @@ impl PageStore {
     pub fn prefetch(&self, ptr: &PagePtr, offset: u64, len: u64) {
         if let Some(file) = self.files[ptr.class as usize].get() {
             file.prefetch(ptr.offset() + offset, len);
+        }
+    }
+
+    /// Like [`PageStore::prefetch`], but on a background thread where the
+    /// storage asks for one, so the caller waits for neither the system call
+    /// nor the memory it allocates.
+    pub fn prefetch_background(&self, ptr: &PagePtr, offset: u64, len: u64) {
+        let Some(pool) = &self.prefetcher else {
+            return self.prefetch(ptr, offset, len);
+        };
+        if let Some(file) = self.files[ptr.class as usize].get() {
+            let (file, at) = (file.clone(), ptr.offset() + offset);
+            pool.spawn(move || file.prefetch(at, len));
         }
     }
 
