@@ -143,8 +143,9 @@ typedef struct lt_options {
    */
   bool pace_checkpoints;
   /**
-   * Zero-fill each log segment ahead of its writes, so that durable
-   * writes on a new store overwrite allocated space.
+   * Write whole log segments of zeros ahead of the memtables that use
+   * them, so that durable writes on a new store overwrite allocated space.
+   * Opening a new store writes the first segment before it returns.
    */
   bool preallocate_log;
   /**

@@ -153,12 +153,14 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `merge_threads` | 8 | Threads for parallel merges and page writes; 0 uses the caller's rayon pool. Each adds reads in flight and holds memory. |
 | `background` | true | Checkpoint on background threads; with false, callers drive `checkpoint_step` |
 | `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
-| `preallocate_log` | false | Zero-fill each log segment a few MiB ahead of its writes, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first segments and writes them twice. |
+| `preallocate_log` | false | Write whole log segments of zeros ahead of the memtables that use them, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first three segments and writes them twice. Opening a new store writes the first before it returns. |
 | `compression` | `Lz4` | `Lz4` sizes each data block to compress into one 4 KiB page and compresses it as its page is written, so a point read still reads one page. Cached blocks stay uncompressed, so only reads from disk decompress. While blocks would hold under an eighth more entries per page, pages are stored as with `None`, and one block in eight is compressed to tell when that changes. A store may switch either way between opens. lionturtle 0.4.0 and later read compressed pages; earlier versions report them as corrupt. |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
 | `tree.max_pivots` | 64 | Pivots per node before it splits |
+
+An allocator that returns freed memory to the system can stall the thread it does that on, and mimalloc does it on whichever thread allocates next. lionturtle keeps its memtables and log buffers out of the allocator, and its checkpoints still take their page buffers from it. With mimalloc's defaults, one thread committing 2,500 durable batches a second saw a commit of 17 to 19 ms after several of its checkpoints, spent returning memory those checkpoints had freed. With `MIMALLOC_PURGE_DELAY=-1`, which keeps freed memory mapped, the slowest commit of a minute took 2.2 ms. `cargo run --release --example lone_writer` reproduces both.
 
 Under a memory cap that counts page cache, such as a container's, transparent huge pages in the application's heap leave less of the cap for the page cache that lionturtle reads through. mimalloc asks for them on its arenas. Set `MIMALLOC_ALLOW_THP=0`, or call `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` at startup, as kvbench does: on YCSB C at 50M records with LZ4 under a 4 GB cap, huge pages halved lionturtle's page cache and cost it 27% of its throughput.
 

@@ -27,6 +27,14 @@ flowchart LR
 
 Each writer queues its pre-encoded record, and whichever writer holds the lock serves every queued batch in one turn: it assigns sequence numbers and tickets and appends the records. Waiting writers spin briefly, then park until their batch is served or the lock is free. Under contention one lock handoff serves many batches, which matters most across NUMA nodes, where each handoff costs a cross-socket cache miss. Two background stages checkpoint frozen memtables: one applies the next while the other commits the last. Writers wait only when two frozen memtables await checkpoints, so a checkpoint can run past the next memtable's filling, as when the drive slows for a few seconds, without stopping writers. A checkpoint cuts its memtable into batches on one thread while another applies them, and two more write its new pages as they come, holding back the newest quarter of the cache in case a later batch replaces them. Its I/O is paced after the SILK paper; see [Reads during sustained writes](BENCHMARKS.md#reads-during-sustained-writes).
 
+### Memtable memory
+
+The default memtable keeps its keys, values, versions and tree nodes in an arena: 2 MiB chunks that lionturtle maps itself and fills by advancing a pointer. Each writer thread takes a block of the arena at a time, so an insert allocates without a lock. A dropped memtable hands its chunks to a pool, and the next memtable takes them from there, still resident. Each memtable's Bloom filter comes from the same pool, and each log segment passes its buffers to the next, so a rotation asks the general allocator for no large block. Chunks that go unused for 30 seconds return to the system, so an idle store holds no idle memtable memory. A value of 4 KiB or more keeps a buffer of its own, which reads share; a read copies a shorter value out of the arena.
+
+A write batch's ops go to the memtable's tree eight at a time, and the eight lookups overlap their cache misses. An overwrite returns its copy of the key to the arena.
+
+The general allocator serves a memtable poorly. With each entry in blocks of mimalloc's, a memtable of 2.3 million 50-byte entries took 360 to 400 ms to drop, on whichever thread released its last reference, and an insert took 350 to 410 ns. From the arena, on the same 16-core EPYC 4564P, the drop takes 10 µs, and an insert takes 270 ns alone and 180 ns in a batch. `cargo run --release --example memtable_churn` measures both.
+
 ### The TurtleTree
 
 Each interior node holds up to 64 pivots and buffers updates in up to four levels. Level *i* holds up to 2^*i* leaf-sized sorted runs. Inserting a batch merges it with the occupied prefix of levels, like incrementing a binary counter. After each insert the node flushes one leaf-sized batch to the child with the most buffered bytes. Leaves hold up to 4 MiB.
@@ -48,7 +56,7 @@ Each batch takes a ticket under the writer lock and registers it. Its versions c
 
 ## Guarantees
 
-- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. Each flush returns its buffer for the next, so appends land in resident memory. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused. With `preallocate_log`, segments with none to reuse are zero-filled ahead of their writes; see [Synchronous writes](BENCHMARKS.md#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
+- **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. Each flush returns its buffer for the next, so appends land in resident memory. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused. With `preallocate_log`, a segment with none to reuse is written ahead as zeros, in a file of its own, before a memtable takes it: the first when the store opens, and later ones on a background thread paced to the active memtable's filling; see [Synchronous writes](BENCHMARKS.md#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
 - **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
@@ -86,7 +94,7 @@ VOPR seeds and the threaded tests use small stores so that a short history reach
   - `db.rs`: write path, commit tickets, memtable rotation, the checkpoint pipeline, recovery, page reclamation.
   - `tree/`: the TurtleTree, its cursors and scans, the page cache and prefetch.
   - `page.rs`, `bloom.rs`, `pagestore.rs`: pages, filters, arenas and the superblock.
-  - `memtable.rs`, `wal.rs`, `storage.rs`: memtables, the log, and the storage traits.
+  - `memtable.rs`, `arena.rs`, `wal.rs`, `storage.rs`: memtables and their memory, the log, and the storage traits.
   - `sim/`: the simulated disk, the VOPR driver, and a deterministic write-amplification simulator.
 - `kvbench/`: the YCSB driver for lionturtle, RocksDB, fjall and ScyllaDB, and an in-memory index benchmark.
 - `bench/aws/`: EC2 benchmark scripts.

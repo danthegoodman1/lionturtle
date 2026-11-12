@@ -24,9 +24,9 @@
 
 use crate::error::Result;
 use crate::storage::{DIRECT_ALIGN, File, Storage};
-use crate::types::{Value, WriteOp};
+use crate::types::{Op, Value, WriteOp};
 use bytes::Bytes;
-use parking_lot::{Condvar, Mutex, lock_api::ArcMutexGuard};
+use parking_lot::{Mutex, lock_api::ArcMutexGuard};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -42,20 +42,24 @@ fn recycled_name(n: u64) -> String {
     format!("recycled-{n:016x}.log")
 }
 
-/// Retired log segments kept for reuse.
+/// Log segments kept for the memtables to come: retired ones, and ones
+/// written ahead as zeros (see [`Recycler::prepare`]).
 ///
-/// A new segment written over a retired one keeps the file's length, so
-/// fdatasync has no file size to journal, only data to write. On ext4 that
-/// halves the cost of a synchronous write.
+/// A new segment written over one of these keeps the file's length and its
+/// allocated blocks, so fdatasync has no file size or block allocation to
+/// journal, only data to write. On ext4 that halves the cost of a
+/// synchronous write.
 ///
-/// Only segments created since the store opened are kept. Once retired,
-/// every record in one has a sequence number its checkpoint covers. A
-/// segment replayed at recovery can hold records past a crash point, which
-/// are not covered, so it is deleted instead.
+/// Of retired segments, only those created since the store opened are kept.
+/// Once retired, every record in one has a sequence number its checkpoint
+/// covers. A segment replayed at recovery can hold records past a crash
+/// point, which are not covered, so it is deleted instead.
 pub struct Recycler {
     pool: Mutex<Pool>,
     /// The first segment created since the store opened.
     first_new: u64,
+    /// Bytes in the longest segment kept so far.
+    longest: AtomicU64,
 }
 
 struct Pool {
@@ -63,30 +67,46 @@ struct Pool {
     next: u64,
 }
 
-/// Retired segments kept at most. Each memtable rotation takes one, and each
+/// Segments kept at most. Each memtable rotation takes one, and each
 /// checkpoint returns one.
 const MAX_RECYCLED: usize = 2;
 
+/// Bytes of zeros written at a time while preparing a segment.
+const PREPARE_STEP: u64 = 1 << 20;
+
+fn preparing_name(n: u64) -> String {
+    format!("preparing-{n:016x}.log")
+}
+
 impl Recycler {
-    /// Adopts retired segments left in storage. A segment enters the pool
-    /// only after its checkpoint is durable, so these hold covered records
-    /// only. `first_new` is the id of the first segment this store creates.
+    /// Adopts the kept segments left in storage, and removes any left half
+    /// prepared. A retired segment enters the pool only after its
+    /// checkpoint is durable, and a prepared one holds zeros, so none holds
+    /// a record recovery would apply. `first_new` is the id of the first
+    /// segment this store creates.
     pub fn open(storage: &dyn Storage, first_new: u64) -> Result<Self> {
-        let mut found: Vec<(u64, String)> = storage
-            .list()?
-            .into_iter()
-            .filter_map(|name| {
-                let n = u64::from_str_radix(name.strip_prefix("recycled-")?.strip_suffix(".log")?, 16).ok()?;
-                Some((n, name))
-            })
-            .collect();
+        let mut found = Vec::new();
+        for name in storage.list()? {
+            if name.starts_with("preparing-") && name.ends_with(".log") {
+                storage.remove(&name)?;
+            } else if let Some(hex) = name.strip_prefix("recycled-").and_then(|n| n.strip_suffix(".log"))
+                && let Ok(n) = u64::from_str_radix(hex, 16)
+            {
+                found.push((n, name));
+            }
+        }
         found.sort_unstable();
         let next = found.last().map_or(0, |(n, _)| n + 1);
         let keep = found.len().min(MAX_RECYCLED);
         for (_, name) in found.drain(keep..) {
             storage.remove(&name)?;
         }
-        Ok(Self { pool: Mutex::new(Pool { names: found.into_iter().map(|(_, name)| name).collect(), next }), first_new })
+        let mut longest = 0;
+        for (_, name) in &found {
+            longest = longest.max(storage.open(name, false)?.len()?);
+        }
+        let names = found.into_iter().map(|(_, name)| name).collect();
+        Ok(Self { pool: Mutex::new(Pool { names, next }), first_new, longest: AtomicU64::new(longest) })
     }
 
     /// Retires segment `id`, whose checkpoint is durable: keeps it for reuse
@@ -97,6 +117,7 @@ impl Recycler {
             let name = recycled_name(pool.next);
             pool.next += 1;
             storage.rename(&segment_name(id), &name)?;
+            self.longest.fetch_max(storage.open(&name, false)?.len()?, Ordering::Relaxed);
             pool.names.push(name);
         } else {
             storage.remove(&segment_name(id))?;
@@ -104,10 +125,95 @@ impl Recycler {
         Ok(())
     }
 
-    /// A retired segment to reuse, if any.
+    /// A kept segment to write the next one over, if any.
     pub fn take(&self) -> Option<String> {
         self.pool.lock().names.pop()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.pool.lock().names.is_empty()
+    }
+
+    /// Bytes a prepared segment should span to hold one memtable's log:
+    /// `expected`, or the longest segment kept so far if that was longer.
+    pub fn segment_len(&self, expected: u64) -> u64 {
+        expected.max(self.longest.load(Ordering::Relaxed)).next_multiple_of(DIRECT_ALIGN as u64)
+    }
+
+    /// Writes a segment of `len` zeroed bytes and adds it to the pool, so
+    /// that the memtable rotation that takes it finds every block
+    /// allocated. Returns whether it did: a failed write only leaves the
+    /// pool as it was, and the next segment then grows as it is written.
+    ///
+    /// The zeros go to a file of their own, under a name recovery removes,
+    /// and the file joins the pool once they are durable. Zeroing the file
+    /// that takes the log's writes would hold up each write that overlaps a
+    /// fill: on XFS, a durable 20 KB write took 219 us at the median while
+    /// 16 MiB of its segment was being zeroed, against 46 us otherwise.
+    ///
+    /// `pace` is called with the bytes written so far, after each
+    /// [`PREPARE_STEP`]. It returns when the next step may go ahead, or
+    /// false to abandon the segment.
+    pub fn prepare(&self, storage: &dyn Storage, len: u64, mut pace: impl FnMut(u64) -> bool) -> bool {
+        let n = {
+            let mut pool = self.pool.lock();
+            pool.next += 1;
+            pool.next - 1
+        };
+        let (tmp, name) = (preparing_name(n), recycled_name(n));
+        let mut fill = || -> std::io::Result<bool> {
+            let file = storage.open_direct(&tmp, true)?;
+            let mut zeros = Vec::new();
+            let mut written = 0;
+            while written < len {
+                let step = PREPARE_STEP.min(len - written);
+                write_zeros(&*file, written, step, &mut zeros)?;
+                written += step;
+                if !pace(written) {
+                    return Ok(false);
+                }
+            }
+            file.sync_data()?;
+            storage.rename(&tmp, &name)?;
+            Ok(true)
+        };
+        if !matches!(fill(), Ok(true)) {
+            let _ = storage.remove(&tmp);
+            return false;
+        }
+        let mut pool = self.pool.lock();
+        if pool.names.len() < MAX_RECYCLED {
+            self.longest.fetch_max(len, Ordering::Relaxed);
+            pool.names.push(name);
+        } else {
+            // Checkpoints filled the pool meanwhile.
+            let _ = storage.remove(&name);
+        }
+        true
+    }
+}
+
+/// Zeroes `[start, start + len)` of `file` as written blocks, without making
+/// them durable. Both ends must be multiples of [`DIRECT_ALIGN`]. `zeros`
+/// keeps the buffer of zeros between calls.
+fn write_zeros(file: &dyn File, start: u64, len: u64, zeros: &mut Vec<Block>) -> std::io::Result<()> {
+    match file.write_zeroes(start, len) {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        r => return r,
+    }
+    if zeros.is_empty() {
+        zeros.resize((len as usize).div_ceil(DIRECT_ALIGN).min((PREPARE_STEP as usize) / DIRECT_ALIGN), Block([0; DIRECT_ALIGN]));
+    }
+    // SAFETY: a `Block` is a byte array without padding, as in
+    // `Staging::write`.
+    let bytes = unsafe { std::slice::from_raw_parts(zeros.as_ptr().cast::<u8>(), zeros.len() * DIRECT_ALIGN) };
+    let mut offset = start;
+    while offset < start + len {
+        let n = bytes.len().min((start + len - offset) as usize);
+        file.write_all_at(&bytes[..n], offset)?;
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 /// Ids of all log segments in storage, ascending.
@@ -138,7 +244,7 @@ pub struct Body {
 
 impl Body {
     /// Encodes `ops`, reusing this body's buffer.
-    pub fn encode(&mut self, ops: &[WriteOp]) {
+    pub fn encode<O: Op>(&mut self, ops: &[O]) {
         let buf = &mut self.bytes;
         buf.clear();
         buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
@@ -168,20 +274,21 @@ pub fn encode(buf: &mut Vec<u8>, first_seq: u64, ops: &[WriteOp]) {
     body.append_to(buf, first_seq);
 }
 
-fn encode_ops(buf: &mut Vec<u8>, ops: &[WriteOp]) {
+fn encode_ops<O: Op>(buf: &mut Vec<u8>, ops: &[O]) {
     for op in ops {
-        match &op.value {
-            Value::Put(v) => {
+        let key = op.key();
+        match op.value() {
+            Some(v) => {
                 buf.push(KIND_PUT);
-                buf.extend_from_slice(&(op.key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&op.key);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
                 buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 buf.extend_from_slice(v);
             }
-            Value::Delete => {
+            None => {
                 buf.push(KIND_DELETE);
-                buf.extend_from_slice(&(op.key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&op.key);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
             }
         }
     }
@@ -223,7 +330,6 @@ pub struct Log {
     /// fsync, a later one can succeed without the data being durable, so
     /// after either, no sync of this segment succeeds.
     failed: AtomicBool,
-    prealloc: Option<Arc<Prealloc>>,
 }
 
 struct Pending {
@@ -235,6 +341,19 @@ struct Pending {
     /// and under a memory limit one fault can wait milliseconds in reclaim
     /// while the writer lock is held.
     spare: Vec<u8>,
+}
+
+/// The memory a segment's records pass through on their way to its file,
+/// handed from each segment to the next. A new segment then appends, and
+/// composes its writes, in memory that is resident, and a memtable rotation
+/// asks the allocator for none: an allocation can wait milliseconds while
+/// the allocator returns other threads' freed memory to the system.
+#[derive(Default)]
+pub struct Buffers {
+    pending: Vec<u8>,
+    spare: Vec<u8>,
+    tail: Vec<u8>,
+    blocks: Vec<Block>,
 }
 
 /// One aligned block of a direct write.
@@ -288,141 +407,6 @@ impl Staging {
     }
 }
 
-/// How to zero-fill a segment ahead of its writes; see [`Prealloc`].
-#[derive(Clone, Copy, Debug)]
-pub struct PreallocConfig {
-    /// Bytes each fill zeroes, a multiple of [`DIRECT_ALIGN`].
-    pub chunk: u64,
-    /// Fill on a thread of its own rather than before the write that needs it.
-    pub background: bool,
-}
-
-/// Zero-fills a segment ahead of its writes, so that each write overwrites
-/// allocated blocks within the file's length, and the sync after it has no
-/// file size or block allocation to journal. On ext4 over a workstation's
-/// consumer NVMe drive, a durable 14 KB commit to a new store took 4.1 ms
-/// appending and 2.1 ms with fills. The few commits that land during a
-/// fill's own sync still pay the append cost.
-///
-/// A new segment fills its first chunk before it takes writes. After that, a
-/// fill of one more chunk starts once writes come within half a chunk of the
-/// filled end. In the background, a write that would reach a fill under way
-/// waits for it, since the fill's zeros could land after the write. Without
-/// background threads, the write that makes a fill due runs it first, which
-/// keeps simulation runs deterministic.
-///
-/// Fills write and sync through their own handle to the file, so the log's
-/// own syncs still see any write-back error on its pages.
-struct Prealloc {
-    file: Arc<dyn File>,
-    chunk: u64,
-    background: bool,
-    fill: Mutex<Fill>,
-    done: Condvar,
-}
-
-struct Fill {
-    /// Bytes from the start of the segment known to be allocated.
-    end: u64,
-    /// A background fill past `end` is under way.
-    running: bool,
-    /// A fill failed, or the segment is closed: writes past `end` append.
-    stopped: bool,
-}
-
-impl Prealloc {
-    /// Prepares to fill a segment `len` bytes long through `file`, a handle
-    /// of the fills' own.
-    fn new(file: Arc<dyn File>, len: u64, cfg: PreallocConfig) -> Self {
-        let mut end = len / DIRECT_ALIGN as u64 * DIRECT_ALIGN as u64;
-        let mut stopped = false;
-        if end < cfg.chunk {
-            match zero_fill(&*file, end, cfg.chunk) {
-                Ok(()) => end += cfg.chunk,
-                Err(_) => stopped = true,
-            }
-        }
-        Self {
-            file,
-            chunk: cfg.chunk,
-            background: cfg.background,
-            fill: Mutex::new(Fill { end, running: false, stopped }),
-            done: Condvar::new(),
-        }
-    }
-
-    /// Readies the segment for a write that ends at `end`: waits for a fill
-    /// the write would reach, and starts or runs the next fill once it is due.
-    fn before_write(self: &Arc<Self>, end: u64) {
-        let mut fill = self.fill.lock();
-        while fill.running && end > fill.end {
-            self.done.wait(&mut fill);
-        }
-        if fill.stopped || fill.running || end + self.chunk / 2 <= fill.end {
-            return;
-        }
-        if !self.background {
-            // Writes stop at the filled end until a fill fails, so this fill
-            // starts at or past the write's start.
-            let len = end.saturating_sub(fill.end) + self.chunk;
-            match zero_fill(&*self.file, fill.end, len) {
-                Ok(()) => fill.end += len,
-                Err(_) => fill.stopped = true,
-            }
-            return;
-        }
-        // A write that outran the fills appends; the next fill starts past it.
-        let start = fill.end.max(end);
-        fill.running = true;
-        let p = self.clone();
-        let spawned = std::thread::Builder::new().name("lionturtle-log-fill".into()).spawn(move || {
-            let r = zero_fill(&*p.file, start, p.chunk);
-            let mut fill = p.fill.lock();
-            fill.running = false;
-            match r {
-                Ok(()) => fill.end = start + p.chunk,
-                Err(_) => fill.stopped = true,
-            }
-            p.done.notify_all();
-        });
-        if spawned.is_err() {
-            fill.running = false;
-            fill.stopped = true;
-        }
-    }
-
-    /// Waits out a fill under way and starts no more. A retired segment's
-    /// file can be reused, and a late fill would zero its new records.
-    fn stop(&self) {
-        let mut fill = self.fill.lock();
-        while fill.running {
-            self.done.wait(&mut fill);
-        }
-        fill.stopped = true;
-    }
-}
-
-/// Zeroes `[start, start + len)` of `file` as written blocks, durably. Both
-/// ends must be multiples of [`DIRECT_ALIGN`].
-fn zero_fill(file: &dyn File, start: u64, len: u64) -> std::io::Result<()> {
-    match file.write_zeroes(start, len) {
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-            let blocks = vec![Block([0; DIRECT_ALIGN]); (len as usize).div_ceil(DIRECT_ALIGN).min(256)];
-            // SAFETY: a `Block` is a byte array without padding, as in
-            // `Staging::write`.
-            let zeros = unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), blocks.len() * DIRECT_ALIGN) };
-            let mut offset = start;
-            while offset < start + len {
-                let n = zeros.len().min((start + len - offset) as usize);
-                file.write_all_at(&zeros[..n], offset)?;
-                offset += n as u64;
-            }
-        }
-        r => r?,
-    }
-    file.sync_data()
-}
-
 impl Log {
     /// Total bytes appended, written or not.
     pub fn len(&self) -> u64 {
@@ -437,12 +421,11 @@ impl Log {
         let mut p = self.pending.lock();
         let io = self.io.lock_arc();
         let offset = p.offset;
-        // A synchronous group flushes little; copying that keeps the
-        // buffer's capacity.
-        let buf = if p.buf.len() < 64 << 10 {
-            let small = p.buf.clone();
-            p.buf.clear();
-            small
+        // The records go to the write in their buffer, and the buffer the
+        // last write returned takes its place, so a flush allocates only
+        // until the segment has two.
+        let buf = if p.buf.is_empty() {
+            Vec::new()
         } else {
             let next = match std::mem::take(&mut p.spare) {
                 spare if spare.capacity() > 0 => spare,
@@ -551,15 +534,12 @@ impl Flush {
             // A failed write leaves `base` short of later offsets, and
             // `Staging::write` returns that failure.
             debug_assert!(io.failed || io.base + io.tail.len() as u64 == offset);
-            if let Some(p) = &log.prealloc {
-                p.before_write(io.base + (io.tail.len() + buf.len()).next_multiple_of(DIRECT_ALIGN) as u64);
-            }
             io.write(&*log.file, &buf, durable)?;
             log.complete(offset, buf.len());
         }
         // Appends take `pending` before `io`, so `io` goes first.
         drop(io);
-        if buf.capacity() >= 64 << 10 {
+        if buf.capacity() > 0 {
             buf.clear();
             let mut p = log.pending.lock();
             if p.spare.capacity() < buf.capacity() {
@@ -571,10 +551,10 @@ impl Flush {
 }
 
 impl WalWriter {
-    /// Creates segment `id`, reusing the retired segment `reuse` if given,
-    /// and makes its directory entry durable. With `prealloc`, zero-fills the
-    /// segment ahead of its writes.
-    pub fn create(storage: &dyn Storage, id: u64, reuse: Option<String>, prealloc: Option<PreallocConfig>) -> Result<Self> {
+    /// Creates segment `id`, over the kept segment `reuse` if given, and
+    /// makes its directory entry durable. Its records pass through
+    /// `buffers`: the last segment's, or `Buffers::default()` for new ones.
+    pub fn create(storage: &dyn Storage, id: u64, reuse: Option<String>, buffers: Buffers) -> Result<Self> {
         let file = match reuse {
             Some(old) => {
                 storage.rename(&old, &segment_name(id))?;
@@ -582,26 +562,39 @@ impl WalWriter {
             }
             None => storage.open_direct(&segment_name(id), true)?,
         };
-        let prealloc = match prealloc {
-            Some(cfg) => Some(Arc::new(Prealloc::new(storage.open_direct(&segment_name(id), false)?, file.len()?, cfg))),
-            None => None,
-        };
         storage.sync_dir()?;
+        let Buffers { mut pending, spare, mut tail, blocks } = buffers;
+        pending.reserve(1 << 20);
+        tail.reserve(DIRECT_ALIGN);
         let log = Arc::new(Log {
             file,
-            pending: Mutex::new(Pending { buf: Vec::with_capacity(1 << 20), offset: 0, spare: Vec::new() }),
-            io: Arc::new(Mutex::new(Staging { base: 0, tail: Vec::with_capacity(DIRECT_ALIGN), blocks: Vec::new(), failed: false })),
+            pending: Mutex::new(Pending { buf: pending, offset: 0, spare }),
+            io: Arc::new(Mutex::new(Staging { base: 0, tail, blocks, failed: false })),
             completed: AtomicU64::new(0),
             synced: AtomicU64::new(0),
             syncing: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            prealloc,
         });
         Ok(Self { id, log })
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Takes the segment's buffers for the next segment. Call once every
+    /// record is durable: the segment takes no more.
+    pub fn take_buffers(&mut self) -> Buffers {
+        let mut p = self.log.pending.lock();
+        let mut io = self.log.io.lock();
+        debug_assert!(p.buf.is_empty(), "records await a write");
+        io.tail.clear();
+        Buffers {
+            pending: std::mem::take(&mut p.buf),
+            spare: std::mem::take(&mut p.spare),
+            tail: std::mem::take(&mut io.tail),
+            blocks: std::mem::take(&mut io.blocks),
+        }
     }
 
     pub fn append(&mut self, first_seq: u64, ops: &[WriteOp]) {
@@ -638,15 +631,6 @@ impl WalWriter {
     /// Makes every appended record durable.
     pub fn sync(&mut self) -> Result<()> {
         self.log.sync_to(self.log.len())
-    }
-}
-
-impl Drop for WalWriter {
-    /// A segment's writer drops before the segment retires.
-    fn drop(&mut self) {
-        if let Some(p) = &self.log.prealloc {
-            p.stop();
-        }
     }
 }
 
@@ -764,7 +748,7 @@ mod tests {
     #[test]
     fn flushes_reuse_their_buffers() {
         let disk = SimStorage::new(4, FaultConfig::default());
-        let mut w = WalWriter::create(&disk, 1, None, None).unwrap();
+        let mut w = WalWriter::create(&disk, 1, None, Buffers::default()).unwrap();
         let big = [WriteOp::put("k", "v".repeat(100 << 10))];
         let first = w.log.pending.lock().buf.as_ptr();
         w.append(1, &big);
@@ -776,6 +760,16 @@ mod tests {
         assert_eq!(w.log.pending.lock().buf.as_ptr(), first);
         w.append(3, &big);
         w.sync().unwrap();
+        // The next segment takes both buffers with it.
+        let second = w.log.pending.lock().buf.as_ptr();
+        let mut next = WalWriter::create(&disk, 2, None, w.take_buffers()).unwrap();
+        assert_eq!(next.log.pending.lock().buf.as_ptr(), second);
+        next.append(4, &[WriteOp::put("k", "v")]);
+        next.sync().unwrap();
+        assert_eq!(next.log.pending.lock().buf.as_ptr(), first);
+        let mut seen = Vec::new();
+        replay(&disk, 2, 3, |seq, _| seen.push(seq)).unwrap();
+        assert_eq!(seen, [4]);
         let mut seen = Vec::new();
         replay(&disk, 1, 0, |seq, _| seen.push(seq)).unwrap();
         assert_eq!(seen, [1, 2, 3]);
@@ -784,7 +778,7 @@ mod tests {
     #[test]
     fn roundtrip_and_torn_tail() {
         let disk = SimStorage::new(3, FaultConfig::default());
-        let mut w = WalWriter::create(&disk, 1, None, None).unwrap();
+        let mut w = WalWriter::create(&disk, 1, None, Buffers::default()).unwrap();
         w.append(1, &[WriteOp::put("a", "1"), WriteOp::delete("b")]);
         w.append(3, &[WriteOp::put("c", "3")]);
         w.sync().unwrap();
@@ -805,7 +799,7 @@ mod tests {
         let r = replay(&disk, 1, 7, |_, _| {}).unwrap();
         assert_eq!((r.last_seq, r.end), (7, End::Torn), "covered records are skipped up to the zero fill");
 
-        let mut w = WalWriter::create(&disk, 2, None, None).unwrap();
+        let mut w = WalWriter::create(&disk, 2, None, Buffers::default()).unwrap();
         w.append(10, &[WriteOp::put("e", "5")]);
         w.sync().unwrap();
         let r = replay(&disk, 2, 5, |_, _| {}).unwrap();
@@ -816,7 +810,7 @@ mod tests {
     fn reused_segment_skips_old_records() {
         let disk = SimStorage::new(2, FaultConfig::default());
         let recycler = Recycler::open(&disk, 1).unwrap();
-        let mut w = WalWriter::create(&disk, 1, recycler.take(), None).unwrap();
+        let mut w = WalWriter::create(&disk, 1, recycler.take(), Buffers::default()).unwrap();
         for seq in 1..=20 {
             w.append(seq, &[WriteOp::put(format!("key{seq}"), "old value")]);
         }
@@ -825,7 +819,7 @@ mod tests {
         recycler.retire(&disk, 1).unwrap();
         assert!(!disk.list().unwrap().contains(&segment_name(1)));
 
-        let mut w = WalWriter::create(&disk, 2, recycler.take(), None).unwrap();
+        let mut w = WalWriter::create(&disk, 2, recycler.take(), Buffers::default()).unwrap();
         w.append(21, &[WriteOp::put("a", "1")]);
         w.append(22, &[WriteOp::put("b", "2")]);
         w.sync().unwrap();
@@ -841,38 +835,74 @@ mod tests {
         assert!(!disk.list().unwrap().contains(&segment_name(2)));
     }
 
-    /// Fills run just ahead of the writes, inline and in the background, and
-    /// must never zero a record.
+    /// A prepared segment is zeros for its whole length, joins the pool, and
+    /// takes a log's records like any kept segment.
     #[test]
-    fn preallocated_segment_keeps_every_record() {
-        for background in [false, true] {
-            let disk = SimStorage::new(4, FaultConfig::default());
-            let chunk = 2 * DIRECT_ALIGN as u64;
-            let mut w = WalWriter::create(&disk, 1, None, Some(PreallocConfig { chunk, background })).unwrap();
-            let file = disk.open(&segment_name(1), false).unwrap();
-            assert_eq!(file.len().unwrap(), chunk, "a new segment fills its first chunk before taking writes");
-            for seq in 1..=500 {
-                w.append(seq, &[WriteOp::put(format!("key{seq}"), vec![b'v'; 100])]);
-                if seq % 3 == 0 {
-                    w.flush().unwrap();
-                } else {
-                    w.sync().unwrap();
-                }
-                if !background {
-                    assert!(file.len().unwrap() > w.len(), "inline fills keep the segment ahead of its writes");
-                }
-            }
+    fn prepared_segment_takes_records() {
+        let disk = SimStorage::new(4, FaultConfig::default());
+        let recycler = Recycler::open(&disk, 1).unwrap();
+        let len = recycler.segment_len(3 * PREPARE_STEP / 2 + 5);
+        assert_eq!(len % DIRECT_ALIGN as u64, 0);
+        let mut steps = Vec::new();
+        assert!(recycler.prepare(&disk, len, |written| {
+            steps.push(written);
+            true
+        }));
+        assert_eq!(steps, [PREPARE_STEP, len]);
+        let name = recycler.take().expect("a prepared segment");
+        let file = disk.open(&name, false).unwrap();
+        assert_eq!(file.len().unwrap(), len);
+        let mut data = vec![1u8; len as usize];
+        file.read_exact_at(&mut data, 0).unwrap();
+        assert!(data.iter().all(|&b| b == 0));
+
+        let mut w = WalWriter::create(&disk, 1, Some(name), Buffers::default()).unwrap();
+        for seq in 1..=300 {
+            w.append(seq, &[WriteOp::put(format!("key{seq}"), vec![b'v'; 100])]);
             w.sync().unwrap();
-            let written = w.len();
-            drop(w);
-            let mut seen = 0;
-            let r = replay(&disk, 1, 0, |seq, _| {
-                seen += 1;
-                assert_eq!(seq, seen, "background: {background}");
-            })
-            .unwrap();
-            assert_eq!((r.last_seq, seen), (500, 500), "background: {background}");
-            assert!(file.len().unwrap() > written);
         }
+        assert_eq!(disk.open(&segment_name(1), false).unwrap().len().unwrap(), len, "writes stay within the prepared length");
+        let mut seen = 0;
+        let r = replay(&disk, 1, 0, |seq, _| {
+            seen += 1;
+            assert_eq!(seq, seen);
+        })
+        .unwrap();
+        assert_eq!((r.last_seq, seen, r.end), (300, 300, End::Torn));
+        // A longer segment kept raises the length of those prepared later.
+        assert_eq!(recycler.segment_len(DIRECT_ALIGN as u64), len);
+    }
+
+    /// An abandoned preparation leaves nothing behind, and one cut short by
+    /// a crash is removed when the store next opens.
+    #[test]
+    fn half_prepared_segments_are_removed() {
+        let disk = SimStorage::new(5, FaultConfig::default());
+        let recycler = Recycler::open(&disk, 1).unwrap();
+        assert!(!recycler.prepare(&disk, 4 * PREPARE_STEP, |written| written < 2 * PREPARE_STEP));
+        assert!(recycler.take().is_none());
+        assert!(disk.list().unwrap().is_empty());
+
+        disk.open(&preparing_name(7), true).unwrap().write_all_at(&[0; DIRECT_ALIGN], 0).unwrap();
+        disk.sync_dir().unwrap();
+        let recycler = Recycler::open(&disk, 1).unwrap();
+        assert!(recycler.take().is_none());
+        assert!(disk.list().unwrap().is_empty());
+    }
+
+    /// The pool holds what checkpoints retire first: a segment prepared
+    /// once it is full is dropped.
+    #[test]
+    fn a_full_pool_drops_a_prepared_segment() {
+        let disk = SimStorage::new(6, FaultConfig::default());
+        let recycler = Recycler::open(&disk, 1).unwrap();
+        for id in 1..=MAX_RECYCLED as u64 {
+            let mut w = WalWriter::create(&disk, id, None, Buffers::default()).unwrap();
+            w.append(id, &[WriteOp::put("k", "v")]);
+            w.sync().unwrap();
+            recycler.retire(&disk, id).unwrap();
+        }
+        assert!(recycler.prepare(&disk, PREPARE_STEP, |_| true));
+        assert_eq!(disk.list().unwrap().len(), MAX_RECYCLED);
     }
 }
