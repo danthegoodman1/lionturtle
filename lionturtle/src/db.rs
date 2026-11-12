@@ -13,15 +13,16 @@
 //! references return to the allocator once every reader of an older version
 //! is gone (see [`Epoch`]).
 
+use crate::arena::ChunkPool;
 use crate::bloom::{self, SharedFilter};
 use crate::error::{Error, Result};
-use crate::memtable::{MemTable, MemTableKind, View, new_memtable};
+use crate::memtable::{Entry, MemTable, MemTableKind, View, new_memtable};
 use crate::page::{Compression, EntryRef, entry_size};
 use crate::pagestore::{PagePtr, PageStore, Superblock};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, Pace, PageIo};
 use crate::tree::{self, Ctx, Subtree, TreeConfig, TreeScan};
-use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Value, WriteOp, cmp_keys, prefix_end};
+use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Op, Value, WriteOp, cmp_keys, prefix_end};
 use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -66,13 +67,20 @@ pub struct Options {
     /// next memtable takes to fill, rather than run it at full speed, so
     /// client reads queue behind less of it. See [`PACE_SHARE`].
     pub pace_checkpoints: bool,
-    /// Zero-fill each log segment a few MiB ahead of its writes, so that a
-    /// durable write overwrites allocated space instead of extending the
-    /// file, and its sync has no file size or block allocation to journal.
-    /// On ext4 over NVMe, that halved the cost of each sync. A reused
-    /// segment already gets this, so the option speeds up only segments
-    /// with none to reuse: a new store's first few, and any that outgrow
-    /// the one they reuse. It writes those segments twice, once as zeros.
+    /// Write whole log segments of zeros ahead of the memtables that use
+    /// them, so that a durable write overwrites allocated space instead of
+    /// extending the file, and its sync has no file size or block
+    /// allocation to journal. On ext4 over NVMe, that halved the cost of
+    /// each sync. A segment written over a retired one already gets this,
+    /// so the option speeds up only segments with none to reuse: a new
+    /// store's first three, each written twice, once as zeros.
+    ///
+    /// Opening a store with no segment to reuse writes the first one before
+    /// it returns. After that a background thread writes one whenever none
+    /// is kept, spread over [`PREPARE_LOG_SECS`] or half the time the
+    /// active memtable takes to fill, whichever is shorter, in a file the
+    /// log is not writing. A memtable that fills before its segment is
+    /// ready gets a new, empty one, which grows as it is written.
     pub preallocate_log: bool,
     /// How data pages written from now on are stored. With
     /// [`Compression::Lz4`], the default, each block holds about as many
@@ -93,6 +101,11 @@ pub struct Options {
 /// A paced checkpoint aims to finish its I/O within this share of the time
 /// its memtable took to fill, or by the time the next memtable is this full.
 pub const PACE_SHARE: f64 = 0.75;
+
+/// Seconds a background thread takes to write a log segment of zeros while
+/// writers are idle; see [`Options::preallocate_log`]. One memtable's log
+/// over two seconds is a few percent of an NVMe drive's write rate.
+pub const PREPARE_LOG_SECS: f64 = 2.0;
 
 /// Checkpoint I/O per memtable byte that pacing expects before any
 /// checkpoint has run. Checkpoints of uniform 1 KB updates read and wrote 9
@@ -122,13 +135,10 @@ impl Options {
         self.checkpoint_distance.max(1) * self.tree.leaf_size
     }
 
-    /// How to zero-fill log segments, if at all. Each fill ends in a sync,
-    /// so a fill of a quarter of a memtable keeps them few per segment, and
-    /// the 16 MiB cap bounds the wait while a new segment fills its first.
-    fn preallocate(&self) -> Option<wal::PreallocConfig> {
-        let align = crate::storage::DIRECT_ALIGN as u64;
-        let chunk = (self.memtable_limit() / 4).clamp(align, 16 << 20).next_multiple_of(align);
-        self.preallocate_log.then_some(wal::PreallocConfig { chunk, background: self.background })
+    /// Bytes of log one memtable is expected to fill: its entries, and an
+    /// eighth more for the log's record headers.
+    fn log_segment_len(&self) -> u64 {
+        self.memtable_limit() + self.memtable_limit() / 8
     }
 }
 
@@ -333,30 +343,46 @@ fn backoff(spins: &mut u32) {
 }
 
 impl Mem {
-    fn new(id: u64, opts: &Options, last_seq: u64) -> Self {
+    fn new(id: u64, opts: &Options, last_seq: u64, pool: &Arc<ChunkPool>) -> Self {
         Self {
             id,
             created: std::time::Instant::now(),
             filled: std::sync::OnceLock::new(),
             waited: AtomicBool::new(false),
-            table: new_memtable(opts.memtable),
-            filter: SharedFilter::new((opts.memtable_limit() / MEM_BYTES_PER_FILTER_BIT / 8) as usize),
+            table: new_memtable(opts.memtable, pool),
+            filter: SharedFilter::new_in(pool, (opts.memtable_limit() / MEM_BYTES_PER_FILTER_BIT / 8) as usize),
             counts: MemCounts { bytes: AtomicU64::new(0), last_seq: AtomicU64::new(last_seq) },
             inflight: Inflight::default(),
         }
     }
 
     fn replay(&self, op: &WriteOp, seq: u64) {
-        self.insert(&op.key, op.value.clone(), seq, 0);
+        self.insert(op.key(), op.value(), seq, 0);
         self.counts.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
     }
 
     /// Adds the version of `key` written at `seq` by batch `ticket`. The
     /// filter takes the key first, so a get that can see the version finds
     /// the key in the filter.
-    fn insert(&self, key: &[u8], value: Value, seq: u64, ticket: u64) {
+    fn insert(&self, key: &[u8], value: Option<&[u8]>, seq: u64, ticket: u64) {
         self.filter.insert(bloom::hash_key(key));
         self.table.insert(key, value, seq, ticket);
+    }
+
+    /// Adds a version of each of `ops`, at sequence numbers counting up
+    /// from `seq`, a group at a time so the table can look a group's keys
+    /// up together.
+    fn insert_all<O: Op>(&self, ops: &[O], mut seq: u64, ticket: u64) {
+        const GROUP: usize = 64;
+        for group in ops.chunks(GROUP) {
+            let mut entries: [Entry<'_>; GROUP] = [(&[], None); GROUP];
+            for (entry, op) in entries.iter_mut().zip(group) {
+                *entry = (op.key(), op.value());
+                self.filter.insert(bloom::hash_key(entry.0));
+            }
+            self.table.insert_many(&entries[..group.len()], seq, ticket);
+            seq += group.len() as u64;
+        }
     }
 
     /// The newest value of the key hashing to `hash` that `view` sees.
@@ -540,7 +566,7 @@ impl Drop for WriterGuard<'_> {
             (!head.is_null()).then_some(head as usize)
         });
         if let Some(key) = next {
-            Inner::wake(vec![key]);
+            Inner::wake(&[key]);
         }
     }
 }
@@ -626,6 +652,8 @@ struct Inner {
     /// Bytes the last few checkpoints read for merges and wrote as pages.
     checkpoint_io: Mutex<VecDeque<u64>>,
     recycler: wal::Recycler,
+    /// The memory of dropped memtables, for new ones.
+    mem_pool: Arc<ChunkPool>,
 }
 
 /// Cumulative nanoseconds spent in each checkpoint stage, and by writers
@@ -679,9 +707,10 @@ impl Db {
         io.store.punch_free();
 
         // Replay the log into one memtable.
+        let mem_pool = ChunkPool::new(opts.memtable_limit());
         let mut last_seq = sb.last_seq;
         let mut max_id = sb.last_memtable_id;
-        let replayed = Mem::new(0, &opts, last_seq);
+        let replayed = Mem::new(0, &opts, last_seq, &mem_pool);
         let segments = wal::list_segments(&*storage)?;
         let mut gap = false;
         for &id in &segments {
@@ -714,15 +743,18 @@ impl Db {
         }
         storage.sync_dir()?;
         let mut frozen = Vec::new();
-        if replayed.table.len() > 0 {
+        if !replayed.table.is_empty() {
             replayed.counts.last_seq.store(last_seq, Relaxed);
             let mem = Mem { id: max_id, ..replayed };
             frozen.push(Arc::new(mem));
         }
         let active_id = max_id + 1;
         let recycler = wal::Recycler::open(&*storage, active_id)?;
-        let wal = WalWriter::create(&*storage, active_id, recycler.take(), opts.preallocate())?;
-        let active = Arc::new(Mem::new(active_id, &opts, last_seq));
+        if opts.preallocate_log && recycler.is_empty() {
+            recycler.prepare(&*storage, recycler.segment_len(opts.log_segment_len()), |_| true);
+        }
+        let wal = WalWriter::create(&*storage, active_id, recycler.take(), wal::Buffers::default())?;
+        let active = Arc::new(Mem::new(active_id, &opts, last_seq, &mem_pool));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
         let live_versions = Arc::new(AtomicUsize::new(0));
@@ -766,13 +798,15 @@ impl Db {
             merge_pool,
             checkpoint_io: Mutex::new(VecDeque::new()),
             recycler,
+            mem_pool,
             opts,
         });
         // Two pipeline stages, as in the paper: one thread applies the next
         // frozen memtable while the other syncs and commits the last one.
         let mut workers = Vec::new();
         if inner.opts.background {
-            for (name, stage) in [("lionturtle-apply", Stage::Apply), ("lionturtle-commit", Stage::Commit)] {
+            let prepare = inner.opts.preallocate_log.then_some(("lionturtle-log", Stage::PrepareLog));
+            for (name, stage) in [("lionturtle-apply", Stage::Apply), ("lionturtle-commit", Stage::Commit)].into_iter().chain(prepare) {
                 let inner = inner.clone();
                 workers.push(
                     std::thread::Builder::new().name(name.into()).spawn(move || inner.stage_loop(stage)).expect("spawn checkpoint thread"),
@@ -783,16 +817,22 @@ impl Db {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.inner.write(vec![WriteOp::put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))], false)
+        self.inner.write(&[(key, Some(value))], false)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.inner.write(vec![WriteOp::delete(Bytes::copy_from_slice(key))], false)
+        self.inner.write(&[(key, None)], false)
     }
 
     /// Applies `ops` atomically. With `sync`, returns once they are durable.
-    pub fn write(&self, ops: &[WriteOp], sync: bool) -> Result<()> {
-        self.inner.write(ops.to_vec(), sync)
+    ///
+    /// The ops are [`WriteOp`]s, or `(key, value)` pairs of borrowed bytes
+    /// with `None` for a delete. The store copies the keys and values into
+    /// its log and its memtable, and keeps none of the caller's buffers, so
+    /// a caller that holds its keys and values as slices need not allocate
+    /// to write them.
+    pub fn write<O: Op>(&self, ops: &[O], sync: bool) -> Result<()> {
+        self.inner.write(ops, sync)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -851,7 +891,7 @@ impl Db {
         self.inner.check_poisoned()?;
         {
             let mut w = self.inner.lock_writer();
-            if w.active.table.len() > 0 {
+            if !w.active.table.is_empty() {
                 let r = self.inner.rotate(&mut w);
                 self.inner.poison_on_err(r)?;
             }
@@ -885,7 +925,7 @@ impl Db {
     /// Freezes the active memtable if it holds anything, without waiting.
     pub fn freeze(&self) -> Result<()> {
         let mut w = self.inner.lock_writer();
-        if w.active.table.len() > 0 {
+        if !w.active.table.is_empty() {
             let r = self.inner.rotate(&mut w);
             self.inner.poison_on_err(r)?;
         }
@@ -1014,27 +1054,29 @@ impl Inner {
         self.signal.notify_all();
     }
 
-    /// Takes the ops by value so the memtable keeps their buffers as they
-    /// are; a clone of a `Bytes` would add a shared header to every value.
-    fn write(&self, ops: Vec<WriteOp>, sync: bool) -> Result<()> {
+    /// Logs `ops` and inserts them in the memtable, each of which copies
+    /// the bytes it keeps.
+    fn write<O: Op>(&self, ops: &[O], sync: bool) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        for op in &ops {
-            if op.key.len() > MAX_KEY_LEN || op.value.encoded_len() > MAX_VALUE_LEN {
+        let (mut entry_bytes, mut user_bytes) = (0, 0);
+        for op in ops {
+            let (key, value) = (op.key().len(), op.value().map_or(0, <[u8]>::len));
+            if key > MAX_KEY_LEN || value > MAX_VALUE_LEN {
                 return Err(Error::InvalidArgument("key or value too large".into()));
             }
+            entry_bytes += entry_size(key, value);
+            user_bytes += (key + value) as u64;
         }
         self.check_poisoned()?;
-        let entry_bytes: u64 = ops.iter().map(|op| entry_size(op.key.len(), op.value.encoded_len())).sum();
-        let user_bytes: u64 = ops.iter().map(|op| (op.key.len() + op.value.encoded_len()) as u64).sum();
         thread_local! {
             static BODY: std::cell::RefCell<wal::Body> = Default::default();
         }
         BODY.with_borrow_mut(|body| {
             // Everything but the sequence number is encoded and checksummed
             // before queueing, which keeps the writer lock's turns short.
-            body.encode(&ops);
+            body.encode(ops);
             let request = Request {
                 body,
                 ops: ops.len() as u64,
@@ -1059,9 +1101,7 @@ impl Inner {
             // SAFETY: see `Assigned::mem`; this writer stays counted in
             // until the `exit` below, its last use of the memtable.
             let mem = unsafe { &*a.mem };
-            for (i, op) in ops.into_iter().enumerate() {
-                mem.insert(&op.key, op.value, a.seq + i as u64, a.ticket);
-            }
+            mem.insert_all(ops, a.seq, a.ticket);
             self.commits.commit(a.ticket);
             mem.inflight.exit(request.shard);
             self.poison_on_err(flushed)
@@ -1089,11 +1129,19 @@ impl Inner {
                 return;
             }
             if let Some(w) = self.writer.try_lock() {
-                let mut w = WriterGuard { inner: self, w: Some(w) };
-                let woken = self.serve(&mut w);
-                // Releasing the lock wakes a writer to take the next turn.
-                drop(w);
-                Self::wake(woken);
+                thread_local! {
+                    /// The requests a turn served, kept between turns so a
+                    /// turn allocates nothing.
+                    static SERVED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                SERVED.with_borrow_mut(|served| {
+                    let mut w = WriterGuard { inner: self, w: Some(w) };
+                    served.clear();
+                    self.serve(&mut w, served);
+                    // Releasing the lock wakes a writer to take the next turn.
+                    drop(w);
+                    Self::wake(served);
+                });
                 continue;
             }
             if spins < REQUEST_SPINS {
@@ -1120,8 +1168,8 @@ impl Inner {
     }
 
     /// One turn at the writer lock: serves the requests the last turn left,
-    /// then those queued now, oldest first, and returns their keys for
-    /// [`Self::wake`] once the lock is released.
+    /// then those queued now, oldest first, and adds their keys to `served`
+    /// for [`Self::wake`] once the lock is released.
     ///
     /// A turn takes the queue once and serves at most [`TURN_LIMIT`]
     /// requests, so it ends and lets its own batch commit. A turn rotates the
@@ -1129,16 +1177,17 @@ impl Inner {
     /// served, sits in the memtable a rotation may have to wait to
     /// checkpoint. A request needing a rotation after that waits for the next
     /// turn.
-    fn serve(&self, w: &mut Writer) -> Vec<usize> {
+    fn serve(&self, w: &mut Writer, served: &mut Vec<usize>) {
         let mut p = self.queue.swap(std::ptr::null_mut(), Acquire);
-        let mut queued = Vec::new();
+        // The queue runs newest first: its requests join the carried ones
+        // in that order, then turn around in place.
+        let carried = w.carried.len();
         while !p.is_null() {
-            queued.push(p as usize);
+            w.carried.push_back(p as usize);
             // SAFETY: a queued request stays alive until it is done.
             p = unsafe { (*p).next.load(Relaxed) };
         }
-        w.carried.extend(queued.into_iter().rev());
-        let mut served = Vec::new();
+        w.carried.make_contiguous()[carried..].reverse();
         while let Some(&key) = w.carried.front() {
             if served.len() == TURN_LIMIT || !served.is_empty() && w.active.bytes() >= self.opts.memtable_limit() {
                 break;
@@ -1151,13 +1200,12 @@ impl Inner {
             request.done.store(true, Release);
             served.push(key);
         }
-        served
     }
 
     /// Wakes the writers of served requests that parked. Only the keys are
     /// used: the requests themselves may be gone.
-    fn wake(keys: Vec<usize>) {
-        for key in keys {
+    fn wake(keys: &[usize]) {
+        for &key in keys {
             // SAFETY: the callback neither panics nor calls into the
             // parking lot.
             unsafe { parking_lot_core::unpark_one(key, |_| parking_lot_core::DEFAULT_UNPARK_TOKEN) };
@@ -1227,8 +1275,14 @@ impl Inner {
         // so that recovery always replays a prefix of history.
         w.wal.sync()?;
         let id = w.active.id + 1;
-        let wal = WalWriter::create(&*self.storage, id, self.recycler.take(), self.opts.preallocate())?;
-        let mem = Arc::new(Mem::new(id, &self.opts, w.next_seq - 1));
+        if self.opts.preallocate_log && !self.opts.background && self.recycler.is_empty() {
+            // No thread prepares segments ahead, so this one is prepared
+            // now, and a simulated run stays deterministic.
+            self.recycler.prepare(&*self.storage, self.recycler.segment_len(self.opts.log_segment_len()), |_| true);
+        }
+        let buffers = w.wal.take_buffers();
+        let wal = WalWriter::create(&*self.storage, id, self.recycler.take(), buffers)?;
+        let mem = Arc::new(Mem::new(id, &self.opts, w.next_seq - 1, &self.mem_pool));
         {
             let _g = self.version_lock.lock();
             let v = self.version.load();
@@ -1282,18 +1336,31 @@ impl Inner {
     /// Runs one pipeline stage until shutdown or failure.
     fn stage_loop(self: Arc<Self>, stage: Stage) {
         loop {
+            // The committer also wakes to give memtable memory that has
+            // gone unused back to the system.
+            let trim_in = matches!(stage, Stage::Commit).then(|| self.mem_pool.trim().unwrap_or(crate::arena::TRIM_INTERVAL));
+            let mut timed_out = false;
             {
                 let mut g = self.signal_lock.lock();
-                while !self.stage_ready(stage) && !self.shutdown.load(SeqCst) && !self.poisoned.load(SeqCst) {
-                    self.signal.wait(&mut g);
+                while !timed_out && !self.stage_ready(stage) && !self.shutdown.load(SeqCst) && !self.poisoned.load(SeqCst) {
+                    match trim_in {
+                        Some(wait) => timed_out = self.signal.wait_for(&mut g, wait).timed_out(),
+                        None => self.signal.wait(&mut g),
+                    }
                 }
             }
             if self.shutdown.load(SeqCst) || self.poisoned.load(SeqCst) {
                 return;
             }
+            if timed_out {
+                continue;
+            }
             let r = match stage {
                 Stage::Apply => self.apply_step(),
                 Stage::Commit => self.commit_step(),
+                // After a failed write, segments grow as they are written.
+                Stage::PrepareLog if self.prepare_log() => Ok(true),
+                Stage::PrepareLog => return,
             };
             if self.poison_on_err(r).is_err() {
                 return;
@@ -1310,7 +1377,31 @@ impl Inner {
                 idle && self.next_to_apply().is_some()
             }
             Stage::Commit => !self.pending.lock().is_empty(),
+            Stage::PrepareLog => self.recycler.is_empty(),
         }
+    }
+
+    /// Writes a log segment of zeros for a coming memtable to take, paced
+    /// to stay ahead of the active memtable's filling at twice its pace,
+    /// and to finish within [`PREPARE_LOG_SECS`] regardless. Returns
+    /// whether it wrote one.
+    fn prepare_log(&self) -> bool {
+        let len = self.recycler.segment_len(self.opts.log_segment_len());
+        let limit = self.opts.memtable_limit() as f64;
+        let began = std::time::Instant::now();
+        self.recycler.prepare(&*self.storage, len, |written| {
+            loop {
+                if self.shutdown.load(SeqCst) || self.poisoned.load(SeqCst) {
+                    return false;
+                }
+                let filled = self.version.load().active.bytes() as f64 / limit;
+                let share = (began.elapsed().as_secs_f64() / PREPARE_LOG_SECS).max(filled * 2.0);
+                if written as f64 <= share * len as f64 {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
     }
 
     /// The oldest frozen memtable not yet applied.
@@ -1331,7 +1422,7 @@ impl Inner {
             if !open {
                 return;
             }
-            let e = EntryRef { key, value: value.as_put().map(|v| &v[..]) };
+            let e = EntryRef { key, value };
             if !b.is_empty() && b.data_bytes() + e.size() > limit {
                 let next = self.io.builder(self.next_page_id.fetch_add(1, Relaxed), capacity);
                 let full = std::mem::replace(&mut b, next);
@@ -1348,6 +1439,7 @@ impl Inner {
         let r = if !self.pending.lock().is_empty() { self.commit_step() } else { self.apply_step() };
         let r = self.poison_on_err(r);
         self.notify();
+        self.mem_pool.trim();
         r
     }
 
@@ -1587,6 +1679,8 @@ impl Inner {
 enum Stage {
     Apply,
     Commit,
+    /// Keeps a log segment ready; see [`Options::preallocate_log`].
+    PrepareLog,
 }
 
 /// A consistent view of the store: every batch committed when it was

@@ -92,6 +92,38 @@ impl WriteOp {
     }
 }
 
+/// One mutation as the write path reads it: a key, and a value to put or
+/// `None` to delete the key. The log and the memtable each copy what they
+/// keep, so a batch can borrow its caller's bytes: [`Db::write`] takes a
+/// slice of [`WriteOp`]s, or of `(key, value)` pairs of byte slices.
+///
+/// [`Db::write`]: crate::Db::write
+pub trait Op {
+    fn key(&self) -> &[u8];
+    fn value(&self) -> Option<&[u8]>;
+}
+
+impl Op for WriteOp {
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn value(&self) -> Option<&[u8]> {
+        self.value.as_put().map(|v| &v[..])
+    }
+}
+
+/// A borrowed key and the value to put, or `None` to delete the key.
+impl Op for (&[u8], Option<&[u8]>) {
+    fn key(&self) -> &[u8] {
+        self.0
+    }
+
+    fn value(&self) -> Option<&[u8]> {
+        self.1
+    }
+}
+
 /// Largest key the store accepts. Keys are length-prefixed with a `u16`.
 pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 /// Largest value the store accepts.

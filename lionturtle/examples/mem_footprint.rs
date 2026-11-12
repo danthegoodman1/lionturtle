@@ -1,10 +1,9 @@
 //! Resident memory per memtable entry, inserted the way the write path does:
-//! the value arrives as its own `Bytes`, and the memtable keeps a clone.
-//! Usage: mem_footprint <bbtree|art|skiplist|btree>
+//! the memtable copies the key and the value.
+//! Usage: mem_footprint <bbtree|skiplist|btree>
 
-use bytes::Bytes;
+use lionturtle::arena::ChunkPool;
 use lionturtle::memtable::{MemTableKind, new_memtable};
-use lionturtle::types::Value;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -22,11 +21,10 @@ fn main() {
     {
         let kind: MemTableKind = arg.parse().unwrap();
         let before = rss();
-        let t = new_memtable(kind);
+        let t = new_memtable(kind, &ChunkPool::new(128 << 20));
         for i in 0..n {
             let k = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_be_bytes();
-            let v = Value::Put(Bytes::copy_from_slice(&value));
-            if std::env::var_os("NO_CLONE").is_some() { t.insert(&k, v, i + 1, 0) } else { t.insert(&k, v.clone(), i + 1, 0) }
+            t.insert(&k, Some(&value), i + 1, 0);
         }
         let used = rss() - before;
         println!("{kind:?}: {:.0} bytes per entry for 128 logical bytes", used as f64 / n as f64);

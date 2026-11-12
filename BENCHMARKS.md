@@ -271,7 +271,7 @@ bench/steady-writes.sh /mnt/slow/data
 
 ## Synchronous writes
 
-`write(.., true)` returns once its batch is durable. Synchronous writers share syncs: one writer at a time writes every buffered record in one direct write and makes it durable, and the others return when a sync covers them. When every earlier log write is already durable, that write is one `pwritev2` with `RWF_DSYNC`; otherwise it is a write and an fsync. The log bypasses the page cache and writes over retired segments, so a sync has no dirty pages to write back and no file size to journal. A new store has no retired segment until its first checkpoint, so its first segments append, unless `preallocate_log` zero-fills them ahead of their writes.
+`write(.., true)` returns once its batch is durable. Synchronous writers share syncs: one writer at a time writes every buffered record in one direct write and makes it durable, and the others return when a sync covers them. When every earlier log write is already durable, that write is one `pwritev2` with `RWF_DSYNC`; otherwise it is a write and an fsync. The log bypasses the page cache and writes over retired segments, so a sync has no dirty pages to write back and no file size to journal. A new store has no retired segment until its first checkpoint, so its first segments append, unless `preallocate_log` writes them ahead as zeros.
 
 Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB memtables, background work finished first), median of three runs:
 
@@ -283,6 +283,8 @@ Thousand durable updates per second, from `bench/sync.sh` (3M records, 128 MiB m
 | EC2 i7ie.6xlarge, 1 | 37.2 | 7.9 | 35.2 | 32.4 |
 | EC2 i7ie.6xlarge, 16 | 191.1 | 63.1 | 179.7 | 30.4 |
 | EC2 i7ie.6xlarge, 64 | 383.7 | 141.8 | 251.8 | 16.2 |
+
+A metadata store commits from one thread: a durable batch of a few hundred small ops at a time. `cargo run --release --example lone_writer` runs that workload, a get and then one synchronous write of 257 ops and 13 KB, and times each commit. On a Latitude f4.metal.medium (16-core EPYC 4564P, Linux 6.8, XFS on a Micron 7450, which reports a write-through cache), with `preallocate_log` on and mimalloc set to keep freed memory (`MIMALLOC_PURGE_DELAY=-1`), lionturtle commits 7,470 batches a second flat out, 1.92 million ops. Paced at 2,500 batches a second, a commit takes 121 µs at the median, 207 µs at p99, 365 µs at p99.9, and 2.2 ms at worst over a minute. A new store's first eight seconds, which span its first two memtable rotations, stay within 1.1 ms. The README's [configuration notes](README.md#configuration) cover what mimalloc's defaults add to the worst case.
 
 The workstation drive (ext4) has a volatile write cache, so every sync waits about 2 ms for a cache flush. The i7ie's instance-store drive (ext4) reports a write-through cache, as drives with power-loss protection do, so Linux sends no flush: a sync write costs one 4 KiB write, 27 µs on average for lionturtle on one thread.
 

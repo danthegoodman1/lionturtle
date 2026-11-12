@@ -1,6 +1,8 @@
 //! Split-block Bloom filter: each key sets one bit in each of the eight 32-bit
 //! words of a single 256-bit block, so a probe touches one cache line.
 
+use crate::arena::{ChunkPool, Zeroed};
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -60,23 +62,62 @@ pub fn may_contain(filter: &[u8], hash: u64) -> bool {
 
 /// A filter of the same layout that writers add to while readers probe it.
 pub struct SharedFilter {
-    words: Box<[AtomicU32]>,
+    words: Words,
 }
+
+/// Where a filter's words live.
+enum Words {
+    Heap(Box<[AtomicU32]>),
+    /// This many words at the start of a block of a memtable pool's memory.
+    Pool(Zeroed, usize),
+}
+
+// SAFETY: a pool's block is plain memory this filter alone uses, as words
+// that threads share like the boxed ones.
+unsafe impl Send for Words {}
+unsafe impl Sync for Words {}
 
 impl SharedFilter {
     /// A filter of at least `bytes` bytes, in whole blocks.
     pub fn new(bytes: usize) -> Self {
-        let n = bytes.div_ceil(BLOCK_BYTES).max(1) * (BLOCK_BYTES / 4);
         // Zeroed memory fresh from the OS stays untouched until a key lands
-        // in it, so a new memtable's filter costs no time to clear.
-        let words = Box::into_raw(vec![0u32; n].into_boxed_slice()) as *mut [AtomicU32];
+        // in it, so this filter costs no time to clear.
+        let words = Box::into_raw(vec![0u32; Self::words_in(bytes)].into_boxed_slice()) as *mut [AtomicU32];
         // SAFETY: `AtomicU32` has the size, alignment and bit validity of `u32`.
-        Self { words: unsafe { Box::from_raw(words) } }
+        Self { words: Words::Heap(unsafe { Box::from_raw(words) }) }
+    }
+
+    /// A filter of at least `bytes` bytes whose memory comes from `pool`
+    /// and returns to it, if a block of the pool's holds that many. Each
+    /// memtable has a filter, and the pool hands the next memtable's the
+    /// memory of the last one's, still resident. From the allocator, every
+    /// rotation took a new block of 2 MiB under the writer lock, which with
+    /// mimalloc cost 0.7 to 1.7 ms to zero and fault in.
+    pub fn new_in(pool: &Arc<ChunkPool>, bytes: usize) -> Self {
+        let n = Self::words_in(bytes);
+        match pool.zeroed(n * 4) {
+            Some(block) => Self { words: Words::Pool(block, n) },
+            None => Self::new(bytes),
+        }
+    }
+
+    fn words_in(bytes: usize) -> usize {
+        bytes.div_ceil(BLOCK_BYTES).max(1) * (BLOCK_BYTES / 4)
+    }
+
+    fn words(&self) -> &[AtomicU32] {
+        match &self.words {
+            Words::Heap(words) => words,
+            // SAFETY: the block holds `n` words' bytes, zeroed and then
+            // written only as `AtomicU32`s, at a page-aligned address.
+            Words::Pool(block, n) => unsafe { std::slice::from_raw_parts(block.as_ptr().cast::<AtomicU32>(), *n) },
+        }
     }
 
     fn block(&self, hash: u64) -> &[AtomicU32] {
-        let base = block_index(hash, self.words.len() / 8) * 8;
-        &self.words[base..base + 8]
+        let words = self.words();
+        let base = block_index(hash, words.len() / 8) * 8;
+        &words[base..base + 8]
     }
 
     pub fn insert(&self, hash: u64) {
@@ -117,15 +158,22 @@ mod tests {
     #[test]
     fn shared_filter_matches_layout() {
         let n = 10_000;
-        let shared = SharedFilter::new(filter_len(n, 12));
-        let mut plain = vec![0u8; filter_len(n, 12)];
-        for i in 0..n as u64 {
-            shared.insert(hash_key(&i.to_be_bytes()));
-            insert(&mut plain, hash_key(&i.to_be_bytes()));
+        let pool = ChunkPool::new(1 << 20);
+        // A second filter from the pool takes the memory of the first.
+        for round in 0..2u64 {
+            let filters = [SharedFilter::new(filter_len(n, 12)), SharedFilter::new_in(&pool, filter_len(n, 12))];
+            assert!(matches!(filters[1].words, Words::Pool(..)));
+            let mut plain = vec![0u8; filter_len(n, 12)];
+            for i in (0..n as u64).map(|i| i + round * 1_000_000) {
+                filters.iter().for_each(|f| f.insert(hash_key(&i.to_be_bytes())));
+                insert(&mut plain, hash_key(&i.to_be_bytes()));
+            }
+            for i in 0..n as u64 * 11 {
+                let h = hash_key(&(i + round * 1_000_000).to_be_bytes());
+                assert_eq!([filters[0].may_contain(h), filters[1].may_contain(h)], [may_contain(&plain, h); 2]);
+            }
         }
-        for i in 0..n as u64 * 11 {
-            let h = hash_key(&i.to_be_bytes());
-            assert_eq!(shared.may_contain(h), may_contain(&plain, h));
-        }
+        // A filter longer than the pool's blocks comes from the allocator.
+        assert!(matches!(SharedFilter::new_in(&pool, 1 << 20).words, Words::Heap(_)));
     }
 }

@@ -6,8 +6,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use bytes::Bytes;
-use lionturtle::Value;
 use lionturtle::memtable::{MemTableKind, new_memtable};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -116,11 +114,12 @@ fn main() {
     }
     println!("\n# lionturtle memtables: 8-byte keys, 120-byte values; Mops/s");
     println!("memtable,threads,insert,get,scan100");
-    let value = Bytes::from(vec![7u8; 120]);
+    let value = [7u8; 120];
+    let pool = lionturtle::arena::ChunkPool::new(128 << 20);
     for &t in &threads {
         for (name, kind) in [("bbtree", MemTableKind::BBTree), ("skiplist", MemTableKind::SkipList), ("btree", MemTableKind::BTree)] {
-            let table = new_memtable(kind);
-            let ins = run(t, n, |i| table.insert(&mix(i).to_be_bytes(), Value::Put(value.clone()), i, 0));
+            let table = new_memtable(kind, &pool);
+            let ins = run(t, n, |i| table.insert(&mix(i).to_be_bytes(), Some(&value), i, 0));
             let get = run(t, n, |i| {
                 std::hint::black_box(table.get(&mix(mix(i) % n).to_be_bytes(), &|_, _| true));
             });

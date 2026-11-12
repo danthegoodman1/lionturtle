@@ -5,7 +5,8 @@ pub mod types;
 pub mod wal;
 
 pub use error::{Error, Result};
-pub use types::{Value, WriteOp};
+pub use types::{Op, Value, WriteOp};
+pub mod arena;
 pub mod bloom;
 pub mod db;
 pub mod memtable;

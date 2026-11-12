@@ -78,8 +78,9 @@ pub struct lt_options {
     /// Spread each background checkpoint's I/O over most of the time its
     /// memtable took to fill.
     pub pace_checkpoints: bool,
-    /// Zero-fill each log segment ahead of its writes, so that durable
-    /// writes on a new store overwrite allocated space.
+    /// Write whole log segments of zeros ahead of the memtables that use
+    /// them, so that durable writes on a new store overwrite allocated space.
+    /// Opening a new store writes the first segment before it returns.
     pub preallocate_log: bool,
     /// Leaf and flush batch size in bytes.
     pub leaf_size: u64,
