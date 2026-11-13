@@ -113,7 +113,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="ycsb">
     <div class="hero-head">
-      <h1>lionturtle loads <em>1.7×</em> as fast as RocksDB and leads every YCSB workload</h1>
+      <h1>lionturtle loads <em>1.6×</em> as fast as RocksDB and leads every workload but scans</h1>
       <div class="hero-meta">
         <span><b>YCSB</b> · 50M records of 128 bytes · LZ4 on every engine</span>
         <span>16 client threads · 4 GB memory cap · 1 GB block cache</span>
@@ -127,7 +127,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--rocks)"></i>RocksDB</span>
         <span><i class="sw" style="background:var(--third)"></i>fjall</span>
       </div>
-      <span>Values compress to half their size. Bytes written per user byte during load: lionturtle 4.0, RocksDB 4.3, fjall 5.1.</span>
+      <span>Values compress to half their size. Bytes written per user byte during load: lionturtle 4.0, RocksDB 4.4, fjall 5.1.</span>
     </div>
   </div>
 
@@ -170,39 +170,39 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 const D = {
   // BENCHMARKS.md, YCSB at 50M records with LZ4: thousand ops/s for lionturtle, RocksDB, fjall
   ycsb: [
-    ["Load", "inserts", 1710, 1008, 394],
-    ["Workload A", "50% read, 50% update", 1473, 1180, 562],
-    ["Workload B", "95% read, 5% update", 1496, 1248, 1066],
-    ["Workload C", "100% read", 1617, 1209, 1130],
-    ["Workload E", "95% scan, 5% insert", 224, 214, 50],
-    ["Workload F", "50% read, 50% read-modify-write", 917, 841, 578],
+    ["Load", "inserts", 1680, 1053, 416],
+    ["Workload A", "50% read, 50% update", 1538, 1259, 557],
+    ["Workload B", "95% read, 5% update", 1558, 1419, 1130],
+    ["Workload C", "100% read", 1642, 1364, 1136],
+    ["Workload E", "95% scan, 5% insert", 228, 247, 49],
+    ["Workload F", "50% read, 50% read-modify-write", 988, 889, 588],
   ],
   // BENCHMARKS.md, YCSB at 50M records with LZ4: [p99, p99.9] in µs for lionturtle, RocksDB, fjall
   latency: {
-    title: "Update and insert p99.9 stays within <em>60 µs</em>, <span class=\"nw\">5–15×</span> below RocksDB's",
+    title: "Update and insert p99.9 stays within <em>58 µs</em>, <span class=\"nw\">5–33×</span> below RocksDB's",
     reads: [
-      ["A", "reads", [129, 248], [120, 291], [130, 246]],
-      ["B", "reads", [107, 155], [118, 170], [136, 229]],
-      ["C", "reads", [106, 138], [118, 166], [134, 225]],
-      ["E", "scans", [310, 457], [365, 472], [6435, 7397]],
-      ["F", "reads", [116, 218], [120, 224], [140, 251]],
+      ["A", "reads", [120, 232], [111, 276], [120, 229]],
+      ["B", "reads", [102, 151], [109, 142], [126, 217]],
+      ["C", "reads", [101, 127], [109, 140], [125, 213]],
+      ["E", "scans", [290, 405], [320, 395], [6771, 7748]],
+      ["F", "reads", [110, 209], [112, 209], [129, 239]],
     ],
     writes: [
-      ["Load", "inserts", [22, 60], [28, 332], [299, 492]],
-      ["A", "updates", [8, 30], [21, 456], [223, 347]],
-      ["B", "updates", [7, 32], [13, 453], [21, 101]],
-      ["E", "inserts", [6, 15], [18, 125], [18, 28]],
-      ["F", "read-modify-writes", [120, 248], [130, 542], [177, 288]],
+      ["Load", "inserts", [24, 58], [26, 323], [296, 483]],
+      ["A", "updates", [6, 17], [21, 431], [230, 359]],
+      ["B", "updates", [4, 13], [13, 427], [22, 112]],
+      ["E", "inserts", [5, 15], [17, 134], [20, 32]],
+      ["F", "read-modify-writes", [112, 226], [121, 521], [170, 280]],
     ],
   },
   // BENCHMARKS.md, durable writes under load: latency in ms at each offered rate
   durable: {
     rates: [11000, 70000, 118000, 150000],
     panels: [
-      ["Read p99", { lt: [0.19, 0.24, 0.31, 0.37], rocks: [0.20, 3.2, 12, 860], third: [1.4, 9.3] }],
-      ["Read p99.9", { lt: [0.28, 0.88, 3.5, 6.7], rocks: [0.47, 14, 26, 1500], third: [2.8, 31] }],
-      ["Update p99", { lt: [0.12, 0.26, 0.39, 0.47], rocks: [0.42, 5.4, 14, 863], third: [1.3, 9.3] }],
-      ["Update p99.9", { lt: [0.16, 1.1, 3.8, 7.8], rocks: [3.4, 17, 27, 1500], third: [2.3, 30] }],
+      ["Read p99", { lt: [0.18, 0.22, 0.28, 0.32], rocks: [0.20, 2.8, 12, 22], third: [1.4, 9.3] }],
+      ["Read p99.9", { lt: [0.27, 0.73, 2.5, 3.3], rocks: [0.43, 12, 24, 46], third: [2.8, 31] }],
+      ["Update p99", { lt: [0.12, 0.23, 0.34, 0.38], rocks: [0.41, 5.1, 13, 23], third: [1.3, 9.3] }],
+      ["Update p99.9", { lt: [0.15, 0.68, 2.5, 3.4], rocks: [3.4, 14, 26, 47], third: [2.3, 30] }],
     ],
   },
 };
@@ -285,7 +285,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 (function durable() {
   const host = document.getElementById("multiples");
   const S = D.durable, W = 480, H = 300, L = 58, R = 92, T = 14, B = 46;
-  const LO = Math.log10(0.1), HI = Math.log10(2000);
+  const LO = Math.log10(0.1), HI = Math.log10(100);
   const x = v => L + (v / 150000) * (W - L - R);
   const y = v => T + (1 - (Math.log10(v) - LO) / (HI - LO)) * (H - T - B);
   const NS = "http://www.w3.org/2000/svg";
@@ -296,7 +296,7 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
     const p = el("div", "card panel"); p.append(el("h3", null, title));
     const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${title} at ${S.rates.map(fmt).join(", ")} durable ops/s, log scale. ` +
       series.map(([k, n]) => `${n}: ${data[k].map(ms).join(", ")}`).join("; ") + "." });
-    for (const t of [0.1, 1, 10, 100, 1000]) {
+    for (const t of [0.1, 1, 10, 100]) {
       svg.append(sv("line", { x1: L, x2: W - R + 6, y1: y(t), y2: y(t), stroke: t === 0.1 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
       svg.append(sv("text", { x: L - 8, y: y(t) + 4, "text-anchor": "end" }, ms(t)));
     }
