@@ -24,10 +24,14 @@ name: Auto Release
 #   "[skip release]"     skip releasing this push
 # Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
 #
-# The chore(release) commit and tag are pushed with GITHUB_TOKEN, which never
-# triggers workflows, so this can't loop. Publishing happens in the called
-# release.yml, but the OIDC claim names the top-level workflow — crates.io
-# Trusted Publishing must list this file (bump.yml) as a workflow.
+# The chore(release) commit goes to main over the RELEASE_DEPLOY_KEY deploy
+# key, because main's ruleset requires a pull request and CI and exempts only
+# deploy keys (GITHUB_TOKEN can't be exempted on a personal repository). The
+# commit carries [skip ci], so its push starts no workflows. The tag and GitHub
+# release come from GITHUB_TOKEN through the API, which starts none either, so
+# release.yml runs once, as the called workflow below. The OIDC claim names the
+# top-level workflow — crates.io Trusted Publishing must list this file
+# (bump.yml) as a workflow.
 
 on:
   push:
@@ -65,6 +69,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - name: Decide bump level
         id: decide
         env:
@@ -174,12 +179,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if [ "${{ steps.version.outputs.commit }}" = "true" ]; then
-            git commit -am "chore(release): ${{ steps.version.outputs.tag }}"
+            git commit -am "chore(release): ${{ steps.version.outputs.tag }}" -m "[skip ci]"
             git push origin main
           fi
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "refs/tags/${{ steps.version.outputs.tag }}"
           gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$(git rev-parse HEAD)" \
             --title "${{ steps.version.outputs.tag }}" \
             --generate-notes
 

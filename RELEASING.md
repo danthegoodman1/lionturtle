@@ -59,18 +59,31 @@ Then, on crates.io:
    workflow that started the run, and the auto-release path starts in
    `bump.yml` (which then calls `release.yml` as a reusable workflow).
 
-No repository secrets are needed. Do **not** add a `CARGO_REGISTRY_TOKEN`
+Publishing needs no secret. Do **not** add a `CARGO_REGISTRY_TOKEN`
 secret — the workflow mints a token per run via
 `rust-lang/crates-io-auth-action`.
 
 ### 2. Repository settings
 
-- **Settings → Actions → General → Workflow permissions:** allow workflows to
-  **read and write** (the bump job pushes the release commit, tag, and GitHub
-  release using the built-in `GITHUB_TOKEN`).
-- If `main` is protected, allow `github-actions[bot]` to push the
-  `chore(release): vX.Y.Z` commit and the tag (or the auto-release will fail at
-  the push step).
+- **`main` ruleset:** merges need a pull request and the 11 CI checks
+  (`fmt`, `clippy`, `test`, `c-api`, `c-header`, `vopr`, one per platform);
+  force pushes and deletion are blocked. Deploy keys are exempt. Renaming a CI
+  job means updating the ruleset's required checks, or merges wait on a check
+  that never reports.
+- **Deploy key:** the bump job pushes the `chore(release): vX.Y.Z` commit to
+  `main` over a deploy key with write access, stored as the Actions secret
+  `RELEASE_DEPLOY_KEY`. To replace it:
+
+  ```sh
+  k=$(mktemp -d) && ssh-keygen -q -t ed25519 -N "" -f "$k/key" &&
+    gh repo deploy-key add "$k/key.pub" --allow-write --title "Auto Release (bump.yml)" &&
+    gh secret set RELEASE_DEPLOY_KEY < "$k/key"; rm -rf "$k"
+  ```
+
+- **Workflow permissions:** each job requests what it needs, so the default
+  `GITHUB_TOKEN` stays read-only.
+- **Fork pull requests:** CI waits for approval on pull requests from anyone
+  without write access.
 
 ## What runs where
 
@@ -96,5 +109,5 @@ needs `#minor`.
 - [ ] Crate name reserved on crates.io (manual first `cargo publish`, or via the
       first-publish path).
 - [ ] Both Trusted Publishers added (`release.yml` **and** `bump.yml`).
-- [ ] Workflow permissions set to read/write.
+- [ ] Deploy key added and stored as `RELEASE_DEPLOY_KEY`.
 - [ ] Push to `main` (or run **Auto Release**) and watch the run.
