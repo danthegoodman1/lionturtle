@@ -176,6 +176,17 @@ struct MemCounts {
     last_seq: AtomicU64,
 }
 
+/// A value on a cache line of its own, for one that many threads write.
+#[repr(align(128))]
+struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 const INFLIGHT_SHARDS: usize = 16;
 
 #[derive(Default)]
@@ -220,6 +231,10 @@ impl Inflight {
 /// writer waits for another's inserts. `visible` trails behind as the prefix
 /// of committed batches: every version at or below it is committed, and an
 /// iterator reads that prefix as its snapshot.
+///
+/// Every commit writes `folded` and takes `fold_lock`, so they keep to
+/// their own cache line, away from the writer lock.
+#[repr(align(128))]
 struct Commits {
     /// Every batch ending at or below this sequence number has committed.
     visible: AtomicU64,
@@ -633,9 +648,13 @@ struct Inner {
     live_versions: Arc<AtomicUsize>,
     /// Serializes version replacements.
     version_lock: Mutex<()>,
-    writer: Mutex<Writer>,
-    /// Requests waiting for the writer lock, newest first.
-    queue: AtomicPtr<Request>,
+    /// The writer lock and the queue of requests waiting for it, newest
+    /// first, which every writer updates. Each keeps to a cache line of its
+    /// own, as [`Commits`] does: Rust orders these fields as it likes, and
+    /// when the writer lock came to share a line with the commit counters, a
+    /// load of 10M inserts by 16 writers lost 9% of its throughput.
+    writer: CachePadded<Mutex<Writer>>,
+    queue: CachePadded<AtomicPtr<Request>>,
     /// Paired with `signal`: wakes the checkpointer when a memtable freezes
     /// and blocked writers when a checkpoint commits.
     signal_lock: Mutex<()>,
@@ -774,7 +793,7 @@ impl Db {
             version: ArcSwap::from_pointee(version),
             live_versions,
             version_lock: Mutex::new(()),
-            writer: Mutex::new(Writer {
+            writer: CachePadded(Mutex::new(Writer {
                 wal,
                 flush_claimed: 0,
                 carried: VecDeque::new(),
@@ -783,8 +802,8 @@ impl Db {
                 active,
                 user_bytes: 0,
                 wal_bytes: 0,
-            }),
-            queue: AtomicPtr::new(std::ptr::null_mut()),
+            })),
+            queue: CachePadded(AtomicPtr::new(std::ptr::null_mut())),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             durable: Mutex::new(Durable { sb, live, epoch }),
