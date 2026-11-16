@@ -79,6 +79,21 @@ int main(int argc, char **argv) {
     Db db(argv[1]);
     CHECK(db.get("b")->str() == "2");
     CHECK(db.get("t7-199"));
+
+    // Range deletes, alone and in a batch whose writes apply in order.
+    db.erase_range("t0-", "t2-");
+    db.erase_prefix("t7", true);
+    int left = 0;
+    for (auto it = db.prefix("t"); it.next();) left++;
+    CHECK(left == 5 * 200);
+    CHECK(!db.get("t1-5") && !db.get("t7-199") && db.get("t2-0"));
+    lionturtle::Batch batch;
+    batch.put("u-gone", "x").erase_prefix("u-").put("u-kept", "y").erase_range("t", "u");
+    db.write(batch, true);
+    CHECK(!db.get("u-gone") && db.get("u-kept")->str() == "y");
+    CHECK(!db.prefix("t").next());
+    db.checkpoint();
+    CHECK(!db.get("t3-3") && db.get("u-kept"));
   }
   std::puts("cpp_api: ok");
   return 0;

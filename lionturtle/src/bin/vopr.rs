@@ -29,6 +29,7 @@ fn main() {
                 total.steps += r.steps;
                 total.crashes += r.crashes;
                 total.writes += r.writes;
+                total.range_deletes += r.range_deletes;
                 total.reads += r.reads;
                 total.scans += r.scans;
                 total.snapshots += r.snapshots;
@@ -44,10 +45,11 @@ fn main() {
         }
     }
     println!(
-        "{count} seeds ok in {:.1}s: {} steps, {} writes, {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}",
+        "{count} seeds ok in {:.1}s: {} steps, {} writes ({} range deletes), {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}",
         started.elapsed().as_secs_f64(),
         total.steps,
         total.writes,
+        total.range_deletes,
         total.reads,
         total.scans,
         total.snapshots,

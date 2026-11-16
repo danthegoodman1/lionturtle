@@ -8,7 +8,12 @@
 //! ```text
 //! crc32c: u32 | len: u32 | count: u32 | op* | first_seq: u64
 //! op = kind: u8 | key_len: u32 | key | (value_len: u32 | value)?   (value only for puts)
+//!    | kind: u8 | start_len: u32 | start | has_end: u8 | (end_len: u32 | end)?   (range deletes)
 //! ```
+//!
+//! lionturtle 0.6 and earlier read a range delete as a torn record, so a
+//! store marks its superblock before it logs one; see
+//! [`crate::pagestore::Superblock::range_deletes`].
 //!
 //! The checksum covers everything after itself. The sequence number comes
 //! last so that writers can encode and checksum the rest of a record before
@@ -24,7 +29,7 @@
 
 use crate::error::Result;
 use crate::storage::{DIRECT_ALIGN, File, Storage};
-use crate::types::{Op, Value, WriteOp};
+use crate::types::{Op, OpRef, WriteOp};
 use bytes::Bytes;
 use parking_lot::{Mutex, lock_api::ArcMutexGuard};
 use std::sync::Arc;
@@ -33,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const HEADER_LEN: usize = 8;
 const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
+const KIND_DELETE_RANGE: u8 = 2;
 
 pub fn segment_name(id: u64) -> String {
     format!("wal-{id:016x}.log")
@@ -230,7 +236,12 @@ pub fn list_segments(storage: &dyn Storage) -> Result<Vec<u64>> {
 
 /// Bytes a batch occupies in the log.
 pub fn encoded_len(ops: &[WriteOp]) -> usize {
-    HEADER_LEN + 12 + ops.iter().map(|op| 1 + 4 + op.key.len() + op.value.as_put().map_or(0, |v| 4 + v.len())).sum::<usize>()
+    let op_len = |op: &WriteOp| match op.op() {
+        OpRef::Put(key, value) => 1 + 4 + key.len() + 4 + value.len(),
+        OpRef::Delete(key) => 1 + 4 + key.len(),
+        OpRef::DeleteRange(start, end) => 1 + 4 + start.len() + 1 + end.map_or(0, |e| 4 + e.len()),
+    };
+    HEADER_LEN + 12 + ops.iter().map(op_len).sum::<usize>()
 }
 
 /// A record without its sequence number: the bytes between the header and
@@ -275,20 +286,31 @@ pub fn encode(buf: &mut Vec<u8>, first_seq: u64, ops: &[WriteOp]) {
 }
 
 fn encode_ops<O: Op>(buf: &mut Vec<u8>, ops: &[O]) {
+    let put_bytes = |buf: &mut Vec<u8>, b: &[u8]| {
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+    };
     for op in ops {
-        let key = op.key();
-        match op.value() {
-            Some(v) => {
+        match op.op() {
+            OpRef::Put(key, value) => {
                 buf.push(KIND_PUT);
-                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(key);
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                buf.extend_from_slice(v);
+                put_bytes(buf, key);
+                put_bytes(buf, value);
             }
-            None => {
+            OpRef::Delete(key) => {
                 buf.push(KIND_DELETE);
-                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(key);
+                put_bytes(buf, key);
+            }
+            OpRef::DeleteRange(start, end) => {
+                buf.push(KIND_DELETE_RANGE);
+                put_bytes(buf, start);
+                match end {
+                    Some(end) => {
+                        buf.push(1);
+                        put_bytes(buf, end);
+                    }
+                    None => buf.push(0),
+                }
             }
         }
     }
@@ -724,15 +746,25 @@ fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)>
         let kind = take(&mut p, 1)?[0];
         let klen = take_u32(&mut p)?;
         let key = take(&mut p, klen)?;
-        let value = match kind {
+        ops.push(match kind {
             KIND_PUT => {
                 let vlen = take_u32(&mut p)?;
-                Value::Put(take(&mut p, vlen)?)
+                WriteOp::Put { key, value: take(&mut p, vlen)? }
             }
-            KIND_DELETE => Value::Delete,
+            KIND_DELETE => WriteOp::Delete { key },
+            KIND_DELETE_RANGE => {
+                let end = match take(&mut p, 1)?[0] {
+                    0 => None,
+                    1 => {
+                        let len = take_u32(&mut p)?;
+                        Some(take(&mut p, len)?)
+                    }
+                    _ => return None,
+                };
+                WriteOp::DeleteRange { start: key, end }
+            }
             _ => return None,
-        };
-        ops.push(WriteOp { key, value });
+        });
     }
     if p != end || first_seq == 0 {
         return None;
@@ -804,6 +836,27 @@ mod tests {
         w.sync().unwrap();
         let r = replay(&disk, 2, 5, |_, _| {}).unwrap();
         assert_eq!((r.last_seq, r.end), (5, End::Gap));
+    }
+
+    #[test]
+    fn range_deletes_roundtrip() {
+        let disk = SimStorage::new(7, FaultConfig::default());
+        let mut w = WalWriter::create(&disk, 1, None, Buffers::default()).unwrap();
+        let ops = [
+            WriteOp::put("a", "1"),
+            WriteOp::delete_range("b", "d"),
+            WriteOp::delete_from("x"),
+            WriteOp::delete_prefix(&b"\xff\xff"[..]),
+            WriteOp::delete_range("", ""),
+            WriteOp::delete("c"),
+        ];
+        w.append(1, &ops);
+        assert_eq!(w.len() as usize, encoded_len(&ops));
+        w.sync().unwrap();
+        let mut seen = Vec::new();
+        let r = replay(&disk, 1, 0, |seq, op| seen.push((seq, op))).unwrap();
+        assert_eq!(r.last_seq, 6);
+        assert_eq!(seen.into_iter().map(|(_, op)| op).collect::<Vec<_>>(), ops);
     }
 
     #[test]

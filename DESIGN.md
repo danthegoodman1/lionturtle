@@ -54,12 +54,23 @@ With `Options::compression` at `Lz4`, its default, a page goes to disk with each
 
 Each batch takes a ticket under the writer lock and registers it. Its versions carry the ticket. Once every op is in the memtable, the writer marks the ticket committed and returns. A get takes the newest version whose batch has committed. Committed tickets fold into a visible prefix of sequence numbers. A snapshot waits until the batches registered before it commit, then reads that prefix. It also holds the version it started from: the memtables and tree root of that moment. A synchronous batch commits after its fsync, so a snapshot taken meanwhile waits for that fsync; a get does not.
 
+### Range deletes
+
+A range delete is an op like a put: it takes a sequence number and becomes visible with its batch, and a batch's ops apply in order. A memtable keeps its range deletes beside its point versions, in immutable sorted runs that merge like a binary counter, after Bentley and Saxe. Each run cuts its key space into fragments that one set of deletes covers, and records the newest delete of each, so a read finds the newest delete covering a key with one binary search per run, and a memtable with `n` deletes holds at most one run per bit of `n`.
+
+- **Get:** looks up the key's newest version, then the newest range delete covering it, and if there is one, a version newer than the delete. A batch's range deletes are in their memtable before it commits, so a get that found a version from a committed batch finds that batch's range deletes too. A get that finds a newer version reads the deletes again, since its batch may have committed meanwhile. Either way, no get sees half of a batch that both writes and range-deletes a key.
+- **Scan:** walks the key space in spans over which the newest delete the snapshot sees stays the same. Under a delete, the tree and every memtable older than the delete skip to the span's end, and newer memtables show only versions newer than it. A reverse scan starts its tree window below the keys a delete covers.
+- **Checkpoint:** applies the memtable's range deletes to the tree before its entries, since everything in the tree is older. It drops each subtree that lies inside a range without reading it, handing the subtree's key range to a neighbour, and marks the range dead in each buffered segment it reaches, as a flush marks the keys it moves to a child. A leaf a range cuts keeps its keys in the range: at most two leaves per range. The checkpoint finds those keys and writes a tombstone for each into its batches, which leave out the memtable entries a newer range delete covers. A segment left holding more dead ranges than its page has blocks is rewritten, so many small range deletes cannot grow node pages without bound.
+
+The tree never holds a range delete. Once its checkpoint commits, reads pay nothing for it, and the pages of the subtrees it dropped return to the allocator when the readers of older versions finish.
+
 ## Guarantees
 
 - **Durability.** A write without `sync` sits in a 1 MiB log buffer until the buffer fills, `Db::sync` runs, or the memtable rotates. Each flush returns its buffer for the next, so appends land in resident memory. `write(.., true)` returns once its batch is durable, and the batch becomes visible then. Synchronous writers share fsyncs, and retired log segments are reused. With `preallocate_log`, a segment with none to reuse is written ahead as zeros, in a file of its own, before a memtable takes it: the first when the store opens, and later ones on a background thread paced to the active memtable's filling; see [Synchronous writes](BENCHMARKS.md#synchronous-writes). RocksDB groups synchronous writers too, and reuses logs only with `recycle_log_file_num`.
 - **Visibility.** A get returns the newest version whose batch has committed. Concurrent writers to one key resolve in log order.
 - **Snapshots hold resources.** A held snapshot or iterator keeps its memtables in memory and its tree's pages allocated until dropped. Drop them before reopening the store.
 - **Recovery** replays the log segments that follow the last committed checkpoint and keeps a prefix of history containing every synced write.
+- **Range deletes and older versions.** lionturtle 0.6 and earlier would read a range delete in the log as a torn record and drop it and every write after it. So before a store logs its first range delete, it writes both superblock slots with a magic number those versions reject, and they refuse to open it. A store that never takes a range delete keeps the superblock they read.
 
 ## Differences from the C++ TurtleKV
 
@@ -82,9 +93,9 @@ The paper reports larger leads over RocksDB: about 5× on loads, over 4× on mix
 
 `cargo test --release` runs the unit, model and threaded tests, and `cargo run --release --bin vopr -- --seeds 1000` runs 1,000 simulation seeds; `--seed <n> --verbose` replays one.
 
-VOPR drives the store on one thread so seeds replay exactly. Each seed draws a store configuration, a key set with shared prefixes, values that are random or repeat a short pattern so their blocks compress, and a fault profile: lost unsynced sectors at power loss, failed reads, flipped bits, and failed writes and fsyncs. The oracle checks that every read matches the model, that recovery yields a prefix of history containing every synced write, that a clean reopen loses nothing, that every read through a held snapshot matches the model as it stood when the snapshot was taken, that each iterator, forward or reverse, over a range or a prefix, returns exactly its snapshot, and that no page slot leaks.
+VOPR drives the store on one thread so seeds replay exactly. Each seed draws a store configuration, a key set with shared prefixes, values that are random or repeat a short pattern so their blocks compress, writes that include range deletes, alone and inside batches with the keys they cover, and a fault profile: lost unsynced sectors at power loss, failed reads, flipped bits, and failed writes and fsyncs. The oracle checks that every read matches the model, that recovery yields a prefix of history containing every synced write, that a clean reopen loses nothing, that every read through a held snapshot matches the model as it stood when the snapshot was taken, that each iterator, forward or reverse, over a range or a prefix, returns exactly its snapshot, and that no page slot leaks.
 
-Threaded tests cover what one thread cannot: concurrent writers, readers and scanners against background checkpoints, and batches that must stay whole to every reader on every memtable, including gets, scans and iterators of all kinds sharing one snapshot.
+Threaded tests cover what one thread cannot: concurrent writers, readers and scanners against background checkpoints, and batches that must stay whole to every reader on every memtable, including gets, scans and iterators of all kinds sharing one snapshot, and batches that write keys and range-delete them.
 
 VOPR seeds and the threaded tests use small stores so that a short history reaches many checkpoints, which leaves out whatever grows only over a long history. A memtable keeps every version of a key, so a key written in every batch, as a commit timestamp is, collects millions of versions in one default-size memtable. The soak test runs the threaded workload at the default options with such a key, for 15 minutes nightly on x86_64 and arm64 Linux and on macOS: `LIONTURTLE_SOAK_SECS=900 cargo test --release --test concurrency -- --ignored soak_default_options`.
 
@@ -92,9 +103,9 @@ VOPR seeds and the threaded tests use small stores so that a short history reach
 
 - `lionturtle/`: the store.
   - `db.rs`: write path, commit tickets, memtable rotation, the checkpoint pipeline, recovery, page reclamation.
-  - `tree/`: the TurtleTree, its cursors and scans, the page cache and prefetch.
+  - `tree/`: the TurtleTree, its cursors and scans, range deletes applied at checkpoints, the page cache and prefetch.
   - `page.rs`, `bloom.rs`, `pagestore.rs`: pages, filters, arenas and the superblock.
-  - `memtable.rs`, `arena.rs`, `wal.rs`, `storage.rs`: memtables and their memory, the log, and the storage traits.
+  - `memtable.rs`, `arena.rs`, `rangedel.rs`, `wal.rs`, `storage.rs`: memtables, their memory and their range deletes, the log, and the storage traits.
   - `sim/`: the simulated disk, the VOPR driver, and a deterministic write-amplification simulator.
 - `kvbench/`: the YCSB driver for lionturtle, RocksDB, fjall and ScyllaDB, and an in-memory index benchmark.
 - `bench/aws/`: EC2 benchmark scripts.

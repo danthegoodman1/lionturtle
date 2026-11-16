@@ -463,6 +463,8 @@ impl PageStore {
 const SUPERBLOCK: &str = "superblock";
 const SUPER_SLOT: u64 = 4096;
 const SUPER_MAGIC: u64 = 0x544b_565f_5355_5052;
+/// The magic of a store that may have range deletes in its log.
+const SUPER_MAGIC_RANGES: u64 = 0x544b_565f_5355_5033;
 
 /// The durable root of the store: which checkpoint to load and where the log
 /// picks up.
@@ -476,6 +478,11 @@ pub struct Superblock {
     pub next_page_id: PageId,
     /// The root page and its height (0 for a leaf), or `None` for an empty tree.
     pub root: Option<(PagePtr, u32)>,
+    /// Whether the log may hold range deletes. Such a superblock carries a
+    /// magic that lionturtle 0.6 and earlier reject, so they refuse to open
+    /// the store rather than read a range delete as a torn record and drop
+    /// every write after it.
+    pub range_deletes: bool,
 }
 
 impl Superblock {
@@ -493,7 +500,8 @@ impl Superblock {
             }
         }
         let mut out = Vec::with_capacity(SUPER_SLOT as usize);
-        out.extend_from_slice(&SUPER_MAGIC.to_le_bytes());
+        let magic = if self.range_deletes { SUPER_MAGIC_RANGES } else { SUPER_MAGIC };
+        out.extend_from_slice(&magic.to_le_bytes());
         out.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&payload);
@@ -502,9 +510,11 @@ impl Superblock {
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        if u64::from_le_bytes(b[0..8].try_into().unwrap()) != SUPER_MAGIC {
-            return None;
-        }
+        let range_deletes = match u64::from_le_bytes(b[0..8].try_into().unwrap()) {
+            SUPER_MAGIC => false,
+            SUPER_MAGIC_RANGES => true,
+            _ => return None,
+        };
         let crc = u32::from_le_bytes(b[8..12].try_into().unwrap());
         let len = u32::from_le_bytes(b[12..16].try_into().unwrap()) as usize;
         let payload = b.get(16..16 + len)?;
@@ -520,7 +530,7 @@ impl Superblock {
             }
             _ => return None,
         };
-        Some(Self { checkpoint_id: u(0), last_seq: u(1), last_memtable_id: u(2), next_page_id: u(3), root })
+        Some(Self { checkpoint_id: u(0), last_seq: u(1), last_memtable_id: u(2), next_page_id: u(3), root, range_deletes })
     }
 
     /// Reads the newest valid superblock, or `None` if the store is new.
@@ -554,6 +564,20 @@ impl Superblock {
         let file = storage.open(SUPERBLOCK, true)?;
         file.write_all_at(&self.encode(), (self.checkpoint_id % 2) * SUPER_SLOT)?;
         file.sync_data()?;
+        Ok(())
+    }
+
+    /// Marks the store as one whose log may hold range deletes: writes this
+    /// superblock, marked, into both slots under the next two checkpoint
+    /// ids, so no slot an older version could read remains. A crash between
+    /// the two leaves the first, which an older version also rejects.
+    pub fn mark_range_deletes(&mut self, storage: &dyn Storage) -> Result<()> {
+        let mut sb = Self { range_deletes: true, ..self.clone() };
+        for _ in 0..2 {
+            sb.checkpoint_id += 1;
+            sb.store(storage)?;
+        }
+        *self = sb;
         Ok(())
     }
 
@@ -592,6 +616,40 @@ mod tests {
             let loaded = Superblock::load(&disk).unwrap().unwrap();
             assert!(loaded.last_seq == 10 || loaded.last_seq == 20);
             assert!(loaded.root.is_some());
+        }
+    }
+
+    /// Marking writes both slots, so a reader that knows only the old magic
+    /// finds no superblock, even after a crash between the two writes.
+    #[test]
+    fn marking_for_range_deletes_replaces_both_slots() {
+        let old_reader = |disk: &SimStorage| {
+            let file = disk.open(SUPERBLOCK, false).unwrap();
+            (0..2).any(|slot| {
+                let mut buf = vec![0u8; SUPER_SLOT as usize];
+                file.read_exact_at(&mut buf, slot * SUPER_SLOT).unwrap();
+                u64::from_le_bytes(buf[0..8].try_into().unwrap()) == SUPER_MAGIC && Superblock::decode(&buf).is_some()
+            })
+        };
+        for crash_after in [None, Some(1), Some(2), Some(3)] {
+            let disk = SimStorage::new(3, FaultConfig::default());
+            let sb = Superblock { next_page_id: 1, last_seq: 7, ..Default::default() };
+            sb.create(&disk).unwrap();
+            assert!(old_reader(&disk));
+            if let Some(ops) = crash_after {
+                disk.arm_crash(ops);
+            }
+            let marked = sb.clone().mark_range_deletes(&disk).is_ok();
+            disk.disarm_crash();
+            disk.crash();
+            let loaded = Superblock::load(&disk).unwrap().unwrap();
+            assert_eq!(loaded.last_seq, 7);
+            // A failed mark leaves the store unmarked for older versions,
+            // which is safe: the store logs no range delete until marking
+            // succeeds.
+            if marked {
+                assert!(loaded.range_deletes && !old_reader(&disk), "a marked store opens only with the new magic");
+            }
         }
     }
 

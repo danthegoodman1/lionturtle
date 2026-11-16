@@ -27,6 +27,8 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **Snapshots.** `Db::snapshot` returns a handle that any number of reads and iterators can share, and every read through it sees the same batches. Each iterator is a snapshot too.
 
+**Range deletes.** `delete_range` and `delete_prefix` remove every key in a range, at a cost that does not depend on how many keys it holds. Reads honor the range at once. The next checkpoint drops the subtrees inside it without reading them and leaves no range tombstone behind, so reads then pay nothing for it. On 4M records, dropping 100 of 1,000 tenants by prefix took that checkpoint 21 ms, wrote 0.8 MB and removed 22 of 230 leaves; deleting as many keys one by one took 44 ms, wrote 8.3 MB and removed none (`cargo run --release -p lionturtle --example range_deletes`).
+
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
 **Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 18–37% ([results](BENCHMARKS.md#ycsb-at-50m-records)).
@@ -81,6 +83,7 @@ ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over
 - **Memory.** RSS runs about twice RocksDB's: 2.5 GB against 1.3 GB under 128 durable writers.
 - **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.78 s against RocksDB's 116 ms, though update p99.9 was 4.7 ms against 15 ms.
 - **Scans.** A scan merges every buffer level on its path, so its median runs above RocksDB's. At 50M records with LZ4 it was 37 µs against 27, and RocksDB ran workload E 8% faster. At 400M it was 58 µs against 49, though lionturtle ran E 11% faster with a p99.9 of 514 µs against 755.
+- **Many narrow range deletes.** Until its checkpoint, each range delete adds to the reads that cross it. With 100,000 one-key range deletes waiting in memtables, a 50-entry scan took 13 µs on average against 4 µs, with p99 at 83 µs against 5, and a get 1.6 µs against 0.8. Point deletes of as many keys cost reads nothing extra and went 25 times faster, so a range delete pays off when it covers many keys.
 - **Read p99 under writes.** At 50M records with LZ4, read p99 on workload A was 120 µs against RocksDB's 111, though p99.9 was 232 µs against 276.
 
 ## Quick start
@@ -103,6 +106,10 @@ while let Some((key, value)) = it.next()? { /* ... */ }
 let snap = db.snapshot();
 let fruit = snap.prefix(b"b"); // keys starting with "b", ascending
 let newest = snap.iter_rev(b"a", Some(b"c")); // [a, c), descending
+
+// Every key in [a, c), at a cost that does not depend on how many there are.
+db.delete_range(b"a", Some(b"c"))?;
+db.delete_prefix(b"ch")?;
 db.sync()?;
 ```
 
@@ -110,7 +117,7 @@ db.sync()?;
 cargo run --release -p lionturtle --example quickstart
 ```
 
-The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. Keys run to 65,535 bytes and values to 16 MiB.
+The API is `put`, `delete`, `delete_range`, `delete_prefix`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. A batch can hold range deletes among its puts and deletes, and its ops apply in order. Keys and range bounds run to 65,535 bytes and values to 16 MiB. A store that has taken a range delete opens only with lionturtle 0.7.0 or later.
 
 ## C and C++
 

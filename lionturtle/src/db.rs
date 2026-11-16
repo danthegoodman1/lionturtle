@@ -17,12 +17,13 @@ use crate::arena::ChunkPool;
 use crate::bloom::{self, SharedFilter};
 use crate::error::{Error, Result};
 use crate::memtable::{Entry, MemTable, MemTableKind, View, new_memtable};
-use crate::page::{Compression, EntryRef, entry_size};
+use crate::page::{Compression, EntryRef, PageBuilder, entry_size};
 use crate::pagestore::{PagePtr, PageStore, Superblock};
+use crate::rangedel::{FrozenDeletes, Overlay, RangeDelete, RangeDeletes};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, Pace, PageIo};
 use crate::tree::{self, Ctx, Subtree, TreeConfig, TreeScan};
-use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Op, Value, WriteOp, cmp_keys, prefix_end};
+use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Op, OpRef, Value, WriteOp, cmp_keys, prefix_end};
 use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -159,6 +160,8 @@ pub struct Mem {
     /// The keys inserted, so a get of a key the memtable lacks skips the
     /// search: in a large memtable, a cache miss at every level.
     filter: SharedFilter,
+    /// Range deletes, which the filter does not cover.
+    ranges: RangeDeletes,
     counts: MemCounts,
     /// Writers assigned to this memtable that have not finished inserting.
     inflight: Inflight,
@@ -366,14 +369,15 @@ impl Mem {
             waited: AtomicBool::new(false),
             table: new_memtable(opts.memtable, pool),
             filter: SharedFilter::new_in(pool, (opts.memtable_limit() / MEM_BYTES_PER_FILTER_BIT / 8) as usize),
+            ranges: RangeDeletes::default(),
             counts: MemCounts { bytes: AtomicU64::new(0), last_seq: AtomicU64::new(last_seq) },
             inflight: Inflight::default(),
         }
     }
 
     fn replay(&self, op: &WriteOp, seq: u64) {
-        self.insert(op.key(), op.value(), seq, 0);
-        self.counts.bytes.fetch_add(entry_size(op.key.len(), op.value.encoded_len()), Relaxed);
+        self.insert_op(op.op(), seq, 0);
+        self.counts.bytes.fetch_add(op_entry_bytes(op.op()), Relaxed);
     }
 
     /// Adds the version of `key` written at `seq` by batch `ticket`. The
@@ -384,20 +388,45 @@ impl Mem {
         self.table.insert(key, value, seq, ticket);
     }
 
+    fn insert_op(&self, op: OpRef<'_>, seq: u64, ticket: u64) {
+        match op {
+            OpRef::Put(key, value) => self.insert(key, Some(value), seq, ticket),
+            OpRef::Delete(key) => self.insert(key, None, seq, ticket),
+            OpRef::DeleteRange(start, end) => {
+                self.ranges.insert(RangeDelete { start: Bytes::copy_from_slice(start), end: end.map(Bytes::copy_from_slice), seq, ticket })
+            }
+        }
+    }
+
     /// Adds a version of each of `ops`, at sequence numbers counting up
     /// from `seq`, a group at a time so the table can look a group's keys
-    /// up together.
-    fn insert_all<O: Op>(&self, ops: &[O], mut seq: u64, ticket: u64) {
+    /// up together. A batch holding a range delete goes one op at a time.
+    fn insert_all<O: Op>(&self, ops: &[O], mut seq: u64, ticket: u64, ranges: bool) {
+        if ranges {
+            for (i, op) in ops.iter().enumerate() {
+                self.insert_op(op.op(), seq + i as u64, ticket);
+            }
+            return;
+        }
         const GROUP: usize = 64;
         for group in ops.chunks(GROUP) {
             let mut entries: [Entry<'_>; GROUP] = [(&[], None); GROUP];
             for (entry, op) in entries.iter_mut().zip(group) {
-                *entry = (op.key(), op.value());
+                *entry = match op.op() {
+                    OpRef::Put(key, value) => (key, Some(value)),
+                    OpRef::Delete(key) => (key, None),
+                    OpRef::DeleteRange(..) => unreachable!("a batch with range deletes inserts one op at a time"),
+                };
                 self.filter.insert(bloom::hash_key(entry.0));
             }
             self.table.insert_many(&entries[..group.len()], seq, ticket);
             seq += group.len() as u64;
         }
+    }
+
+    /// Whether the memtable holds no write.
+    fn is_empty(&self) -> bool {
+        self.table.is_empty() && self.ranges.is_empty()
     }
 
     /// The newest value of the key hashing to `hash` that `view` sees.
@@ -410,6 +439,16 @@ impl Mem {
 
     pub fn bytes(&self) -> u64 {
         self.counts.bytes.load(Relaxed)
+    }
+}
+
+/// Bytes `op` adds to its memtable. A range delete counts as an entry
+/// holding both of its bounds.
+fn op_entry_bytes(op: OpRef<'_>) -> u64 {
+    match op {
+        OpRef::Put(key, value) => entry_size(key.len(), value.len()),
+        OpRef::Delete(key) => entry_size(key.len(), 0),
+        OpRef::DeleteRange(start, end) => entry_size(start.len(), end.map_or(0, <[u8]>::len)),
     }
 }
 
@@ -628,6 +667,9 @@ pub struct DbStats {
     pub cache_image_bytes: u64,
     pub memtable_bytes: u64,
     pub frozen_memtables: usize,
+    /// Range deletes in memtables, which reads check until their
+    /// checkpoints apply them to the tree.
+    pub range_deletes: usize,
     pub tree: tree::TreeStats,
     pub arena_bytes: u64,
     /// Seconds in each checkpoint stage: build, apply, write, sync, commit;
@@ -673,6 +715,9 @@ struct Inner {
     recycler: wal::Recycler,
     /// The memory of dropped memtables, for new ones.
     mem_pool: Arc<ChunkPool>,
+    /// Whether the superblock marks the store for range deletes; see
+    /// [`Superblock::range_deletes`].
+    range_deletes: AtomicBool,
 }
 
 /// Cumulative nanoseconds spent in each checkpoint stage, and by writers
@@ -762,7 +807,7 @@ impl Db {
         }
         storage.sync_dir()?;
         let mut frozen = Vec::new();
-        if !replayed.table.is_empty() {
+        if !replayed.is_empty() {
             replayed.counts.last_seq.store(last_seq, Relaxed);
             let mem = Mem { id: max_id, ..replayed };
             frozen.push(Arc::new(mem));
@@ -806,6 +851,7 @@ impl Db {
             queue: CachePadded(AtomicPtr::new(std::ptr::null_mut())),
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
+            range_deletes: AtomicBool::new(sb.range_deletes),
             durable: Mutex::new(Durable { sb, live, epoch }),
             applier: Mutex::new(applier),
             pending: Mutex::new(VecDeque::new()),
@@ -841,6 +887,24 @@ impl Db {
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.inner.write(&[(key, None)], false)
+    }
+
+    /// Deletes every key in `[start, end)`; `None` leaves the range
+    /// unbounded above. The cost does not depend on how many keys the range
+    /// holds: until the next checkpoint, reads check the range, and the
+    /// checkpoint drops the subtrees inside it without reading them. An empty
+    /// or inverted range deletes nothing.
+    ///
+    /// A store that has taken a range delete opens only with lionturtle
+    /// 0.7.0 or later.
+    pub fn delete_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        self.inner.write(&[OpRef::DeleteRange(start, end)], false)
+    }
+
+    /// Deletes every key that starts with `prefix`; see [`Db::delete_range`].
+    pub fn delete_prefix(&self, prefix: &[u8]) -> Result<()> {
+        let end = prefix_end(prefix);
+        self.inner.write(&[OpRef::DeleteRange(prefix, end.as_deref())], false)
     }
 
     /// Applies `ops` atomically. With `sync`, returns once they are durable.
@@ -910,7 +974,7 @@ impl Db {
         self.inner.check_poisoned()?;
         {
             let mut w = self.inner.lock_writer();
-            if !w.active.table.is_empty() {
+            if !w.active.is_empty() {
                 let r = self.inner.rotate(&mut w);
                 self.inner.poison_on_err(r)?;
             }
@@ -944,7 +1008,7 @@ impl Db {
     /// Freezes the active memtable if it holds anything, without waiting.
     pub fn freeze(&self) -> Result<()> {
         let mut w = self.inner.lock_writer();
-        if !w.active.table.is_empty() {
+        if !w.active.is_empty() {
             let r = self.inner.rotate(&mut w);
             self.inner.poison_on_err(r)?;
         }
@@ -981,6 +1045,7 @@ impl Db {
             cache_image_bytes: inner.io.cache_image_bytes(),
             memtable_bytes: v.active.bytes() + v.frozen.iter().map(|m| m.bytes()).sum::<u64>(),
             frozen_memtables: v.frozen.len(),
+            range_deletes: std::iter::once(&v.active).chain(&v.frozen).map(|m| m.ranges.len()).sum(),
             tree: v.tree.as_ref().map(tree::stats).unwrap_or_default(),
             arena_bytes: inner.io.store.arena_bytes(),
             stage_secs: [
@@ -1073,22 +1138,48 @@ impl Inner {
         self.signal.notify_all();
     }
 
+    /// Marks the superblock for range deletes before the first one reaches
+    /// the log.
+    fn mark_range_deletes(&self) -> Result<()> {
+        let mut durable = self.durable.lock();
+        if !durable.sb.range_deletes {
+            durable.sb.mark_range_deletes(&*self.storage)?;
+        }
+        self.range_deletes.store(true, Release);
+        Ok(())
+    }
+
     /// Logs `ops` and inserts them in the memtable, each of which copies
     /// the bytes it keeps.
     fn write<O: Op>(&self, ops: &[O], sync: bool) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        let (mut entry_bytes, mut user_bytes) = (0, 0);
+        let (mut entry_bytes, mut user_bytes, mut ranges) = (0, 0, false);
         for op in ops {
-            let (key, value) = (op.key().len(), op.value().map_or(0, <[u8]>::len));
+            let op = op.op();
+            let (key, value) = match op {
+                OpRef::Put(key, value) => (key.len(), value.len()),
+                OpRef::Delete(key) => (key.len(), 0),
+                OpRef::DeleteRange(start, end) => {
+                    ranges = true;
+                    if end.is_some_and(|e| e.len() > MAX_KEY_LEN) {
+                        return Err(Error::InvalidArgument("range end too large".into()));
+                    }
+                    (start.len(), end.map_or(0, <[u8]>::len))
+                }
+            };
             if key > MAX_KEY_LEN || value > MAX_VALUE_LEN {
                 return Err(Error::InvalidArgument("key or value too large".into()));
             }
-            entry_bytes += entry_size(key, value);
+            entry_bytes += op_entry_bytes(op);
             user_bytes += (key + value) as u64;
         }
         self.check_poisoned()?;
+        if ranges && !self.range_deletes.load(Acquire) {
+            let r = self.mark_range_deletes();
+            self.poison_on_err(r)?;
+        }
         thread_local! {
             static BODY: std::cell::RefCell<wal::Body> = Default::default();
         }
@@ -1120,7 +1211,7 @@ impl Inner {
             // SAFETY: see `Assigned::mem`; this writer stays counted in
             // until the `exit` below, its last use of the memtable.
             let mem = unsafe { &*a.mem };
-            mem.insert_all(ops, a.seq, a.ticket);
+            mem.insert_all(ops, a.seq, a.ticket, ranges);
             self.commits.commit(a.ticket);
             mem.inflight.exit(request.shard);
             self.poison_on_err(flushed)
@@ -1336,19 +1427,38 @@ impl Inner {
 
     /// The value of `key` in version `v`, reading the memtables through
     /// `view`. The tree holds only committed batches.
+    ///
+    /// A get reads the range deletes after the versions it returns. A
+    /// batch's range deletes are in their memtable before it commits, so a
+    /// get that saw a version from a committed batch then sees that batch's
+    /// range deletes too, and never half of a batch that both writes and
+    /// range-deletes a key. A get that finds a range delete covering the key
+    /// looks for a version newer than the delete, and reads the deletes
+    /// again after finding one, since its batch may have committed since.
     fn get_in(&self, v: &Version, key: &[u8], view: View) -> Result<Option<Bytes>> {
         let hash = bloom::hash_key(key);
-        if let Some(val) = v.active.get(key, hash, view) {
-            return Ok(val.into_put());
+        let mems = || std::iter::once(&v.active).chain(&v.frozen);
+        let covering = || mems().map(|m| m.ranges.covering(key, view)).max().unwrap_or(0);
+        let found = mems().find_map(|m| m.get(key, hash, view));
+        let mut covered = covering();
+        if covered == 0 {
+            return match (found, &v.tree) {
+                (Some(val), _) => Ok(val.into_put()),
+                (None, Some(t)) => Ok(tree::get(&self.io, t, key, hash)?.and_then(Value::into_put)),
+                (None, None) => Ok(None),
+            };
         }
-        for m in &v.frozen {
-            if let Some(val) = m.get(key, hash, view) {
-                return Ok(val.into_put());
+        loop {
+            // Memtables run newest first, and each holds newer versions than
+            // the next.
+            let newer = move |seq, ticket| seq > covered && view(seq, ticket);
+            let Some(val) = mems().take_while(|m| m.counts.last_seq.load(Relaxed) > covered).find_map(|m| m.get(key, hash, &newer)) else {
+                return Ok(None);
+            };
+            match covering() {
+                again if again == covered => return Ok(val.into_put()),
+                again => covered = again,
             }
-        }
-        match &v.tree {
-            Some(t) => Ok(tree::get(&self.io, t, key, hash)?.and_then(Value::into_put)),
-            None => Ok(None),
         }
     }
 
@@ -1431,26 +1541,44 @@ impl Inner {
 
     /// Cuts a frozen memtable into sorted batches of about one leaf each and
     /// hands each to `send`, stopping early if it returns false.
-    fn build_batches(&self, mem: &Mem, send: &mut dyn FnMut(Arc<DataPage>) -> bool) {
-        let limit = self.opts.tree.leaf_size;
-        let bits = self.opts.tree.filter_bits;
-        let capacity = (limit + limit / 16) as usize + 4096;
-        let mut b = self.io.builder(self.next_page_id.fetch_add(1, Relaxed), capacity);
-        let mut open = true;
-        mem.table.for_each(&mut |key, value| {
-            if !open {
-                return;
+    ///
+    /// With the memtable's range deletes, the batches leave out the entries
+    /// a newer range delete covers, and carry a tombstone for each key of
+    /// `tombstones`, the tree's keys the range deletes left, unless the
+    /// memtable has a newer entry for it.
+    fn build_batches(&self, mem: &Mem, deletes: Option<&FrozenDeletes>, tombstones: &[Bytes], send: &mut dyn FnMut(Arc<DataPage>) -> bool) {
+        let mut b = Batcher::new(self, send);
+        let Some(deletes) = deletes else {
+            mem.table.for_each(&mut |key, value, _| b.push(EntryRef { key, value }));
+            return b.finish();
+        };
+        let mut cover = deletes.cursor();
+        let mut t = 0;
+        mem.table.for_each(&mut |key, value, seq| {
+            while t < tombstones.len() && tombstones[t][..] < *key {
+                b.push(EntryRef { key: &tombstones[t], value: None });
+                t += 1;
             }
-            let e = EntryRef { key, value };
-            if !b.is_empty() && b.data_bytes() + e.size() > limit {
-                let next = self.io.builder(self.next_page_id.fetch_add(1, Relaxed), capacity);
-                let full = std::mem::replace(&mut b, next);
-                open = send(Arc::new(DataPage::unwritten(full.finish(bits))));
+            let hidden = cover.newest(key) > seq;
+            let in_tree = t < tombstones.len() && tombstones[t][..] == *key;
+            t += in_tree as usize;
+            match (hidden, in_tree) {
+                (false, _) => b.push(EntryRef { key, value }),
+                (true, true) => b.push(EntryRef { key, value: None }),
+                (true, false) => {}
             }
-            b.push(e);
         });
-        if open && !b.is_empty() {
-            send(Arc::new(DataPage::unwritten(b.finish(bits))));
+        for key in &tombstones[t..] {
+            b.push(EntryRef { key, value: None });
+        }
+        b.finish();
+    }
+
+    /// Runs `f` on the store's merge pool, if it has one.
+    fn in_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
+        match &self.merge_pool {
+            Some(pool) => pool.install(f),
+            None => f(),
         }
     }
 
@@ -1501,14 +1629,34 @@ impl Inner {
         drop(version);
         let io_bytes = || self.io.counters.span_read_bytes.load(Relaxed) + self.io.counters.page_bytes_written.load(Relaxed);
         let io_before = io_bytes();
+        // The memtable's range deletes go first: everything in the tree is
+        // older than they are.
+        let deletes = mem.ranges.load().map(|i| FrozenDeletes::new(i.all().cloned().collect()));
+        let (root, tombstones) = match &deletes {
+            None => (applier.root.clone(), Vec::new()),
+            Some(d) => {
+                let t = std::time::Instant::now();
+                let (ranges, base) = (d.ranges(), applier.root.clone());
+                let deleted = self.in_pool(|| -> Result<_> {
+                    let root = tree::delete_ranges(&ctx, base.as_ref(), &ranges)?;
+                    let left = tree::live_keys(&self.io, root.as_ref(), &ranges, self.opts.tree.parallel)?;
+                    Ok((root, left))
+                });
+                self.timing.apply_ns.fetch_add(since(t), Relaxed);
+                match deleted {
+                    Ok(out) => out,
+                    Err(e) => {
+                        self.io.pacer.stop();
+                        return Err(e);
+                    }
+                }
+            }
+        };
         let apply = |batches| {
-            let root = applier.root.clone();
+            let root = root.clone();
             if self.opts.background { self.apply_writing(&ctx, root, batches) } else { self.apply_then_write(&ctx, root, batches) }
         };
-        let run = |rx| match &self.merge_pool {
-            Some(pool) => pool.install(|| apply(rx)),
-            None => apply(rx),
-        };
+        let run = |rx| self.in_pool(|| apply(rx));
         let applied = if self.opts.background {
             // Another thread cuts the batches while this one applies them,
             // one batch ahead, so the checkpoint never holds a copy of the
@@ -1519,7 +1667,7 @@ impl Inner {
                 scope.spawn(move || {
                     let t = std::time::Instant::now();
                     let mut blocked = 0;
-                    self.build_batches(frozen, &mut |batch| {
+                    self.build_batches(frozen, deletes.as_ref(), &tombstones, &mut |batch| {
                         let t = std::time::Instant::now();
                         let open = tx.send(batch).is_ok();
                         blocked += since(t);
@@ -1534,7 +1682,7 @@ impl Inner {
             // runs, stay deterministic.
             let (tx, rx) = std::sync::mpsc::channel();
             let t = std::time::Instant::now();
-            self.build_batches(&mem, &mut |batch| tx.send(batch).is_ok());
+            self.build_batches(&mem, deletes.as_ref(), &tombstones, &mut |batch| tx.send(batch).is_ok());
             self.timing.build_ns.fetch_add(since(t), Relaxed);
             drop(tx);
             run(rx)
@@ -1648,6 +1796,7 @@ impl Inner {
             last_memtable_id: mem.id,
             next_page_id: self.next_page_id.load(SeqCst),
             root: root.as_ref().and_then(tree::root_ptr),
+            range_deletes: durable.sb.range_deletes,
         };
         sb.store(&*self.storage)?;
         if std::env::var_os("TURTLEKV_DEBUG").is_some() {
@@ -1694,6 +1843,46 @@ impl Inner {
     }
 }
 
+/// Cuts sorted entries into batches of about one leaf each; see
+/// [`Inner::build_batches`].
+struct Batcher<'a> {
+    inner: &'a Inner,
+    send: &'a mut dyn FnMut(Arc<DataPage>) -> bool,
+    b: PageBuilder,
+    open: bool,
+    limit: u64,
+    bits: u32,
+}
+
+impl<'a> Batcher<'a> {
+    fn new(inner: &'a Inner, send: &'a mut dyn FnMut(Arc<DataPage>) -> bool) -> Self {
+        let (limit, bits) = (inner.opts.tree.leaf_size, inner.opts.tree.filter_bits);
+        Self { b: Self::builder(inner, limit), inner, send, open: true, limit, bits }
+    }
+
+    fn builder(inner: &Inner, limit: u64) -> PageBuilder {
+        inner.io.builder(inner.next_page_id.fetch_add(1, Relaxed), (limit + limit / 16) as usize + 4096)
+    }
+
+    #[inline]
+    fn push(&mut self, e: EntryRef<'_>) {
+        if !self.open {
+            return;
+        }
+        if !self.b.is_empty() && self.b.data_bytes() + e.size() > self.limit {
+            let full = std::mem::replace(&mut self.b, Self::builder(self.inner, self.limit));
+            self.open = (self.send)(Arc::new(DataPage::unwritten(full.finish(self.bits))));
+        }
+        self.b.push(e);
+    }
+
+    fn finish(self) {
+        if self.open && !self.b.is_empty() {
+            (self.send)(Arc::new(DataPage::unwritten(self.b.finish(self.bits))));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Stage {
     Apply,
@@ -1726,6 +1915,12 @@ impl Snapshot {
     /// The sequence number of the last write the snapshot holds.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The range deletes in the snapshot's memtables, if any.
+    fn overlay(&self) -> Option<Overlay> {
+        let v = &self.version;
+        Overlay::new(std::iter::once(&v.active).chain(&v.frozen).filter_map(|m| m.ranges.load()).collect(), self.seq)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -1828,6 +2023,8 @@ impl DbIter {
 /// reverse scans read little and long ones amortize each window's seeks.
 struct Reverse {
     snap: Snapshot,
+    /// The range deletes the snapshot sees, if any.
+    overlay: Option<Overlay>,
     start: Bytes,
     /// Exclusive upper bound of what remains; `None` for the end of the key
     /// space.
@@ -1848,6 +2045,7 @@ impl Reverse {
     fn new(snap: &Snapshot, start: &[u8], end: Option<&[u8]>) -> Self {
         Self {
             snap: snap.clone(),
+            overlay: snap.overlay(),
             start: Bytes::copy_from_slice(start),
             hi: end.map(Bytes::copy_from_slice),
             window: Vec::new(),
@@ -1883,7 +2081,10 @@ impl Reverse {
         let hi = self.hi.as_deref();
         let mut lo = self.start.clone();
         if let Some(t) = &self.snap.version.tree {
-            lo = lo.max(tree::window_start(t, hi, self.blocks));
+            // The tree holds nothing the snapshot sees in keys a range
+            // delete covers, so its share of the window starts below them.
+            let covered = self.overlay.as_ref().and_then(|o| o.covered_below(hi));
+            lo = lo.max(tree::window_start(t, covered.as_deref().or(hi), self.blocks));
         }
         // Each memtable is read only within the window so far, which narrows
         // as it goes.
@@ -1902,22 +2103,41 @@ impl Reverse {
 }
 
 /// A merged iterator over the memtables and the tree of one snapshot.
+///
+/// With range deletes in the snapshot's memtables, the merge walks the key
+/// space in spans over which the newest delete the snapshot sees is the
+/// same. In a span under a delete, each source shows only versions newer
+/// than it: the tree skips to the span's end, as does each memtable older
+/// than the delete, and newer memtables hide the versions it covers.
 struct Forward {
     snap: Snapshot,
     /// Newest first; the tree comes last.
     mems: Vec<MemSource>,
     tree: TreeScan,
+    end: Option<Bytes>,
+    overlay: Option<Overlay>,
+    /// The newest delete covering the current span (0 for none), and the
+    /// span's exclusive end (`None` for the end of the key space).
+    span_seq: u64,
+    span_end: Option<Bytes>,
+    /// Whether the tree has yet to skip past the current span.
+    skip_tree: bool,
 }
 
 struct MemSource {
     mem: Arc<Mem>,
     snapshot: u64,
+    /// Versions at or below this are hidden by a range delete.
+    hidden_below: u64,
     buf: VecDeque<(Bytes, Value)>,
     start: Bound<Bytes>,
+    /// The end of what the next refills read: the scan's end, or the
+    /// current span's.
     end: Option<Bytes>,
     /// Entries the next refill copies. It starts small and doubles, since
     /// memtables hold a small share of the data and most scans are short.
     chunk: usize,
+    /// Whether the memtable holds nothing more to read before `end`.
     exhausted: bool,
 }
 
@@ -1936,8 +2156,8 @@ impl MemSource {
             Bound::Excluded(k) => Bound::Excluded(&k[..]),
             Bound::Unbounded => Bound::Unbounded,
         };
-        let snapshot = self.snapshot;
-        self.mem.table.range(start, self.end.as_deref(), &|seq, _| seq <= snapshot, self.chunk, &mut out);
+        let (snapshot, hidden) = (self.snapshot, self.hidden_below);
+        self.mem.table.range(start, self.end.as_deref(), &|seq, _| seq <= snapshot && seq > hidden, self.chunk, &mut out);
         self.exhausted = out.len() < self.chunk;
         self.chunk = (self.chunk * 2).min(MEM_CHUNK_MAX);
         if let Some((k, _)) = out.last() {
@@ -1991,6 +2211,7 @@ impl Forward {
             .map(|m| MemSource {
                 mem: m.clone(),
                 snapshot,
+                hidden_below: 0,
                 buf: VecDeque::new(),
                 start: Bound::Included(start_b.clone()),
                 end: end_b.clone(),
@@ -1998,8 +2219,19 @@ impl Forward {
                 exhausted: false,
             })
             .collect();
-        let tree = TreeScan::new(version.tree.clone(), start, end_b);
-        Self { snap: snap.clone(), mems, tree }
+        let tree = TreeScan::new(version.tree.clone(), start, end_b.clone());
+        let mut f =
+            Self { snap: snap.clone(), mems, tree, end: end_b, overlay: snap.overlay(), span_seq: 0, span_end: None, skip_tree: false };
+        if let Some(overlay) = &f.overlay {
+            (f.span_seq, f.span_end) = enter_span(overlay, &mut f.mems, f.end.as_ref(), start_b);
+            f.skip_tree = f.span_seq > 0;
+        }
+        f
+    }
+
+    /// Whether `key` lies before the end of the current span.
+    fn in_span(&self, key: &[u8]) -> bool {
+        self.span_end.as_ref().is_none_or(|e| key < &e[..])
     }
 
     fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
@@ -2010,6 +2242,10 @@ impl Forward {
     fn step<T>(&mut self, f: impl FnOnce(EntryView<'_>) -> T) -> Result<Option<T>> {
         let io = &self.snap.inner.io;
         loop {
+            if self.skip_tree {
+                self.skip_tree = false;
+                self.tree.skip_to(io, self.span_end.as_deref())?;
+            }
             self.tree.settle(io)?;
             for m in &mut self.mems {
                 m.fill();
@@ -2027,10 +2263,22 @@ impl Forward {
             }
             if let Some((k, _)) = self.tree.peek()
                 && best.is_none_or(|(_, b)| cmp_keys(k, b).is_lt())
+                && self.span_seq == 0
+                && self.in_span(k)
             {
                 best = Some((n, k));
             }
-            let Some((w, _)) = best else { return Ok(None) };
+            let Some((w, _)) = best else {
+                // The span is done; the next one starts at its end.
+                match (&self.overlay, self.span_end.clone()) {
+                    (Some(overlay), Some(next)) if self.end.as_ref().is_none_or(|e| next < *e) => {
+                        (self.span_seq, self.span_end) = enter_span(overlay, &mut self.mems, self.end.as_ref(), next);
+                        self.skip_tree = self.span_seq > 0;
+                        continue;
+                    }
+                    _ => return Ok(None),
+                }
+            };
             if w == n {
                 let out = f(EntryView::Tree(&self.tree));
                 self.tree.advance(io)?;
@@ -2044,6 +2292,27 @@ impl Forward {
             consume_mem(&mut self.mems, &mut self.tree, io, w)?;
         }
     }
+}
+
+/// Starts the memtables on the span of `overlay` that begins at `at`, within
+/// the scan's `end`. Returns the newest delete covering the span and the
+/// span's end.
+fn enter_span(overlay: &Overlay, mems: &mut [MemSource], end: Option<&Bytes>, at: Bytes) -> (u64, Option<Bytes>) {
+    let (seq, until) = overlay.span(&at);
+    let fill_end = match (end, &until) {
+        (None, u) => u.clone(),
+        (e, None) => e.cloned(),
+        (Some(e), Some(u)) => Some(if e <= u { e.clone() } else { u.clone() }),
+    };
+    for m in mems {
+        debug_assert!(m.buf.is_empty());
+        m.start = Bound::Included(at.clone());
+        m.end = fill_end.clone();
+        m.hidden_below = seq;
+        // A memtable whose versions all predate the delete shows none.
+        m.exhausted = m.mem.counts.last_seq.load(Relaxed) <= seq;
+    }
+    (seq, until)
 }
 
 /// Moves past memtable `w`'s front entry and the older entries for the same

@@ -75,6 +75,16 @@ class Batch {
     detail::check(lt_batch_delete(b_.get(), key.data(), key.size()));
     return *this;
   }
+  // Deletes every key in [start, end), or from `start` on without `end`.
+  // A batch's writes apply in order.
+  Batch &erase_range(std::string_view start, std::optional<std::string_view> end = std::nullopt) {
+    detail::check(lt_batch_delete_range(b_.get(), start.data(), start.size(), detail::bound(end), end ? end->size() : 0));
+    return *this;
+  }
+  Batch &erase_prefix(std::string_view prefix) {
+    detail::check(lt_batch_delete_prefix(b_.get(), prefix.data(), prefix.size()));
+    return *this;
+  }
   void clear() noexcept { lt_batch_clear(b_.get()); }
   const lt_batch *get() const noexcept { return b_.get(); }
 
@@ -161,6 +171,14 @@ class Db {
   }
   void erase(std::string_view key, bool sync = false) {
     detail::check(lt_delete(db_.get(), key.data(), key.size(), sync));
+  }
+  // Deletes every key in [start, end), or from `start` on without `end`,
+  // at a cost that does not depend on how many keys the range holds.
+  void erase_range(std::string_view start, std::optional<std::string_view> end = std::nullopt, bool sync = false) {
+    detail::check(lt_delete_range(db_.get(), start.data(), start.size(), detail::bound(end), end ? end->size() : 0, sync));
+  }
+  void erase_prefix(std::string_view prefix, bool sync = false) {
+    detail::check(lt_delete_prefix(db_.get(), prefix.data(), prefix.size(), sync));
   }
   // Applies every write in `batch` as one: a crash keeps all or none, and
   // no read sees some without the rest.

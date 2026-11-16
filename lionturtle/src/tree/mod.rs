@@ -23,8 +23,11 @@
 
 pub mod codec;
 pub mod cursor;
+mod delete;
 pub mod io;
 pub mod ranges;
+
+pub use delete::{delete_ranges, live_keys};
 
 use crate::error::{Result, corruption};
 use crate::page::{EntryRef, PageBuilder, PageId, PageImage};
@@ -173,6 +176,14 @@ impl Segment {
             && cmp_keys(self.page.meta.max_key(), lo).is_ge()
             && self.hi.as_ref().is_none_or(|h| cmp_keys(h, lo).is_gt())
             && hi.is_none_or(|hi| cmp_keys(self.min_key(), hi).is_lt())
+    }
+
+    /// Whether the segment may hold a live key in `[lo, hi)`: false when
+    /// its dead keys cover every key of its clipped range there, as after
+    /// a range delete.
+    pub fn may_hold_live(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
+        let Some(start) = live_start(self, lo) else { return false };
+        start <= self.page.meta.max_key() && hi.is_none_or(|h| start < h) && self.hi.as_deref().is_none_or(|h| start < h)
     }
 
     fn range_is_empty(&self) -> bool {
@@ -865,22 +876,33 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
         return Ok(root.cloned());
     }
     let batch = vec![Segment::whole(batch)];
-    let mut pieces: Vec<Piece> = match root {
+    let pieces: Vec<Piece> = match root {
         None => leaf_pieces(leaf_apply(ctx, None, &batch)?, &Bytes::new()),
         Some(Subtree::Leaf(leaf)) => leaf_pieces(leaf_apply(ctx, Some(leaf), &batch)?, &Bytes::new()),
         Some(Subtree::Node(n)) => {
             let mut n = (**n).clone();
             node_apply(ctx, &mut n, batch)?;
-            split_if_needed(ctx, n)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect()
+            node_pieces(split_if_needed(ctx, n)?)
         }
     };
+    settle_root(ctx, pieces)
+}
+
+fn node_pieces(nodes: Vec<Node>) -> Vec<Piece> {
+    nodes.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect()
+}
+
+/// The root over `pieces`, the pieces a change to the root became: a new
+/// root above them if there are several, and a root with a single child
+/// gives way to it.
+fn settle_root(ctx: &Ctx, mut pieces: Vec<Piece>) -> Result<Option<Subtree>> {
     loop {
         match pieces.len() {
             0 => return Ok(None),
             1 => break,
             _ => {
                 let root = new_root(ctx, pieces);
-                pieces = split_if_needed(ctx, root)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect();
+                pieces = node_pieces(split_if_needed(ctx, root)?);
             }
         }
     }
@@ -1131,6 +1153,28 @@ impl TreeScan {
             Some(m) => m.advance(io),
             None => Ok(()),
         }
+    }
+
+    /// Moves to the first live entry at or after `key`, or past the end for
+    /// `None`. Steps over a few entries in place, and reopens the scan at
+    /// `key` past those.
+    pub fn skip_to(&mut self, io: &PageIo, key: Option<&[u8]>) -> Result<()> {
+        const STEPS: usize = 16;
+        let Some(key) = key else {
+            self.merger = None;
+            self.next_start = None;
+            return Ok(());
+        };
+        for _ in 0..STEPS {
+            self.settle(io)?;
+            match self.peek() {
+                Some((k, _)) if cmp_keys(k, key).is_lt() => self.advance(io)?,
+                _ => return Ok(()),
+            }
+        }
+        self.merger = None;
+        self.next_start = self.end.as_ref().is_none_or(|e| key < &e[..]).then(|| Bytes::copy_from_slice(key));
+        Ok(())
     }
 
     /// The next live entry.

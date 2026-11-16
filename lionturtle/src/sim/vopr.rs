@@ -5,6 +5,9 @@
 //! Everything runs on one thread against [`SimStorage`], with checkpoints
 //! driven explicitly, so a seed replays the same run exactly.
 //!
+//! Writes include range deletes: narrow and wide ranges, prefixes, and
+//! ranges inside batches with the puts and deletes they cover.
+//!
 //! What the model checks:
 //! - every `get` and `scan` matches the model, unless it returns an error;
 //! - after a crash, the store recovers exactly the state after some write
@@ -33,6 +36,7 @@ use std::sync::Arc;
 pub struct Report {
     pub steps: u64,
     pub writes: u64,
+    pub range_deletes: u64,
     pub reads: u64,
     pub scans: u64,
     pub snapshots: u64,
@@ -52,6 +56,26 @@ struct Undo {
     prev: Option<Vec<u8>>,
 }
 
+/// One write as the model applies it.
+#[derive(Clone, Debug)]
+enum ModelOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+    DeleteRange(Vec<u8>, Option<Vec<u8>>),
+}
+
+impl ModelOp {
+    fn write_op(&self) -> WriteOp {
+        match self {
+            ModelOp::Put(k, v) => WriteOp::put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)),
+            ModelOp::Delete(k) => WriteOp::delete(Bytes::copy_from_slice(k)),
+            ModelOp::DeleteRange(start, end) => {
+                WriteOp::DeleteRange { start: Bytes::copy_from_slice(start), end: end.as_deref().map(Bytes::copy_from_slice) }
+            }
+        }
+    }
+}
+
 /// The expected contents of the store and enough history to rewind it.
 #[derive(Default)]
 struct Model {
@@ -62,14 +86,30 @@ struct Model {
 }
 
 impl Model {
-    fn apply(&mut self, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
-        for (key, value) in ops {
+    fn apply(&mut self, ops: &[ModelOp]) {
+        for op in ops {
             self.last_seq += 1;
-            let prev = match value {
-                Some(v) => self.state.insert(key.clone(), v.clone()),
-                None => self.state.remove(key),
-            };
-            self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+            match op {
+                ModelOp::Put(key, value) => {
+                    let prev = self.state.insert(key.clone(), value.clone());
+                    self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+                }
+                ModelOp::Delete(key) => {
+                    let prev = self.state.remove(key);
+                    self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+                }
+                ModelOp::DeleteRange(start, end) => {
+                    if end.as_ref().is_some_and(|e| e <= start) {
+                        continue;
+                    }
+                    let hi = end.clone().map_or(Bound::Unbounded, Bound::Excluded);
+                    let doomed: Vec<Vec<u8>> = self.state.range((Bound::Included(start.clone()), hi)).map(|(k, _)| k.clone()).collect();
+                    for key in doomed {
+                        let prev = self.state.remove(&key);
+                        self.undo.push(Undo { seq: self.last_seq, key, prev });
+                    }
+                }
+            }
         }
     }
 
@@ -288,19 +328,40 @@ impl Sim {
         v
     }
 
-    fn write(&mut self, ops: Vec<(Vec<u8>, Option<Vec<u8>>)>, sync: bool) -> Result<(), String> {
-        let wops: Vec<WriteOp> = ops
-            .iter()
-            .map(|(k, v)| match v {
-                Some(v) => WriteOp::put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)),
-                None => WriteOp::delete(Bytes::copy_from_slice(k)),
-            })
-            .collect();
+    /// A range to delete: usually a narrow one between two keys, sometimes
+    /// a prefix, an unbounded range, or an empty or inverted one.
+    fn range(&mut self) -> (Vec<u8>, Option<Vec<u8>>) {
+        let start = self.key();
+        match self.rng.below(20) {
+            0 => (start, None),
+            1..4 => {
+                let mut p = start;
+                p.truncate(self.rng.range(0, p.len() as u64 + 1) as usize);
+                let end = crate::types::prefix_end(&p).map(|e| e.to_vec());
+                (p, end)
+            }
+            _ => {
+                // Keys sort by their random head, so a neighbour in the key
+                // list is close by, and an arbitrary key is far.
+                let end = if self.rng.chance(0.8) {
+                    let i = self.keys.partition_point(|k| *k < start);
+                    self.keys[(i + self.rng.below(4) as usize).min(self.keys.len() - 1)].clone()
+                } else {
+                    self.key()
+                };
+                (start, Some(end))
+            }
+        }
+    }
+
+    fn write(&mut self, ops: Vec<ModelOp>, sync: bool) -> Result<(), String> {
+        let wops: Vec<WriteOp> = ops.iter().map(ModelOp::write_op).collect();
         let before = self.db().last_seq();
         let result = self.db().write(&wops, sync);
         let after = self.db().last_seq();
         match result {
             Ok(()) => {
+                self.report.range_deletes += ops.iter().filter(|op| matches!(op, ModelOp::DeleteRange(..))).count() as u64;
                 self.model.apply(&ops);
                 if after != self.model.last_seq {
                     return Err(format!("sequence mismatch: db {after}, model {}", self.model.last_seq));
@@ -605,23 +666,35 @@ impl Sim {
             0..300 => {
                 let (k, v) = (self.key(), self.value());
                 let sync = self.rng.chance(0.05);
-                self.write(vec![(k, Some(v))], sync)
+                self.write(vec![ModelOp::Put(k, v)], sync)
             }
-            300..380 => {
+            300..360 => {
                 let k = self.key();
                 let sync = self.rng.chance(0.05);
-                self.write(vec![(k, None)], sync)
+                self.write(vec![ModelOp::Delete(k)], sync)
+            }
+            360..380 => {
+                let (start, end) = self.range();
+                let sync = self.rng.chance(0.05);
+                self.write(vec![ModelOp::DeleteRange(start, end)], sync)
             }
             380..430 => {
+                // Ops apply in order, so a batch may write a key and then
+                // range-delete it, or the reverse.
                 let n = self.rng.range(2, 10);
-                let mut ops = BTreeMap::new();
+                let mut ops = Vec::new();
                 for _ in 0..n {
-                    let k = self.key();
-                    let v = self.rng.chance(0.8).then(|| self.value());
-                    ops.insert(k, v);
+                    ops.push(match self.rng.below(10) {
+                        0 => {
+                            let (start, end) = self.range();
+                            ModelOp::DeleteRange(start, end)
+                        }
+                        1 | 2 => ModelOp::Delete(self.key()),
+                        _ => ModelOp::Put(self.key(), self.value()),
+                    });
                 }
                 let sync = self.rng.chance(0.2);
-                self.write(ops.into_iter().collect(), sync)
+                self.write(ops, sync)
             }
             430..650 => {
                 let k = if self.rng.chance(0.9) { self.key() } else { b"missing-key".to_vec() };

@@ -393,6 +393,34 @@ pub unsafe extern "C" fn lt_delete(db: *mut lt_db, key: *const c_char, key_len: 
     call(|| unsafe { handle(db)?.0.write(&[WriteOp::delete(bytes(key, key_len)?.to_vec())], sync) })
 }
 
+/// Deletes every key in [start, end). A null `end` leaves the range
+/// unbounded above. The cost does not depend on how many keys the range
+/// holds. With `sync`, returns once the delete is durable. A store that has
+/// taken a range delete opens only with lionturtle 0.7.0 or later.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_delete_range(
+    db: *mut lt_db,
+    start: *const c_char,
+    start_len: usize,
+    end: *const c_char,
+    end_len: usize,
+    sync: bool,
+) -> lt_status {
+    call(|| unsafe { handle(db)?.0.write(&[range_op(start, start_len, end, end_len)?], sync) })
+}
+
+/// Deletes every key that starts with `prefix`; see lt_delete_range().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_delete_prefix(db: *mut lt_db, prefix: *const c_char, prefix_len: usize, sync: bool) -> lt_status {
+    call(|| unsafe { handle(db)?.0.write(&[WriteOp::delete_prefix(bytes(prefix, prefix_len)?.to_vec())], sync) })
+}
+
+/// A range delete of `[start, end)`, copying both bounds.
+unsafe fn range_op(start: *const c_char, start_len: usize, end: *const c_char, end_len: usize) -> Result<WriteOp> {
+    let (start, end) = unsafe { (bytes(start, start_len)?, bound(end, end_len)?) };
+    Ok(WriteOp::DeleteRange { start: Bytes::copy_from_slice(start), end: end.map(Bytes::copy_from_slice) })
+}
+
 /// Applies every write in `batch` as one: a crash keeps all of them or
 /// none, and no read sees some without the rest. With `sync`, returns once
 /// they are durable. `batch` keeps its writes for reuse.
@@ -582,6 +610,35 @@ pub unsafe extern "C" fn lt_batch_delete(batch: *mut lt_batch, key: *const c_cha
     call(|| unsafe {
         let batch = batch.as_mut().ok_or_else(|| invalid("null handle"))?;
         batch.0.push(WriteOp::delete(bytes(key, key_len)?.to_vec()));
+        Ok(())
+    })
+}
+
+/// Adds a delete of every key in [start, end), copying both bounds. A null
+/// `end` leaves the range unbounded above. The batch's writes apply in
+/// order, so a range delete removes the keys the batch put before it and
+/// keeps those it puts after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_batch_delete_range(
+    batch: *mut lt_batch,
+    start: *const c_char,
+    start_len: usize,
+    end: *const c_char,
+    end_len: usize,
+) -> lt_status {
+    call(|| unsafe {
+        let batch = batch.as_mut().ok_or_else(|| invalid("null handle"))?;
+        batch.0.push(range_op(start, start_len, end, end_len)?);
+        Ok(())
+    })
+}
+
+/// Adds a delete of every key that starts with `prefix`, copying it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_batch_delete_prefix(batch: *mut lt_batch, prefix: *const c_char, prefix_len: usize) -> lt_status {
+    call(|| unsafe {
+        let batch = batch.as_mut().ok_or_else(|| invalid("null handle"))?;
+        batch.0.push(WriteOp::delete_prefix(bytes(prefix, prefix_len)?.to_vec()));
         Ok(())
     })
 }

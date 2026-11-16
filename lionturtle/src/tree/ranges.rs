@@ -104,10 +104,39 @@ impl KeyRanges {
         self.find(lo).is_some_and(|(_, h)| h.as_ref().is_none_or(|h| hi < &h[..]))
     }
 
+    /// Whether every key in `[lo, hi)` lies inside the set (`hi = None` for
+    /// the end of the key space). An empty range lies inside any set.
+    pub fn covers_range(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
+        if hi.is_some_and(|h| h <= lo) {
+            return true;
+        }
+        self.find(lo).is_some_and(|(_, h)| match (h, hi) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(h), Some(hi)) => hi <= &h[..],
+        })
+    }
+
+    /// The index of the first range that ends after `lo`.
+    fn first_after(&self, lo: &[u8]) -> usize {
+        self.ranges.partition_point(|(_, h)| h.as_ref().is_some_and(|h| &h[..] <= lo))
+    }
+
+    /// Whether any key in `[lo, hi)` lies inside the set.
+    pub fn overlaps(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
+        if hi.is_some_and(|h| h <= lo) {
+            return false;
+        }
+        self.ranges.get(self.first_after(lo)).is_some_and(|(l, _)| hi.is_none_or(|hi| &l[..] < hi))
+    }
+
     /// The part of the set inside `[lo, hi)`.
     pub fn clip(&self, lo: &[u8], hi: Option<&[u8]>) -> KeyRanges {
         let mut out = KeyRanges::new();
-        for (l, h) in &self.ranges {
+        for (l, h) in &self.ranges[self.first_after(lo)..] {
+            if hi.is_some_and(|hi| hi <= &l[..]) {
+                break;
+            }
             let nl = if &l[..] < lo { Bytes::copy_from_slice(lo) } else { l.clone() };
             let nh = match (h, hi) {
                 (None, None) => None,
@@ -122,10 +151,44 @@ impl KeyRanges {
         out
     }
 
-    pub fn union(&mut self, other: &KeyRanges) {
-        for (l, h) in &other.ranges {
-            self.insert(l.clone(), h.clone());
+    /// The set of intervals given in order of their lower ends, joining
+    /// those that overlap or touch.
+    pub fn from_sorted(ranges: impl IntoIterator<Item = (Bytes, Option<Bytes>)>) -> Self {
+        let mut out: Vec<(Bytes, Option<Bytes>)> = Vec::new();
+        for (l, h) in ranges {
+            if h.as_ref().is_some_and(|h| *h <= l) {
+                continue;
+            }
+            match out.last_mut() {
+                // `last.1` is `Some` or the set already reaches the end.
+                Some(last) if last.1.as_ref().is_none_or(|lh| l <= *lh) => {
+                    debug_assert!(last.0 <= l, "ranges given out of order");
+                    last.1 = max_hi(last.1.take(), h);
+                }
+                _ => out.push((l, h)),
+            }
         }
+        Self { ranges: out }
+    }
+
+    /// Adds every interval of `other`, in time linear in both sets.
+    pub fn union(&mut self, other: &KeyRanges) {
+        if other.ranges.is_empty() {
+            return;
+        }
+        let (a, b) = (std::mem::take(&mut self.ranges), &other.ranges);
+        let mut merged = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() || j < b.len() {
+            if j == b.len() || (i < a.len() && a[i].0 <= b[j].0) {
+                merged.push(a[i].clone());
+                i += 1;
+            } else {
+                merged.push(b[j].clone());
+                j += 1;
+            }
+        }
+        *self = Self::from_sorted(merged);
     }
 
     pub fn check(&self) {
@@ -216,6 +279,47 @@ mod tests {
                 let inside = k[..] >= b"f"[..] && k[..] < b"p"[..];
                 assert_eq!(clipped.contains(&k), m && inside);
             }
+        }
+    }
+
+    /// The range queries, clipping and union match a bitmap over a small
+    /// key space, including unbounded ends.
+    #[test]
+    fn range_queries_match_bitmap() {
+        let mut rng = Rng::new(17);
+        let k = |i: u64| Bytes::from(vec![b'a' + i as u8]);
+        let bound = |i: u64| (i < 26).then(|| k(i));
+        let random_set = |rng: &mut Rng| {
+            let mut set = KeyRanges::new();
+            let mut model = [false; 26];
+            for _ in 0..rng.range(0, 6) {
+                let lo = rng.below(26);
+                let hi = rng.range(lo, 27);
+                set.insert(k(lo), bound(hi));
+                model[lo as usize..hi.min(26) as usize].iter_mut().for_each(|m| *m = true);
+            }
+            (set, model)
+        };
+        for _ in 0..2000 {
+            let (mut set, model) = random_set(&mut rng);
+            let lo = rng.below(26);
+            let hi = rng.range(0, 27);
+            let span = lo as usize..(hi.max(lo).min(26)) as usize;
+            assert_eq!(set.covers_range(&k(lo), bound(hi).as_deref()), model[span.clone()].iter().all(|&m| m));
+            assert_eq!(set.overlaps(&k(lo), bound(hi).as_deref()), model[span.clone()].iter().any(|&m| m));
+            let clipped = set.clip(&k(lo), bound(hi).as_deref());
+            clipped.check();
+            for i in 0..26 {
+                assert_eq!(clipped.contains(&k(i)), model[i as usize] && span.contains(&(i as usize)));
+            }
+            let (other, other_model) = random_set(&mut rng);
+            set.union(&other);
+            set.check();
+            for i in 0..26 {
+                assert_eq!(set.contains(&k(i)), model[i as usize] || other_model[i as usize]);
+            }
+            let rebuilt = KeyRanges::from_sorted(set.iter().cloned());
+            assert_eq!(rebuilt, set);
         }
     }
 
