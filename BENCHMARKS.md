@@ -13,6 +13,7 @@ Each section names its machine and setup. [How the benchmarks run](#how-the-benc
 - [Clock speed](#clock-speed)
 - [Compression](#compression)
 - [Large values](#large-values)
+- [Backups](#backups)
 - [fjall in these runs](#fjall-in-these-runs)
 - [How the benchmarks run](#how-the-benchmarks-run)
 
@@ -482,6 +483,64 @@ bench/blobs.sh bench-data/blobs 65536 250000 600000 4000000 400000 32 lz4 "liont
 bench/blobs.sh bench-data/blobs 32768 131072 65536 262144 26214 1 lz4 "lionturtle:0 lionturtle:1"
 ```
 
+## Backups
+
+Two stores on the workstation of [Compression](#compression), under a 4 GB memory cap that covers page cache, with LZ4, a 1 GB block cache, 128 MiB memtables and 16 client threads:
+
+- **Small rows:** 100M records of 8-byte keys and 120-byte values, 12.8 GB of user data in 9.4 GB of pages.
+- **Blobs:** 16,000 values of 1 MiB, 16.8 GB of user data in 8.5 GB of [blobs](DESIGN.md#blobs).
+
+Each was loaded and then overwritten by a minute of YCSB A. `bench/backup.sh` backs each up while it is quiet and while it serves A at a fixed rate, the backup starting 20 s in, and trims the drive before each run that writes much. The workstation's one drive held the stores and the backups, so a backup that was read and discarded stands for one sent to another machine: it costs the store's drive only reads. Each run ran once, and a range gives two runs.
+
+The tables set [the store's backup](DESIGN.md#backups), which copies one checkpoint's pages and blobs as they are stored, against streaming rows: one thread reads a snapshot through an iterator and writes its rows to a file in 1 MiB frames compressed with LZ4, and a restore writes them into a new store in batches of 256 from 16 threads. Every restored store returned the source's row count and a checksum over all of its rows.
+
+| Quiet store, no rate limit | Small rows: backup | Streamed rows | Blobs: backup | Streamed rows |
+|---|--:|--:|--:|--:|
+| Read and verify, copy discarded (s) | 3.1 | | 3.5 | |
+| To an archive file beside the store (s) | 6.2 | 89.5 | 6.3 | 16.7 |
+| To a store beside the store (s) | 5.7 | | 6.2 | |
+| CPU for the file (s) | 1.8 | 31.5 | 1.1 | 10.8 |
+| File size (GB) | 9.4 | 7.3 | 8.5 | 8.5 |
+| Restore from the file (s) | 4.6–4.9 | 30.1 | 4.4 | 5.1 |
+| CPU for the restore (s) | 2.7–2.9 | 92.8 | 2.4 | 12.9 |
+
+- **Rate.** One thread read and verified 3.0 GB/s of small-row pages and 2.4 GB/s of blobs. A backup decompresses nothing, so its CPU goes to checksums.
+- **Opening.** A copy opens as it is, and a restored archive is such a copy: the small-row store opened in 0.7 s, the time to read its tree's metadata, and the blob store in 0.01 s.
+- **What a rebuild buys.** A backup restores the tree as it was, buffers and free slots included. The store rebuilt from rows was 9.0 GB against 9.4, and a scan of all of it took 34 s against 75 s for the restored backup and 77 s for the source.
+
+Under load, the latency columns describe the seconds the backup ran: the p99 of the median second, the p99 of the 95th-percentile second, and the slowest operation. Updates on the small rows matched reads within 0.3 ms throughout.
+
+| Small rows, A at 500,000 ops/s | Backup (s) | Read p99, median second (ms) | 95th-percentile second (ms) | Slowest operation (ms) | Peak store growth (GB) |
+|---|--:|--:|--:|--:|--:|
+| No backup, seconds 20–64 | | 4.6–5.1 | 12–17 | 55–134 | 0.1–0.3 |
+| Backup at 256 MiB/s, discarded | 44 | 5.5–5.6 | 22–30 | 53–232 | 0.3 |
+| Backup unlimited, discarded | 8.0 | 5.3 | 39 | 45 | 0.1 |
+| Archive file beside the store, 100 MiB/s | 96 | 7.9 | 42 | 210 | 0.7 |
+| The same through the page cache | 110 | 14.2 | 409 | 784 | 1.0 |
+| Streamed rows to a file beside the store | 175 | 7.4 | 214 | 415 | 8.9 |
+
+| Blobs, A at 1,000 ops/s | Backup (s) | Update p99, median second (ms) | Read p99, median second (ms) | Slowest operation (ms) | Peak store size (GB) |
+|---|--:|--:|--:|--:|--:|
+| No backup | | 2.5 | 3.4–3.6 | 25–26 | 8.7 |
+| Backup at 256 MiB/s, discarded | 36 | 5.3–6.8 | 3.6 | 30–34 | 9.9–10.3 |
+| Backup unlimited, discarded | 4.5 | 6.5 | 3.5 | 23 | 9.0 |
+| Archive file beside the store, 200 MiB/s | 49 | 2.8 | 3.5 | 26 | 9.7 |
+| The same through the page cache | 50 | 8.6 | 4.1 | 692 | 10.4 |
+| Streamed rows to a file beside the store | 20 | 32 | 43 | 361 | 13.9 |
+
+- **At the default rate.** With the copy discarded, a backup at 256 MiB/s moved the median second's read p99 on small rows from 4.6–5.1 ms to 5.5–5.6 and the 95th-percentile second's from 12–17 ms to 22–30. Its slowest operation, 53 and 232 ms in the two runs, fell within what runs without a backup show over two minutes: 62 and 277 ms. On blobs, reads kept their latency and update p99 rose from 2.5 ms to 5.3–6.8.
+- **Starting.** A backup first waits for the writes before it to reach the tree: 2.1–3.0 s on the small rows and 0.16 s on the blobs. That checkpoint keeps its pace, and with the copy discarded the slowest second it produced had a p99 of 39 ms. Run at full speed, as `Db::checkpoint` runs one, it held p99 at 160 and 183 ms for its second in two runs.
+- **Disk space.** The backup holds a superseded page or blob only until it has read it. Clients overwrote about 9 GB of the 8.7 GB blob store during a 36 s backup, and the store peaked at 9.9–10.3 GB. A copy at 200 MiB/s that held a reader's version instead grew the same store to 20 GB in 43 s, and streamed rows, which read a snapshot, grew the small-row store from 10.8 to 19.6 GB.
+- **Beside the store.** A backup written to the store's drive shares it with the store's writes, and on this drive each of the store's syncs flushes the backup's writes too. An archive file at 100 MiB/s moved the median second's p99 on small rows to 7.9 ms, and on blobs 200 MiB/s left clients where they were. `Backup::archive_to` writes past the page cache: the same archive written through it, under a memory cap that counts it, held p99 over the backup at 445 ms on small rows and 477 ms on blobs.
+- **Unlimited.** With the copy discarded, an unlimited backup read 2.1 GB/s under load and moved small-row latency no more than the default rate did, for the five seconds it read. One thread reading front to back leaves the drive's queue to clients; a copy by four threads at 3.9 GB/s held client p99 at 0.8 s.
+
+```console
+cargo build --release -p kvbench
+# <dir> <value bytes> <records> <blob KiB> <A ops/s> <A seconds> <same-drive MiB/s> <output prefix>
+bench/backup.sh bench-data/backup 120 100000000 0 500000 260 100 small
+bench/backup.sh bench-data/backup 1048576 16000 32 1000 120 200 blob
+```
+
 ## fjall in these runs
 
 fjall trails here by more than its own benchmarks suggest, because these runs use 16–32 client threads and scan after update phases. Both stress parts of fjall's design:
@@ -499,6 +558,7 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 - RocksDB runs on jemalloc, its production allocator. lionturtle and fjall run on mimalloc.
 - kvbench turns off transparent huge pages for its process. mimalloc asks for them on its arenas, and under a memory cap they leave less of it for page cache: on C at 50M records with LZ4 under a 4 GB cap, lionturtle kept 1.2 GB of page cache with them and 2.3 GB without, and ran 37% faster without. Between two runs of `bench/compression.sh`, turning them off raised lionturtle's throughput after the load by 13–33% with LZ4 and 4–19% without, and moved RocksDB's by at most 7%. Reads during sustained writes, Clock speed and the workstation rows of Synchronous writes ran with them on; every other section ran with them off.
 - lionturtle's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
+- `--backup <mode>` backs a lionturtle store up, alone as the `backup` phase or starting `--backup-at <seconds>` into each timed phase: `archive` and `copy` are the store's backup, to an archive file and to a directory that opens as a store, and `rows` streams a snapshot's rows to a file. `--backup-mbps` sets the backup's rate, 0 for none. The `restore` and `restore-archive` phases rebuild a store, and `fingerprint` reads every row and prints their count and checksum.
 - `--blob-kb <n>` stores values of at least `n` KiB apart from each tree: it sets lionturtle's `blob_threshold`, and turns on RocksDB's BlobDB with that `min_blob_size`, its garbage collection, and the tree's compression on its blob files. Without it, lionturtle keeps every value in its tree. `--compression-ratio` fills a value a 32 KiB piece at a time, each piece repeating its random start, so LZ4, which finds repeats within 64 KiB, compresses values of any length to that ratio.
 - Latency runs need a quiet drive. Each read of an NVMe drive's temperature in `/sys/class/hwmon` sends the drive a SMART log request, and the workstation's drive holds reads about 3.4 ms behind each one; monitoring agents that poll every second put a floor under every second's p99. Eight ClickHouse processes, polling together, made that floor about 40 ms.
 - Runs on an SSD need it trimmed. A drive that has not been told which blocks were freed copies them during garbage collection, and on the workstation's drive, mounted without `discard` and trimmed weekly, identical runs drifted 30% apart after a few hundred GB of copies were written and deleted. Run `sudo fstrim /` before each run; after one full trim, six alternating runs of three builds landed within 2% of each other.

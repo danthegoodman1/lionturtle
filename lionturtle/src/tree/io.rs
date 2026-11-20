@@ -292,6 +292,18 @@ impl Pacer {
         *self.state.lock() = None;
     }
 
+    /// Brings the running checkpoint's deadline in to `within` from now, if
+    /// it had longer: for a caller that waits on the checkpoint, and would
+    /// rather it end soon than run at full speed.
+    pub fn finish_within(&self, within: Duration) {
+        if let Some(s) = self.state.lock().as_mut() {
+            let deadline = s.started.elapsed() + within;
+            if s.pace.target > deadline {
+                s.pace.target = deadline;
+            }
+        }
+    }
+
     /// Whether a checkpoint's I/O is on a schedule, so it favors client
     /// reads over its own speed. That holds past the schedule's deadline,
     /// until writers would wait and [`Pacer::stop`] lifts it: on a drive

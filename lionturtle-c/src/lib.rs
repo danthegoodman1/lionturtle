@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lionturtle::storage::FsStorage;
-use lionturtle::{Compression, Db, DbIter, Error, MemTableKind, Options, Result, Snapshot, TreeConfig, WriteOp};
+use lionturtle::{BackupInfo, BackupOptions, Compression, Db, DbIter, Error, MemTableKind, Options, Result, Snapshot, TreeConfig, WriteOp};
 
 /// The outcome of a call. A call that returns anything but LT_OK leaves a
 /// message for lt_last_error().
@@ -357,8 +357,7 @@ pub extern "C" fn lt_last_error() -> *const c_char {
 pub unsafe extern "C" fn lt_open(path: *const c_char, options: *const lt_options, db: *mut *mut lt_db) -> lt_status {
     call(|| {
         let out = unsafe { output(db) }?;
-        let path = unsafe { path.as_ref() }.ok_or_else(|| invalid("null path"))?;
-        let path = OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes());
+        let path = unsafe { self::path(path) }?;
         let opts = match unsafe { options.as_ref() } {
             Some(o) => o.to_options()?,
             None => Options::default(),
@@ -495,6 +494,128 @@ pub unsafe extern "C" fn lt_checkpoint_step(db: *mut lt_db, progressed: *mut boo
     call(|| unsafe {
         let out = progressed.as_mut().ok_or_else(|| invalid("null output pointer"))?;
         *out = handle(db)?.0.checkpoint_step()?;
+        Ok(())
+    })
+}
+
+/// How a backup runs. Start from lt_backup_options_default().
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct lt_backup_options {
+    /// Bytes per second the backup reads from the store, or 0 for as fast
+    /// as the drive allows. The default is 256 MiB/s.
+    pub rate_limit: u64,
+}
+
+/// What a backup holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct lt_backup_info {
+    /// The sequence number of the last write the backup holds.
+    pub seq: u64,
+    /// Node and data pages.
+    pub pages: u64,
+    pub blobs: u64,
+    /// Bytes of the pages and blobs as stored.
+    pub bytes: u64,
+}
+
+/// The file system path at `p`.
+unsafe fn path<'a>(p: *const c_char) -> Result<&'a OsStr> {
+    let p = unsafe { p.as_ref() }.ok_or_else(|| invalid("null path"))?;
+    Ok(OsStr::from_bytes(unsafe { CStr::from_ptr(p) }.to_bytes()))
+}
+
+unsafe fn backup_options(options: *const lt_backup_options) -> BackupOptions {
+    match unsafe { options.as_ref() } {
+        Some(o) => BackupOptions { rate_limit: (o.rate_limit > 0).then_some(o.rate_limit) },
+        None => BackupOptions::default(),
+    }
+}
+
+/// Reports `done` through `info`, which may be null.
+unsafe fn report(info: *mut lt_backup_info, done: BackupInfo) {
+    if let Some(out) = unsafe { info.as_mut() } {
+        *out = lt_backup_info { seq: done.seq, pages: done.pages, blobs: done.blobs, bytes: done.bytes };
+    }
+}
+
+/// The defaults: 256 MiB/s.
+#[unsafe(no_mangle)]
+pub extern "C" fn lt_backup_options_default() -> lt_backup_options {
+    lt_backup_options { rate_limit: BackupOptions::default().rate_limit.unwrap_or(0) }
+}
+
+/// Backs the store up into the directory `path`, which this creates if
+/// needed and which must hold nothing. The copy holds every write completed
+/// before this call and none made after it returns, and opens with
+/// lt_open(). Writes go on meanwhile. `options` may be null for the
+/// defaults, and `info` may be null; otherwise `*info` says what the backup
+/// holds. If the call fails, the directory refuses to open as a store.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_backup_to_dir(
+    db: *const lt_db,
+    path: *const c_char,
+    options: *const lt_backup_options,
+    info: *mut lt_backup_info,
+) -> lt_status {
+    call(|| unsafe {
+        let dest = FsStorage::new(self::path(path)?)?;
+        let done = handle(db)?.0.backup(backup_options(options))?.copy_to(Arc::new(dest))?;
+        report(info, done);
+        Ok(())
+    })
+}
+
+/// Backs the store up into an archive: the file `path`, which this creates
+/// or replaces, holds the backup end to end, for lt_restore_from_file(). It
+/// holds what a copy by lt_backup_to_dir() would, and is written past the
+/// page cache where the file system allows. `options` and `info` are as
+/// there. If the call fails, it removes the file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_backup_to_file(
+    db: *const lt_db,
+    path: *const c_char,
+    options: *const lt_backup_options,
+    info: *mut lt_backup_info,
+) -> lt_status {
+    call(|| unsafe {
+        let path = std::path::Path::new(self::path(path)?);
+        let name = path.file_name().and_then(OsStr::to_str).ok_or_else(|| invalid("the archive's path must end in a UTF-8 file name"))?;
+        let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        let backup = handle(db)?.0.backup(backup_options(options))?;
+        let written = backup.archive_to(&FsStorage::new(dir)?, name);
+        if written.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        report(info, written?);
+        Ok(())
+    })
+}
+
+/// Restores the archive in the file `archive` into the directory `path`,
+/// which this creates if needed and which must hold nothing. The directory
+/// then opens with lt_open() as the store the archive holds. Every page and
+/// blob is verified on the way. `info` may be null. If the call fails, the
+/// directory refuses to open as a store.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_restore_from_file(archive: *const c_char, path: *const c_char, info: *mut lt_backup_info) -> lt_status {
+    call(|| unsafe {
+        let archive = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(self::path(archive)?)?);
+        let dest = FsStorage::new(self::path(path)?)?;
+        report(info, lionturtle::backup::restore(archive, Arc::new(dest))?);
+        Ok(())
+    })
+}
+
+/// Checks the archive in the file `archive` from end to end: that it is
+/// complete, and that every page and blob in it passes its checksums.
+/// `info` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lt_verify_backup_file(archive: *const c_char, info: *mut lt_backup_info) -> lt_status {
+    call(|| unsafe {
+        let archive = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(self::path(archive)?)?);
+        report(info, lionturtle::backup::verify(archive)?);
         Ok(())
     })
 }

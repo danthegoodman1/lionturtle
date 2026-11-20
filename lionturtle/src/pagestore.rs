@@ -42,8 +42,11 @@ use crate::page::PageId;
 use crate::storage::{DIRECT_ALIGN, File, Storage};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+    Ordering::SeqCst,
+};
 use std::sync::{Arc, OnceLock};
 
 pub const MIN_SLOT: u64 = 4096;
@@ -100,11 +103,11 @@ pub fn class_for(len: u64) -> Option<u8> {
 }
 
 /// The file name prefix of the arenas that hold the tree's pages.
-const PAGES: &str = "pages";
+pub const PAGES: &str = "pages";
 /// The file name prefix of the arenas that hold blobs; see [`crate::blob`].
 pub const BLOBS: &str = "blobs";
 
-fn arena_name(prefix: &str, class: u8) -> String {
+pub(crate) fn arena_name(prefix: &str, class: u8) -> String {
     format!("{prefix}-{class:02}.dat")
 }
 
@@ -176,6 +179,21 @@ pub struct PageStore {
     /// Whether a slot may be reused by an image somewhat shorter than the
     /// one it held; see [`REUSE_SLACK`].
     reuse_shorter: bool,
+    /// Slots that backups have yet to copy; see [`PageStore::pin`].
+    pins: Mutex<HashMap<(u8, u32), Pin>>,
+    /// How many slots are pinned, so a free takes the pin lock only while a
+    /// backup runs.
+    pinned: AtomicUsize,
+}
+
+/// A slot some backup has yet to copy.
+#[derive(Default)]
+struct Pin {
+    /// Backups that hold the slot.
+    holders: u32,
+    /// The slot's page, once the tree has dropped it. It is released when
+    /// the last holder lets go.
+    freed: Option<PagePtr>,
 }
 
 impl PageStore {
@@ -259,6 +277,8 @@ impl PageStore {
             freed: Mutex::new(Vec::new()),
             reclaims: AtomicU64::new(0),
             prefetcher,
+            pins: Mutex::new(HashMap::new()),
+            pinned: AtomicUsize::new(0),
         })
     }
 
@@ -317,9 +337,64 @@ impl PageStore {
     }
 
     /// Queues slots for release. This is cheap, so any thread may call it;
-    /// [`PageStore::reclaim`] does the I/O.
+    /// [`PageStore::reclaim`] does the I/O. A slot a backup has yet to copy
+    /// waits for the backup instead; see [`PageStore::pin`].
     pub fn free(&self, ptrs: impl IntoIterator<Item = PagePtr>) {
-        self.freed.lock().extend(ptrs);
+        if self.pinned.load(SeqCst) == 0 {
+            self.freed.lock().extend(ptrs);
+            return;
+        }
+        let mut pins = self.pins.lock();
+        let mut freed = self.freed.lock();
+        for ptr in ptrs {
+            match pins.get_mut(&(ptr.class, ptr.slot)) {
+                Some(pin) => pin.freed = Some(ptr),
+                None => freed.push(ptr),
+            }
+        }
+    }
+
+    /// Holds `slots` for a backup: a held slot keeps its page, though the
+    /// tree drops it, until [`PageStore::unpin`] lets it go. The caller
+    /// holds a version of the tree that references every one of them, so
+    /// none can be freed before this returns.
+    ///
+    /// A backup reads each slot once, in an order it knows, so it holds a
+    /// slot only until it has copied it, and never holds a page written
+    /// after it began. Holding a version instead would keep every page and
+    /// blob superseded while the backup ran: copying a blob store at 200
+    /// MiB/s while clients overwrote it at 250 MB/s grew it from 8.7 to
+    /// 20 GB, and with pins it peaked at 9.7 GB.
+    pub fn pin(&self, slots: impl IntoIterator<Item = (u8, u32)>) {
+        let mut pins = self.pins.lock();
+        for slot in slots {
+            pins.entry(slot).or_default().holders += 1;
+        }
+        self.pinned.store(pins.len(), SeqCst);
+    }
+
+    /// Lets go of a slot one backup held, and queues it for release if the
+    /// tree dropped its page meanwhile and no other backup holds it.
+    pub fn unpin(&self, class: u8, slot: u32) {
+        let mut pins = self.pins.lock();
+        let Some(pin) = pins.get_mut(&(class, slot)) else { return };
+        pin.holders -= 1;
+        if pin.holders == 0 {
+            if let Some(ptr) = pins.remove(&(class, slot)).and_then(|pin| pin.freed) {
+                self.freed.lock().push(ptr);
+            }
+            self.pinned.store(pins.len(), SeqCst);
+        }
+    }
+
+    /// Reads `buf.len()` bytes at `offset` within the slot of `ptr`, past
+    /// the page cache where the storage allows. The address and length of
+    /// `buf`, and `offset`, must be multiples of [`DIRECT_ALIGN`]. A slot
+    /// holds its image padded to that, so a read may run to the padded end.
+    pub fn read_direct(&self, ptr: &PagePtr, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let (file, _) = self.direct_file(ptr.class)?;
+        file.read_exact_at(buf, ptr.offset() + offset)?;
+        Ok(())
     }
 
     /// Makes freed slots allocatable, dropping their pages from the page
@@ -549,7 +624,9 @@ impl PageStore {
 
     /// Slots in use per class, for leak checks.
     pub fn allocated(&self) -> Vec<(u8, u32)> {
-        let freed: BTreeSet<(u8, u32)> = self.freed.lock().iter().map(|p| (p.class, p.slot)).collect();
+        let mut freed: BTreeSet<(u8, u32)> =
+            self.pins.lock().iter().filter(|(_, pin)| pin.freed.is_some()).map(|(&slot, _)| slot).collect();
+        freed.extend(self.freed.lock().iter().map(|p| (p.class, p.slot)));
         let alloc = self.alloc.lock();
         let mut out = Vec::new();
         for (class, a) in alloc.iter().enumerate() {
@@ -611,7 +688,10 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    fn encode(&self) -> Vec<u8> {
+    /// Bytes of an encoded superblock.
+    pub(crate) const ENCODED_LEN: usize = SUPER_SLOT as usize;
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         for v in [self.checkpoint_id, self.last_seq, self.last_memtable_id, self.next_page_id] {
             payload.extend_from_slice(&v.to_le_bytes());
@@ -644,7 +724,9 @@ impl Superblock {
         out
     }
 
-    fn decode(b: &[u8]) -> Option<Self> {
+    /// Decodes [`Superblock::ENCODED_LEN`] bytes, or returns `None` if they
+    /// fail their checksum or come from a version this one cannot read.
+    pub(crate) fn decode(b: &[u8]) -> Option<Self> {
         let magic = u64::from_le_bytes(b[0..8].try_into().unwrap());
         let crc = u32::from_le_bytes(b[8..12].try_into().unwrap());
         let len = u32::from_le_bytes(b[12..16].try_into().unwrap()) as usize;
@@ -800,6 +882,43 @@ mod tests {
             assert!(loaded.last_seq == 10 || loaded.last_seq == 20);
             assert!(loaded.root.is_some());
         }
+    }
+
+    /// A slot a backup holds keeps its page when the tree drops it, counts
+    /// as freed for the leak check, and is released when the last backup
+    /// that holds it lets go.
+    #[test]
+    fn a_pinned_slot_is_released_when_its_last_holder_lets_go() {
+        let store = PageStore::open(Arc::new(SimStorage::new(1, FaultConfig::default())), &[]).unwrap();
+        let ptrs: Vec<PagePtr> = (0..4).map(|id| store.allocate(id, 5000, 0).unwrap()).collect();
+        let slot = |p: &PagePtr| (p.class, p.slot);
+        let allocated = |store: &PageStore| -> BTreeSet<(u8, u32)> { store.allocated().into_iter().collect() };
+        // Two backups hold slots 0 and 1; the second also holds slot 2.
+        store.pin([slot(&ptrs[0]), slot(&ptrs[1])]);
+        store.pin([slot(&ptrs[0]), slot(&ptrs[1]), slot(&ptrs[2])]);
+        store.free([ptrs[0], ptrs[3]]);
+        store.reclaim();
+        // Slot 3 is free. Slot 0 counts as freed, and nothing takes it.
+        assert_eq!(allocated(&store), [slot(&ptrs[1]), slot(&ptrs[2])].into_iter().collect());
+        let next = store.allocate(9, 5000, 0).unwrap();
+        assert_eq!(slot(&next), slot(&ptrs[3]));
+        store.unpin(ptrs[0].class, ptrs[0].slot);
+        store.reclaim();
+        assert_ne!(slot(&store.allocate(10, 5000, 0).unwrap()), slot(&ptrs[0]));
+        // The last holder lets go: the slot is released and reused.
+        store.unpin(ptrs[0].class, ptrs[0].slot);
+        store.reclaim();
+        assert_eq!(slot(&store.allocate(11, 5000, 0).unwrap()), slot(&ptrs[0]));
+        // A slot let go while its page lives stays allocated, and frees as
+        // any other afterwards.
+        store.unpin(ptrs[1].class, ptrs[1].slot);
+        store.unpin(ptrs[1].class, ptrs[1].slot);
+        store.unpin(ptrs[2].class, ptrs[2].slot);
+        assert!(allocated(&store).contains(&slot(&ptrs[1])));
+        store.free([ptrs[1]]);
+        store.reclaim();
+        assert!(!allocated(&store).contains(&slot(&ptrs[1])));
+        assert_eq!(store.pinned.load(SeqCst), 0);
     }
 
     /// Marking writes both slots, so a reader that knows only the old magic

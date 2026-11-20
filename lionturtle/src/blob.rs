@@ -135,9 +135,9 @@ fn checksum(id: PageId, body: &[u8]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(&id.to_le_bytes()), body)
 }
 
-/// The value of the blob at `ptr`, verified, from `stored`, its bytes as
-/// read from its slot.
-pub fn decode(ptr: &BlobPtr, stored: Bytes) -> Result<Bytes> {
+/// Checks `stored`, the bytes read from the slot of `ptr`, against the
+/// pointer and the blob's checksum, and returns how its payload is stored.
+fn check(ptr: &BlobPtr, stored: &[u8]) -> Result<u32> {
     let word = |at: usize| u32::from_le_bytes(stored[at..at + 4].try_into().unwrap());
     if stored.len() != ptr.len as usize || stored.len() < HEADER {
         return Err(corruption(format!("blob {} has the wrong length", ptr.id)));
@@ -150,12 +150,28 @@ pub fn decode(ptr: &BlobPtr, stored: Bytes) -> Result<Bytes> {
         return Err(corruption(format!("blob {} does not match its pointer", ptr.id)));
     }
     match kind {
-        KIND_RAW if payload_len == raw_len => Ok(stored.slice(HEADER..)),
-        KIND_LZ4 => match lz4_flex::block::decompress(&stored[HEADER..], raw_len) {
-            Ok(raw) if raw.len() == raw_len => Ok(Bytes::from(raw)),
-            _ => Err(corruption(format!("blob {} does not decompress", ptr.id))),
-        },
+        KIND_RAW if payload_len == raw_len => Ok(kind),
+        KIND_LZ4 => Ok(kind),
         _ => Err(corruption(format!("blob {} is of an unknown kind", ptr.id))),
+    }
+}
+
+/// Verifies the blob at `ptr` as it is stored, without decompressing it. A
+/// backup checks each blob this way as it copies it.
+pub fn verify(ptr: &BlobPtr, stored: &[u8]) -> Result<()> {
+    check(ptr, stored).map(|_| ())
+}
+
+/// The value of the blob at `ptr`, verified, from `stored`, its bytes as
+/// read from its slot.
+pub fn decode(ptr: &BlobPtr, stored: Bytes) -> Result<Bytes> {
+    if check(ptr, &stored)? == KIND_RAW {
+        return Ok(stored.slice(HEADER..));
+    }
+    let raw_len = ptr.raw_len as usize;
+    match lz4_flex::block::decompress(&stored[HEADER..], raw_len) {
+        Ok(raw) if raw.len() == raw_len => Ok(Bytes::from(raw)),
+        _ => Err(corruption(format!("blob {} does not decompress", ptr.id))),
     }
 }
 
@@ -237,6 +253,22 @@ mod tests {
         assert!(decode(&BlobPtr { id: 6, ..ptr }, bytes.clone()).is_err());
         assert!(decode(&BlobPtr { raw_len: ptr.raw_len + 1, ..ptr }, bytes.clone()).is_err());
         assert!(decode(&ptr, bytes.slice(..bytes.len() - 1)).is_err());
+    }
+
+    #[test]
+    fn verify_agrees_with_decode() {
+        for value in [vec![7u8; 100_000], noise(100_000)] {
+            let (ptr, bytes) = stored(5, &value, true);
+            verify(&ptr, &bytes).unwrap();
+            for at in [0, 5, 9, 13, HEADER, bytes.len() - 1] {
+                let mut flipped = bytes.to_vec();
+                flipped[at] ^= 1;
+                assert!(verify(&ptr, &flipped).is_err(), "byte {at}");
+            }
+            assert!(verify(&BlobPtr { id: 6, ..ptr }, &bytes).is_err());
+            assert!(verify(&BlobPtr { raw_len: ptr.raw_len + 1, ..ptr }, &bytes).is_err());
+            assert!(verify(&ptr, &bytes[..bytes.len() - 1]).is_err());
+        }
     }
 
     #[test]

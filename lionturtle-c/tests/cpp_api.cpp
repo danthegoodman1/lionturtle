@@ -94,6 +94,29 @@ int main(int argc, char **argv) {
     CHECK(!db.prefix("t").next());
     db.checkpoint();
     CHECK(!db.get("t3-3") && db.get("u-kept"));
+
+    // Backups: a copy that opens as a store, and an archive that restores
+    // to one. Each holds the writes made before it and none after.
+    const std::string dir = argv[1];
+    lt_backup_options fast = lt_backup_options_default();
+    fast.rate_limit = 0;
+    const lt_backup_info info = db.backup_to_dir(dir + "-copy", fast);
+    CHECK(info.pages > 0 && info.bytes > 0);
+    CHECK(db.backup_to_file(dir + "-archive").seq == info.seq);
+    db.put("later", "z");
+    CHECK(lionturtle::verify_backup(dir + "-archive").bytes == info.bytes);
+    CHECK(lionturtle::restore(dir + "-archive", dir + "-restored").seq == info.seq);
+    bool threw = false;
+    try {
+      db.backup_to_dir(dir + "-copy");
+    } catch (const lionturtle::Error &e) {
+      threw = e.status() == LT_INVALID_ARGUMENT;
+    }
+    CHECK(threw);
+    for (const char *suffix : {"-copy", "-restored"}) {
+      Db copy(dir + suffix);
+      CHECK(copy.get("u-kept")->str() == "y" && copy.get("b")->str() == "2" && !copy.get("later"));
+    }
   }
   std::puts("cpp_api: ok");
   return 0;

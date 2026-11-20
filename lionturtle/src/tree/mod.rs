@@ -39,7 +39,7 @@ use codec::{Reader, put_bytes};
 use cursor::{LevelCursor, Merger, PageCursor, ReadMode, Source, merge_span};
 use io::{DataPage, PageIo};
 use ranges::KeyRanges;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -1311,10 +1311,11 @@ struct DecodedNode {
     levels: Vec<Vec<(PagePtr, Bytes, Option<Bytes>, KeyRanges)>>,
 }
 
-fn decode_node(raw: &Bytes, id: PageId) -> Result<DecodedNode> {
-    let bad = || corruption(format!("node page {id} is malformed"));
+/// Verifies a node page as it is stored: its magic, checksum and id. A
+/// backup checks each node this way as it copies it.
+pub fn verify_node(raw: &[u8], id: PageId) -> Result<()> {
     if raw.len() < 16 || u32::from_le_bytes(raw[0..4].try_into().unwrap()) != NODE_MAGIC {
-        return Err(bad());
+        return Err(corruption(format!("node page {id} is malformed")));
     }
     if u32::from_le_bytes(raw[4..8].try_into().unwrap()) != crc32c::crc32c(&raw[8..]) {
         return Err(corruption(format!("node page {id} checksum mismatch")));
@@ -1322,6 +1323,12 @@ fn decode_node(raw: &Bytes, id: PageId) -> Result<DecodedNode> {
     if u64::from_le_bytes(raw[8..16].try_into().unwrap()) != id {
         return Err(corruption(format!("expected node page {id}")));
     }
+    Ok(())
+}
+
+fn decode_node(raw: &Bytes, id: PageId) -> Result<DecodedNode> {
+    let bad = || corruption(format!("node page {id} is malformed"));
+    verify_node(raw, id)?;
     let body = raw.slice(16..);
     let mut r = Reader::new(&body);
     let parse = |r: &mut Reader| -> Option<DecodedNode> {
@@ -1673,6 +1680,40 @@ fn load_subtree(io: &PageIo, ptr: PagePtr, height: u32, pages: &mut HashMap<Page
     let node = Node { height, pivots: d.pivots, hi: d.hi, children, pending, levels, ptr: OnceLock::new() };
     node.ptr.set(ptr).unwrap();
     Ok(Subtree::Node(Arc::new(node)))
+}
+
+/// What a written tree holds on disk: its node pages, its data pages, and
+/// the blobs those list, each once.
+#[derive(Default)]
+pub struct Images {
+    pub nodes: Vec<PagePtr>,
+    pub pages: Vec<PagePtr>,
+    pub blobs: Vec<crate::blob::BlobPtr>,
+}
+
+/// The images of the tree under `t`, every page of which is written.
+pub fn images(t: &Subtree) -> Images {
+    fn walk(t: &Subtree, nodes: &mut HashSet<PagePtr>, pages: &mut HashMap<PagePtr, Arc<DataPage>>) {
+        let mut data_page = |p: &Arc<DataPage>| {
+            pages.entry(p.ptr().expect("reachable pages are written")).or_insert_with(|| p.clone());
+        };
+        match t {
+            Subtree::Leaf(p) => data_page(p),
+            Subtree::Node(n) => {
+                if !nodes.insert(n.ptr().expect("reachable nodes are written")) {
+                    return;
+                }
+                n.levels.iter().flatten().for_each(|seg| data_page(&seg.page));
+                for c in &n.children {
+                    walk(c, nodes, pages);
+                }
+            }
+        }
+    }
+    let (mut nodes, mut pages) = (HashSet::new(), HashMap::new());
+    walk(t, &mut nodes, &mut pages);
+    let blobs: HashSet<crate::blob::BlobPtr> = pages.values().flat_map(|p| p.meta.blobs()).collect();
+    Images { nodes: nodes.into_iter().collect(), pages: pages.into_keys().collect(), blobs: blobs.into_iter().collect() }
 }
 
 /// Every page location the tree references, added to `out`, and each data

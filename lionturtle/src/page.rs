@@ -812,6 +812,37 @@ pub fn inflate_into(stored: &[u8], page_id: PageId, out: &mut [u8]) -> Result<()
     }
 }
 
+/// Verifies a data page as it is stored: its metadata region, which starts
+/// at `meta_off`, and the checksum of every block, without decompressing
+/// any. A backup checks each page this way as it copies it.
+pub fn verify_stored(stored: &[u8], page_id: PageId, meta_off: u32) -> Result<()> {
+    let Some(region) = stored.get(meta_off as usize..) else {
+        return Err(corruption(format!("page {page_id} metadata starts past its end")));
+    };
+    let meta = PageMeta::decode(Bytes::copy_from_slice(region), page_id)?;
+    if meta.meta_off != meta_off {
+        return Err(corruption(format!("page {page_id} metadata does not match its pointer")));
+    }
+    let short = || corruption(format!("page {page_id} block out of range"));
+    for i in 0..meta.n_blocks as usize {
+        if meta.map_off != 0 {
+            let end = if i + 1 < meta.n_blocks as usize { meta.stored_offset(i + 1) } else { meta_off };
+            let block = stored.get(meta.stored_offset(i) as usize..end as usize).ok_or_else(short)?;
+            if compressed_payload(block, page_id)?.is_none() && u32_at(block, 0) != block_crc(page_id, &block[4..]) {
+                return Err(corruption(format!("page {page_id} block checksum mismatch")));
+            }
+        } else {
+            let info = meta.block(i);
+            let end = info.offset as usize + info.len as usize;
+            let block = stored.get(info.offset as usize..end).filter(|_| end <= meta_off as usize).ok_or_else(short)?;
+            if block.len() < BLOCK_HEADER || u32_at(block, 0) != block_crc(page_id, &block[4..]) {
+                return Err(corruption(format!("page {page_id} block checksum mismatch")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fills in the checksum of every block of `image`, a copy of a page's
 /// image about to be written as it is.
 pub fn seal_blocks(image: &mut [u8], meta: &PageMeta) {
@@ -1165,6 +1196,44 @@ mod tests {
                 assert_eq!(back.len(), want.len());
                 assert_eq!(back.entry(back.len() - 1), want.entry(want.len() - 1));
             }
+        }
+    }
+
+    /// A stored page verifies whole, in either stored form, and a flipped
+    /// bit in a block or in the metadata fails it.
+    #[test]
+    fn verify_stored_finds_damage_in_blocks_and_metadata() {
+        let compressed = store(&build_patterned(2000, 120, 8, Some(2 * BLOCK_SIZE)));
+        let unshrunk = store(&build_patterned(200, 120, 120, Some(BLOCK_SIZE)));
+        let image = {
+            let page = build_patterned(2000, 120, 8, None);
+            let mut bytes = page.bytes.to_vec();
+            seal_blocks(&mut bytes, &page.meta);
+            (bytes, page.meta)
+        };
+        for (stored, meta) in [compressed, unshrunk, image] {
+            verify_stored(&stored, 7, meta.meta_off).unwrap();
+            let n = meta.n_blocks as usize;
+            let block = |i: usize| if meta.map_off != 0 { meta.stored_offset(i) as usize } else { meta.block(i).offset as usize };
+            let meta_at = meta.meta_off as usize;
+            for at in [
+                block(0),
+                block(0) + 5,
+                block(n / 2) + 9,
+                block(n - 1) + 17,
+                meta_at,
+                meta_at + 9,
+                stored.len() - FOOTER_LEN + 5,
+                stored.len() - 1,
+            ] {
+                let mut bad = stored.clone();
+                bad[at] ^= 0x10;
+                assert!(verify_stored(&bad, 7, meta.meta_off).is_err(), "flip at {at} of {}", stored.len());
+            }
+            assert!(verify_stored(&stored, 8, meta.meta_off).is_err(), "wrong page id");
+            assert!(verify_stored(&stored, 7, meta.meta_off + 4096).is_err(), "wrong metadata offset");
+            assert!(verify_stored(&stored[..stored.len() - 1], 7, meta.meta_off).is_err(), "truncated");
+            assert!(verify_stored(&stored[..meta_at], 7, meta.meta_off).is_err(), "without metadata");
         }
     }
 
