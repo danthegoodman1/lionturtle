@@ -18,9 +18,13 @@
 //!   model's state when it was taken, whatever is written since;
 //! - a long-lived iterator, forward or reverse, over a range or a prefix,
 //!   returns exactly the model's entries in its range as of its snapshot;
-//! - tree invariants hold, and no page slot leaks.
+//! - a backup holds every completed write when it starts, and, copied or
+//!   archived and restored any number of steps later, opens as a store with
+//!   the model's state as of its start; a read fault on the way fails it;
+//! - tree invariants hold, and no page slot leaks, backups in hand or not.
 
 use super::{FaultConfig, Rng, SimStorage};
+use crate::backup::{self, Backup, BackupOptions};
 use crate::db::{Db, DbIter, Options, Snapshot};
 use crate::error::Error;
 use crate::memtable::MemTableKind;
@@ -40,6 +44,10 @@ pub struct Report {
     pub reads: u64,
     pub scans: u64,
     pub snapshots: u64,
+    /// Backups copied or restored and found equal to the model, and backups
+    /// that a read fault failed.
+    pub backups: u64,
+    pub failed_backups: u64,
     pub iterators: u64,
     pub crashes: u64,
     pub reopens: u64,
@@ -153,6 +161,13 @@ struct Snap {
     state: State,
 }
 
+/// A backup started and not yet copied, and the model's state when it
+/// started.
+struct Held {
+    backup: Backup,
+    state: State,
+}
+
 struct Sim {
     rng: Rng,
     disk: SimStorage,
@@ -168,6 +183,7 @@ struct Sim {
     compressible: bool,
     iters: Vec<Iter>,
     snaps: Vec<Snap>,
+    backups: Vec<Held>,
     report: Report,
     verbose: bool,
 }
@@ -267,6 +283,7 @@ impl Sim {
             compressible,
             iters: Vec::new(),
             snaps: Vec::new(),
+            backups: Vec::new(),
             report: Report::default(),
             verbose,
         }
@@ -411,6 +428,7 @@ impl Sim {
     fn crash_and_recover(&mut self) -> Result<(), String> {
         self.iters.clear();
         self.snaps.clear();
+        self.backups.clear();
         self.close();
         self.disk.crash();
         self.report.crashes += 1;
@@ -432,6 +450,7 @@ impl Sim {
     fn clean_reopen(&mut self) -> Result<(), String> {
         self.iters.clear();
         self.snaps.clear();
+        self.backups.clear();
         let poisoned = self.db().is_poisoned();
         self.close();
         if poisoned {
@@ -685,8 +704,101 @@ impl Sim {
         Ok(())
     }
 
+    /// Starts a backup, which must hold every completed write, and finishes
+    /// it at once or holds it for [`Sim::step_held_backup`], while later
+    /// steps overwrite and free what it holds.
+    fn step_backup(&mut self) -> Result<(), String> {
+        let held = match self.db().backup(BackupOptions { rate_limit: None }) {
+            Ok(backup) if backup.seq() != self.model.last_seq => {
+                return Err(format!("backup at seq {}, last write {}", backup.seq(), self.model.last_seq));
+            }
+            Ok(backup) => Held { backup, state: self.model.state.clone() },
+            // A backup starts with a checkpoint, which a fault fails.
+            Err(_) => return self.crash_and_recover(),
+        };
+        if self.backups.len() < 2 && self.rng.chance(0.5) {
+            self.backups.push(held);
+            return Ok(());
+        }
+        self.finish_backup_either_way(held)
+    }
+
+    /// Finishes one of the backups in hand.
+    fn step_held_backup(&mut self) -> Result<(), String> {
+        let i = self.rng.below(self.backups.len() as u64) as usize;
+        let held = self.backups.swap_remove(i);
+        self.finish_backup_either_way(held)
+    }
+
+    /// Finishes a backup, half the time with the source reading cleanly, so
+    /// that stores under read faults finish backups too.
+    fn finish_backup_either_way(&mut self, held: Held) -> Result<(), String> {
+        match self.rng.chance(0.5) {
+            true => self.quietly(|s| s.finish_backup(held)),
+            false => self.finish_backup(held),
+        }
+    }
+
+    /// Copies a backup to a second disk, directly or through an archive,
+    /// and checks that the result opens as a store with the model's state
+    /// as of the backup's start. A read fault on the source fails the
+    /// backup and leaves nothing to check.
+    fn finish_backup(&mut self, held: Held) -> Result<(), String> {
+        let Held { mut backup, state } = held;
+        let info = backup.info();
+        let dest = SimStorage::new(self.rng.next_u64(), FaultConfig::default());
+        let copied = if self.rng.chance(0.5) {
+            backup.copy_to(Arc::new(dest.clone()))
+        } else {
+            let mut archive = Vec::new();
+            match std::io::Read::read_to_end(&mut backup, &mut archive) {
+                // An archive read without error is whole.
+                Ok(_) => {
+                    backup::verify(&archive[..]).map_err(|e| format!("backup archive does not verify: {e}"))?;
+                    Ok(backup::restore(&archive[..], Arc::new(dest.clone()))
+                        .map_err(|e| format!("backup archive does not restore: {e}"))?)
+                }
+                Err(e) => Err(Error::Io(e)),
+            }
+        };
+        match copied {
+            Ok(done) if done != info => return Err(format!("backup finished as {done:?}, started as {info:?}")),
+            Ok(_) => {}
+            Err(Error::Io(_)) | Err(Error::Corruption(_)) => {
+                self.report.failed_backups += 1;
+                return Ok(());
+            }
+            Err(e) => return Err(format!("backup failed: {e}")),
+        }
+        let db = Db::open(Arc::new(dest), self.opts.clone()).map_err(|e| format!("backup does not open: {e}"))?;
+        if db.last_seq() != info.seq {
+            return Err(format!("backup opened at seq {}, taken at {}", db.last_seq(), info.seq));
+        }
+        let got = db.scan(b"", None, usize::MAX).map_err(|e| format!("backup does not scan: {e}"))?;
+        if got.len() != state.len() || !got.iter().zip(&state).all(|((gk, gv), (ek, ev))| gk[..] == ek[..] && gv[..] == ev[..]) {
+            let differs = got.iter().zip(&state).find(|((gk, gv), (ek, ev))| gk[..] != ek[..] || gv[..] != ev[..]);
+            return Err(format!("backup has {} entries, the model had {}; first difference: {differs:?}", got.len(), state.len()));
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.check_invariants())) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("backup fails its invariant check: {e}")),
+            Err(p) => {
+                let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
+                return Err(format!("backup fails its invariant check: {}", msg.unwrap_or_default()));
+            }
+        }
+        self.report.backups += 1;
+        Ok(())
+    }
+
     fn step(&mut self) -> Result<(), String> {
         self.report.steps += 1;
+        // A backup in hand is finished some steps after it started: long
+        // enough for writes and checkpoints to supersede what it holds, and
+        // soon enough that a crash rarely comes first.
+        if !self.backups.is_empty() && self.rng.chance(0.08) {
+            self.step_held_backup()?;
+        }
         let r = self.rng.below(1000);
         match r {
             0..300 => {
@@ -722,7 +834,7 @@ impl Sim {
                 let sync = self.rng.chance(0.2);
                 self.write(ops, sync)
             }
-            430..650 => {
+            430..638 => {
                 let k = if self.rng.chance(0.9) { self.key() } else { b"missing-key".to_vec() };
                 let snap = self.pick_snapshot();
                 self.verify_get(&k, snap)
@@ -734,6 +846,7 @@ impl Sim {
                 let snap = self.pick_snapshot();
                 self.verify_scan(&start, end.as_deref(), limit, snap)
             }
+            638..650 => self.step_backup(),
             710..740 => self.step_snapshot(),
             740..770 => {
                 let r = self.db().sync();
@@ -796,6 +909,7 @@ fn run_inner(seed: u64, steps: u64, verbose: bool) -> Result<Report, String> {
     }
     sim.iters.clear();
     sim.snaps.clear();
+    sim.backups.clear();
     sim.disk.disarm_crash();
     sim.check_invariants().map_err(|e| format!("seed {seed} final: {e}"))?;
     sim.verify_all().map_err(|e| format!("seed {seed} final: {e}"))?;

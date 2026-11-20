@@ -33,6 +33,8 @@ fn main() {
                 total.reads += r.reads;
                 total.scans += r.scans;
                 total.snapshots += r.snapshots;
+                total.backups += r.backups;
+                total.failed_backups += r.failed_backups;
                 total.iterators += r.iterators;
                 total.read_errors += r.read_errors;
                 total.max_height = total.max_height.max(r.max_height);
@@ -48,7 +50,7 @@ fn main() {
         }
     }
     println!(
-        "{count} seeds ok in {:.1}s: {} steps, {} writes ({} range deletes), {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}, {} blobs written, {} blob reads, up to {} blobs live",
+        "{count} seeds ok in {:.1}s: {} steps, {} writes ({} range deletes), {} reads, {} scans, {} snapshots, {} backups ({} failed by read faults), {} iterators, {} crashes, {} read faults, max height {}, {} blobs written, {} blob reads, up to {} blobs live",
         started.elapsed().as_secs_f64(),
         total.steps,
         total.writes,
@@ -56,6 +58,8 @@ fn main() {
         total.reads,
         total.scans,
         total.snapshots,
+        total.backups,
+        total.failed_backups,
         total.iterators,
         total.crashes,
         total.read_errors,

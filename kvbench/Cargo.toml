@@ -18,6 +18,8 @@ hdrhistogram = "7"
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 lionturtle = { path = "../lionturtle" }
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "checked-decode"] }
+crc32c = "0.6"
 rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4"] }
 scylla = { version = "1.9", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }

@@ -175,6 +175,36 @@ typedef struct lt_options {
 } lt_options;
 
 /**
+ * How a backup runs. Start from lt_backup_options_default().
+ */
+typedef struct lt_backup_options {
+  /**
+   * Bytes per second the backup reads from the store, or 0 for as fast
+   * as the drive allows. The default is 256 MiB/s.
+   */
+  uint64_t rate_limit;
+} lt_backup_options;
+
+/**
+ * What a backup holds.
+ */
+typedef struct lt_backup_info {
+  /**
+   * The sequence number of the last write the backup holds.
+   */
+  uint64_t seq;
+  /**
+   * Node and data pages.
+   */
+  uint64_t pages;
+  uint64_t blobs;
+  /**
+   * Bytes of the pages and blobs as stored.
+   */
+  uint64_t bytes;
+} lt_backup_info;
+
+/**
  * Bytes owned by a handle, valid for as long as the call that returned
  * them says.
  */
@@ -303,6 +333,54 @@ enum lt_status lt_checkpoint(struct lt_db *db);
  * to do.
  */
 enum lt_status lt_checkpoint_step(struct lt_db *db, bool *progressed);
+
+/**
+ * The defaults: 256 MiB/s.
+ */
+struct lt_backup_options lt_backup_options_default(void);
+
+/**
+ * Backs the store up into the directory `path`, which this creates if
+ * needed and which must hold nothing. The copy holds every write completed
+ * before this call and none made after it returns, and opens with
+ * lt_open(). Writes go on meanwhile. `options` may be null for the
+ * defaults, and `info` may be null; otherwise `*info` says what the backup
+ * holds. If the call fails, the directory refuses to open as a store.
+ */
+enum lt_status lt_backup_to_dir(const struct lt_db *db,
+                                const char *path,
+                                const struct lt_backup_options *options,
+                                struct lt_backup_info *info);
+
+/**
+ * Backs the store up into an archive: the file `path`, which this creates
+ * or replaces, holds the backup end to end, for lt_restore_from_file(). It
+ * holds what a copy by lt_backup_to_dir() would, and is written past the
+ * page cache where the file system allows. `options` and `info` are as
+ * there. If the call fails, it removes the file.
+ */
+enum lt_status lt_backup_to_file(const struct lt_db *db,
+                                 const char *path,
+                                 const struct lt_backup_options *options,
+                                 struct lt_backup_info *info);
+
+/**
+ * Restores the archive in the file `archive` into the directory `path`,
+ * which this creates if needed and which must hold nothing. The directory
+ * then opens with lt_open() as the store the archive holds. Every page and
+ * blob is verified on the way. `info` may be null. If the call fails, the
+ * directory refuses to open as a store.
+ */
+enum lt_status lt_restore_from_file(const char *archive,
+                                    const char *path,
+                                    struct lt_backup_info *info);
+
+/**
+ * Checks the archive in the file `archive` from end to end: that it is
+ * complete, and that every page and blob in it passes its checksums.
+ * `info` may be null.
+ */
+enum lt_status lt_verify_backup_file(const char *archive, struct lt_backup_info *info);
 
 /**
  * Takes a snapshot: every read through it sees the writes completed before

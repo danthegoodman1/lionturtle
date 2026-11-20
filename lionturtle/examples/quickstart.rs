@@ -1,10 +1,11 @@
 //! Opens a store, writes a key and an atomic batch, reads them back through
-//! iterators and a snapshot, then deletes them by range.
+//! iterators and a snapshot, deletes them by range, then backs the store up
+//! and restores it.
 //!
 //! `cargo run --release -p lionturtle --example quickstart`
 
 use lionturtle::storage::FsStorage;
-use lionturtle::{Db, Options, WriteOp};
+use lionturtle::{BackupOptions, Db, Options, WriteOp};
 use std::sync::Arc;
 
 fn main() -> lionturtle::Result<()> {
@@ -49,7 +50,25 @@ fn main() -> lionturtle::Result<()> {
     assert_eq!(snap.get(b"banana")?.as_deref(), Some(&b"yellow"[..]));
 
     db.sync()?;
-    drop(db);
+
+    // A backup holds every write completed before it began, and writes go
+    // on while it is copied. This one goes to an archive file, which
+    // restores into an empty directory that then opens as a store.
+    let (backups, restored) = (dir.with_extension("backups"), dir.with_extension("restored"));
+    let _ = std::fs::remove_dir_all(&restored);
+    db.put(b"date", b"brown")?;
+    let backup = db.backup(BackupOptions::default())?;
+    db.put(b"elderberry", b"black")?;
+    backup.archive_to(&FsStorage::new(&backups)?, "fruit.backup")?;
+    let archive = std::fs::File::open(backups.join("fruit.backup"))?;
+    lionturtle::backup::restore(archive, Arc::new(FsStorage::new(&restored)?))?;
+    let copy = Db::open(Arc::new(FsStorage::new(&restored)?), Options::default())?;
+    assert_eq!(copy.get(b"date")?.as_deref(), Some(&b"brown"[..]));
+    assert_eq!(copy.get(b"elderberry")?, None);
+
+    drop((db, copy));
     std::fs::remove_dir_all(&dir)?;
+    std::fs::remove_dir_all(&restored)?;
+    std::fs::remove_dir_all(&backups)?;
     Ok(())
 }

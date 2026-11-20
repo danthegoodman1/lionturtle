@@ -154,6 +154,22 @@ class Snapshot {
   std::unique_ptr<lt_snapshot, detail::Free<lt_snapshot_free>> s_;
 };
 
+// Restores the archive in the file `archive` into the empty directory
+// `path`, which then opens as the store the archive holds.
+inline lt_backup_info restore(const std::string &archive, const std::string &path) {
+  lt_backup_info info{};
+  detail::check(lt_restore_from_file(archive.c_str(), path.c_str(), &info));
+  return info;
+}
+
+// Checks the archive in the file `archive`: that it is complete, and that
+// every page and blob in it passes its checksums.
+inline lt_backup_info verify_backup(const std::string &archive) {
+  lt_backup_info info{};
+  detail::check(lt_verify_backup_file(archive.c_str(), &info));
+  return info;
+}
+
 // An open store. Any number of threads may share one. The destructor stops
 // background work and syncs the log.
 class Db {
@@ -211,6 +227,21 @@ class Db {
     bool progressed = false;
     detail::check(lt_checkpoint_step(db_.get(), &progressed));
     return progressed;
+  }
+
+  // Backs the store up into the empty directory `path`, which then opens as
+  // a store that holds every write completed before this call. Writes go on
+  // meanwhile.
+  lt_backup_info backup_to_dir(const std::string &path, const lt_backup_options &options = lt_backup_options_default()) const {
+    lt_backup_info info{};
+    detail::check(lt_backup_to_dir(db_.get(), path.c_str(), &options, &info));
+    return info;
+  }
+  // Backs the store up into an archive, the file `path`, for restore().
+  lt_backup_info backup_to_file(const std::string &path, const lt_backup_options &options = lt_backup_options_default()) const {
+    lt_backup_info info{};
+    detail::check(lt_backup_to_file(db_.get(), path.c_str(), &options, &info));
+    return info;
   }
 
  private:

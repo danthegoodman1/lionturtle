@@ -669,11 +669,13 @@ version = "0.1.0"
 dependencies = [
  "bbtree",
  "bytes",
+ "crc32c",
  "crossbeam-skiplist",
  "fjall",
  "hdrhistogram",
  "libc",
  "lionturtle",
+ "lz4_flex 0.14.0",
  "mimalloc",
  "parking_lot",
  "rocksdb",

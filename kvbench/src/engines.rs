@@ -23,6 +23,10 @@ pub trait Engine: Send + Sync {
     fn stall_secs(&self) -> f64 {
         0.0
     }
+    /// The store, for the engine that is lionturtle.
+    fn lion(&self) -> Option<&lionturtle::Db> {
+        None
+    }
 }
 
 pub fn open(args: &Args) -> Arc<dyn Engine> {
@@ -79,6 +83,10 @@ impl Engine for Turtle {
 
     fn settle(&self) {
         self.db.checkpoint().unwrap();
+    }
+
+    fn lion(&self) -> Option<&lionturtle::Db> {
+        Some(&self.db)
     }
 
     fn stall_secs(&self) -> f64 {

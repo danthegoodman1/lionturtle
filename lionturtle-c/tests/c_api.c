@@ -156,7 +156,49 @@ int main(int argc, char **argv) {
   OK(lt_open(argv[1], NULL, &db));
   OK(lt_iter_new(db, "", 0, NULL, 0, false, &it));
   expect_keys(it, "cz");
+
+  /* Backups: a copy that opens as a store, and an archive that restores to
+     one. Each holds the writes made before it and none after. */
+  char copy[4096], archive[4096], restored[4096], not_archive[4200];
+  snprintf(copy, sizeof copy, "%s-copy", argv[1]);
+  snprintf(archive, sizeof archive, "%s-archive", argv[1]);
+  snprintf(restored, sizeof restored, "%s-restored", argv[1]);
+  snprintf(not_archive, sizeof not_archive, "%s/superblock", copy);
+  /* A value this long is stored as a blob. */
+  static char blob[100000];
+  memset(blob, 'x', sizeof blob);
+  OK(lt_put(db, "big", 3, blob, sizeof blob, false));
+  lt_backup_options fast = lt_backup_options_default();
+  CHECK(fast.rate_limit == 256u << 20);
+  fast.rate_limit = 0;
+  lt_backup_info info, again;
+  OK(lt_backup_to_dir(db, copy, &fast, &info));
+  CHECK(info.pages > 0 && info.blobs == 1 && info.bytes > 0);
+  OK(lt_backup_to_file(db, archive, NULL, &again));
+  CHECK(again.seq == info.seq && again.bytes == info.bytes);
+  OK(lt_put(db, "later", 5, "6", 1, false));
+  CHECK(lt_backup_to_dir(db, copy, NULL, NULL) == LT_INVALID_ARGUMENT);
+  CHECK(lt_backup_to_dir(NULL, restored, NULL, NULL) == LT_INVALID_ARGUMENT);
+  OK(lt_verify_backup_file(archive, &again));
+  CHECK(again.seq == info.seq && again.pages == info.pages);
+  OK(lt_restore_from_file(archive, restored, NULL));
+  CHECK(lt_restore_from_file(archive, restored, NULL) == LT_INVALID_ARGUMENT);
+  CHECK(lt_verify_backup_file(not_archive, NULL) == LT_CORRUPTION);
+  CHECK(lt_verify_backup_file(NULL, NULL) == LT_INVALID_ARGUMENT);
   lt_close(db);
+  const char *stores[] = {copy, restored};
+  for (int i = 0; i < 2; i++) {
+    OK(lt_open(stores[i], NULL, &db));
+    expect(db, NULL, "cz", "8");
+    expect(db, NULL, "later", NULL);
+    lt_value *v = NULL;
+    OK(lt_get(db, "big", 3, &v));
+    CHECK(v != NULL && lt_value_bytes(v).len == sizeof blob);
+    lt_value_free(v);
+    OK(lt_iter_new(db, "", 0, NULL, 0, false, &it));
+    expect_keys(it, "bigcz");
+    lt_close(db);
+  }
 
   puts("c_api: ok");
   return 0;

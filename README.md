@@ -31,6 +31,8 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **Large values written once.** A value of 32 KiB or more goes to a blob: a slot of its own that its writer compresses and writes before it logs a 21-byte pointer. Writers write their blobs side by side, the tree moves pointers, and an overwritten blob frees its slot at the next checkpoint while live values stay in place. On 16 GB of 1 MiB values with LZ4, lionturtle loaded 3.9 times as fast as RocksDB with BlobDB and wrote 0.51 bytes per user byte against 1.77 ([results](BENCHMARKS.md#large-values)).
 
+**Live backups.** `Db::backup` copies one checkpoint's pages and blobs as they are stored, while writes go on: into an archive stream for a file, a pipe or an upload, or into a directory that opens as a store. A backup holds every write completed before it began, verifies each checksum as it copies, and reads at a set rate (256 MiB/s by default). On a store of 100M small rows serving 500,000 operations a second, a backup at that rate read 10.5 GB in 44 s and moved the read p99 of a typical second from 5 to 5.5 ms. Its archive restored in under 5 s, where streaming the same rows from a snapshot took 90 s to back up and 30 s to restore ([guide](BACKUPS.md), [results](BENCHMARKS.md#backups)).
+
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
 **Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 18–37% ([results](BENCHMARKS.md#ycsb-at-50m-records)).
@@ -108,7 +110,7 @@ lionturtle ran 1.2–3.9× RocksDB's rate on every workload. With A at a fixed r
 ```rust
 use std::sync::Arc;
 use lionturtle::storage::FsStorage;
-use lionturtle::{Db, Options, WriteOp};
+use lionturtle::{BackupOptions, Db, Options, WriteOp};
 
 let db = Db::open(Arc::new(FsStorage::new("data")?), Options::default())?;
 db.put(b"apple", b"red")?;
@@ -128,13 +130,20 @@ let newest = snap.iter_rev(b"a", Some(b"c")); // [a, c), descending
 db.delete_range(b"a", Some(b"c"))?;
 db.delete_prefix(b"ch")?;
 db.sync()?;
+
+// A backup of every write so far, as an archive file; writes go on while it is copied.
+let backup = db.backup(BackupOptions::default())?;
+backup.archive_to(&FsStorage::new("backups")?, "data.backup")?;
+// The archive restores into an empty directory, which then opens as a store.
+let archive = std::fs::File::open("backups/data.backup")?;
+lionturtle::backup::restore(archive, Arc::new(FsStorage::new("restored")?))?;
 ```
 
 ```console
 cargo run --release -p lionturtle --example quickstart
 ```
 
-The API is `put`, `delete`, `delete_range`, `delete_prefix`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. A batch can hold range deletes among its puts and deletes, and its ops apply in order. Keys and range bounds run to 65,535 bytes and values to 16 MiB. A store that has taken a range delete opens only with lionturtle 0.7.0 or later, and one that has written a value of `blob_threshold` bytes or more only with 0.8.0 or later.
+The API is `put`, `delete`, `delete_range`, `delete_prefix`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint`, `backup` and `stats`. A `Snapshot` offers the same reads. A `Backup` is a `std::io::Read` that yields an archive, `Backup::archive_to` writes the archive to a file, `Backup::copy_to` writes a store instead, and `backup::restore` and `backup::verify` read an archive back. A batch can hold range deletes among its puts and deletes, and its ops apply in order. Keys and range bounds run to 65,535 bytes and values to 16 MiB. A store that has taken a range delete, or written a value of `blob_threshold` bytes or more, opens only with lionturtle 0.7.0 or later.
 
 ## C and C++
 
@@ -161,7 +170,7 @@ c++ -std=c++17 -Iinclude app.cpp lib/liblionturtle_c.a -lutil -lrt -lpthread -lm
 c++ -std=c++17 -Iinclude app.cpp lib/liblionturtle_c.a                                  # macOS
 ```
 
-C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error`. A `Db` and its snapshots serve any number of threads at once; use each iterator and batch from one thread at a time. Values come back without a copy: `lt_get` returns a handle to the store's bytes. `scan` and `stats` are Rust-only.
+C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error`. A `Db` and its snapshots serve any number of threads at once; use each iterator and batch from one thread at a time. Values come back without a copy: `lt_get` returns a handle to the store's bytes. Backups go to a directory or an archive file (`lt_backup_to_dir`, `lt_backup_to_file`, `lt_restore_from_file`, `lt_verify_backup_file`). `scan`, `stats` and backups to a stream are Rust-only.
 
 ## Configuration
 
@@ -205,6 +214,7 @@ Under a memory cap that counts page cache, such as a container's, transparent hu
 
 ## Documentation
 
+- [BACKUPS.md](BACKUPS.md): how to back up a live store, restore it and verify a backup, and what a backup costs the store while it runs.
 - [BENCHMARKS.md](BENCHMARKS.md): every benchmark result, how each ran, and the commands to reproduce it.
 - [DESIGN.md](DESIGN.md): the write path, the TurtleTree, reads and visibility; durability guarantees; how lionturtle differs from the C++ TurtleKV; and what the tests check.
 - [RELEASING.md](RELEASING.md): how merges to `main` become crates.io releases.

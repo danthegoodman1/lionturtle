@@ -13,6 +13,13 @@
 //! seconds and 40,000 for 10.
 //! `--timeline <file>` writes each second's throughput and latency
 //! percentiles there.
+//!
+//! `--backup <mode>` backs a lionturtle store up (see [`backup`]): alone, as
+//! the `backup` phase, or starting `--backup-at <seconds>` into each timed
+//! phase, whose latencies then print split into before, during and after
+//! the backup. The `restore` and `restore-archive` phases rebuild a store
+//! from a backup, and `fingerprint` reads every row and prints their count
+//! and checksum.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -30,6 +37,7 @@ fn disable_huge_pages() {
     }
 }
 
+mod backup;
 mod engines;
 mod ycsb;
 
@@ -98,6 +106,19 @@ pub struct Args {
     /// on. 0 keeps every value inline.
     pub blob_kb: u64,
     pub timeline: Option<String>,
+    /// How to back the store up: `rows`, `rows-raw`, `copy` or `archive`;
+    /// see [`backup`]. The `backup` phase runs it alone, and `--backup-at`
+    /// starts it that many seconds into each timed phase.
+    pub backup: Option<String>,
+    /// Where the backup goes: a file for `rows`, `rows-raw` and `archive`,
+    /// and a directory for `copy`, or `null` to discard the copy. The
+    /// `restore` phase reads a row backup from here, and `restore-archive`,
+    /// which comes first and needs an empty `--dir`, an archive.
+    pub backup_dest: String,
+    pub backup_at: Option<f64>,
+    /// MiB/s a `copy` or `archive` backup reads at: 0 for no limit, and the
+    /// store's default when left out.
+    pub backup_mbps: Option<u64>,
 }
 
 impl Args {
@@ -176,6 +197,10 @@ fn parse_args() -> Args {
         uniform: num("--uniform", 0) == 1,
         blob_kb: num("--blob-kb", 0),
         timeline: get("--timeline"),
+        backup: get("--backup"),
+        backup_dest: get("--backup-dest").unwrap_or_default(),
+        backup_at: get("--backup-at").map(|v| v.parse().expect("--backup-at")),
+        backup_mbps: get("--backup-mbps").map(|v| v.parse().expect("--backup-mbps")),
     }
 }
 
@@ -257,6 +282,28 @@ struct PhaseResult {
     elapsed: Duration,
     hist: Vec<Histogram<u64>>,
     scanned: u64,
+    /// Latencies before, during and after the phase's backup.
+    windows: Vec<Vec<Histogram<u64>>>,
+    /// JSON fields that describe the phase's backup, if it ran one.
+    backup: Option<String>,
+    /// The largest the data directory grew during the phase.
+    disk_peak: u64,
+}
+
+/// Which part of a phase with a backup is running: 0 before the backup, 1
+/// during it, 2 after.
+static WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Seconds of CPU this process has used, in user and system mode.
+fn cpu_secs() -> f64 {
+    // SAFETY: getrusage fills the struct it is given.
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru
+    };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(ru.ru_utime) + secs(ru.ru_stime)
 }
 
 fn new_hists() -> Vec<Histogram<u64>> {
@@ -349,7 +396,7 @@ fn run_load(engine: &Arc<dyn Engine>, args: &Args) -> PhaseResult {
             a.add(b).unwrap();
         }
     }
-    PhaseResult { ops: args.records, elapsed: started.elapsed(), hist, scanned: 0 }
+    PhaseResult { ops: args.records, elapsed: started.elapsed(), hist, scanned: 0, windows: Vec::new(), backup: None, disk_peak: 0 }
 }
 
 unsafe extern "C" {
@@ -366,12 +413,37 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
     let started = Instant::now();
     let scanned = Arc::new(AtomicU64::new(0));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    WINDOW.store(0, Ordering::SeqCst);
+    let disk_peak = Arc::new(AtomicU64::new(0));
+    let backup = args.backup.clone().zip(args.backup_at).map(|(mode, at)| {
+        let (engine, dir, dest) = (engine.clone(), args.dir.clone(), args.backup_dest.clone());
+        let mbps = args.backup_mbps;
+        std::thread::spawn(move || {
+            std::thread::sleep((started + Duration::from_secs_f64(at)).saturating_duration_since(Instant::now()));
+            let disk0 = dir_bytes(std::path::Path::new(&dir));
+            let (r0, w0) = io_counters();
+            WINDOW.store(1, Ordering::SeqCst);
+            let fields = backup::run(engine.lion().expect("--backup needs lionturtle"), &mode, std::path::Path::new(&dest), mbps);
+            WINDOW.store(2, Ordering::SeqCst);
+            let (r1, w1) = io_counters();
+            let disk1 = dir_bytes(std::path::Path::new(&dir));
+            format!(
+                r#"{{{fields},"at_s":{at},"disk_before_mb":{:.0},"disk_after_mb":{:.0},"proc_read_mb":{:.1},"proc_write_mb":{:.1}}}"#,
+                disk0 as f64 / 1e6,
+                disk1 as f64 / 1e6,
+                (r1 - r0) as f64 / 1e6,
+                (w1 - w0) as f64 / 1e6
+            )
+        })
+    });
     let sampler = {
         let (engine, timeline, done) = (engine.clone(), timeline.clone(), done.clone());
+        let (dir, disk_peak) = (args.dir.clone(), disk_peak.clone());
         std::thread::spawn(move || {
             let mut next = started;
             while !done.load(Ordering::Relaxed) {
                 timeline.stalls.lock().push(engine.stall_secs());
+                disk_peak.fetch_max(dir_bytes(std::path::Path::new(&dir)), Ordering::Relaxed);
                 next += Duration::from_secs(1);
                 while !done.load(Ordering::Relaxed) && Instant::now() < next {
                     std::thread::park_timeout(next.saturating_duration_since(Instant::now()));
@@ -395,6 +467,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                 // thread's timer slack.
                 unsafe { prctl(29, 1u64) };
                 let mut hist = new_hists();
+                let mut windows: Vec<Vec<Histogram<u64>>> = (0..3).map(|_| new_hists()).collect();
                 let mut sec_hist = new_hists();
                 let mut sec = 0usize;
                 let mut rng = Rng::new(seed);
@@ -450,6 +523,7 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                     let end = Instant::now();
                     let ns = end.saturating_duration_since(t0).as_nanos() as u64;
                     hist[idx].record(ns).ok();
+                    windows[WINDOW.load(Ordering::Relaxed)][idx].record(ns).ok();
                     let s = end.duration_since(started).as_secs() as usize;
                     if s != sec {
                         timeline.add(sec, &sec_hist);
@@ -460,22 +534,37 @@ fn run_phase(engine: &Arc<dyn Engine>, args: &Args, phase: &str, records: &Arc<A
                 }
                 timeline.add(sec, &sec_hist);
                 scanned.fetch_add(local_scanned, Ordering::Relaxed);
-                hist
+                (hist, windows)
             })
         })
         .collect();
     let mut hist = new_hists();
+    let mut windows: Vec<Vec<Histogram<u64>>> = (0..3).map(|_| new_hists()).collect();
     for h in handles {
-        for (a, b) in hist.iter_mut().zip(h.join().unwrap()) {
+        let (thread_hist, thread_windows) = h.join().unwrap();
+        for (a, b) in hist.iter_mut().zip(thread_hist) {
+            a.add(b).unwrap();
+        }
+        for (a, b) in windows.iter_mut().flatten().zip(thread_windows.into_iter().flatten()) {
             a.add(b).unwrap();
         }
     }
     let elapsed = started.elapsed();
+    let outlasted = backup.as_ref().is_some_and(|b| !b.is_finished());
+    let backup = backup.map(|b| format!(r#"{},"outlasted_phase":{outlasted}}}"#, b.join().unwrap().trim_end_matches('}')));
     done.store(true, Ordering::Relaxed);
     sampler.thread().unpark();
     sampler.join().unwrap();
     timeline.stalls.lock().push(engine.stall_secs());
-    PhaseResult { ops: per_thread * args.threads as u64, elapsed, hist, scanned: scanned.load(Ordering::Relaxed) }
+    PhaseResult {
+        ops: per_thread * args.threads as u64,
+        elapsed,
+        hist,
+        scanned: scanned.load(Ordering::Relaxed),
+        windows,
+        backup,
+        disk_peak: disk_peak.load(Ordering::Relaxed),
+    }
 }
 
 fn main() {
@@ -486,11 +575,67 @@ fn main() {
         let _ = std::fs::remove_dir_all(&args.dir);
     }
     std::fs::create_dir_all(&args.dir).unwrap();
+    // An archive restores into the empty directory before the engine opens
+    // the store it leaves there.
+    let restored = (args.phases.first().map(String::as_str) == Some("restore-archive")).then(|| {
+        let ((r0, w0), cpu0, started) = (io_counters(), cpu_secs(), Instant::now());
+        let fields = backup::restore_archive(std::path::Path::new(&args.backup_dest), std::path::Path::new(&args.dir));
+        let (r1, w1) = io_counters();
+        (started.elapsed().as_secs_f64(), cpu_secs() - cpu0, (r1 - r0) as f64 / 1e6, (w1 - w0) as f64 / 1e6, fields)
+    });
+    let opening = Instant::now();
     let engine: Arc<dyn Engine> = engines::open(&args);
+    let open_secs = opening.elapsed().as_secs_f64();
+    if let Some((secs, cpu, read_mb, write_mb, fields)) = restored {
+        println!(
+            r#"{{"engine":"{}","label":"{}","phase":"restore-archive","open_secs":{open_secs:.3},"secs":{secs:.3},"cpu_secs":{cpu:.2},"read_mb":{read_mb:.1},"write_mb":{write_mb:.1},"peak_rss_mb":{:.0},"cgroup_peak_mb":{:.0},"disk_mb":{:.0},{fields}}}"#,
+            args.engine,
+            args.label,
+            status_bytes("VmHWM:") as f64 / 1e6,
+            cgroup_peak_bytes() as f64 / 1e6,
+            dir_bytes(std::path::Path::new(&args.dir)) as f64 / 1e6
+        );
+    }
     let records = Arc::new(AtomicU64::new(0));
     let user_entry = 8 + args.value_size as u64;
     for phase in args.phases.clone() {
         let (r0, w0) = io_counters();
+        if phase == "restore-archive" {
+            continue;
+        }
+        if ["backup", "restore", "fingerprint"].contains(&phase.as_str()) {
+            let db = engine.lion().expect("this phase needs lionturtle");
+            let dest = std::path::Path::new(&args.backup_dest);
+            let (cpu0, started) = (cpu_secs(), Instant::now());
+            let fields = match phase.as_str() {
+                "backup" => {
+                    let mode = args.backup.as_deref().expect("--backup");
+                    backup::run(db, mode, dest, args.backup_mbps)
+                }
+                "restore" => {
+                    let (rows, wrote, settled) = backup::restore_rows(db, dest, args.threads);
+                    format!(r#""rows":{rows},"write_secs":{wrote:.3},"checkpoint_secs":{settled:.3}"#)
+                }
+                _ => format!(r#""fingerprint":{}"#, backup::fingerprint(db.iter(b"", None)).json()),
+            };
+            let (r1, w1) = io_counters();
+            println!(
+                r#"{{"engine":"{}","label":"{}","phase":"{}","open_secs":{:.3},"secs":{:.3},"cpu_secs":{:.2},"read_mb":{:.1},"write_mb":{:.1},"peak_rss_mb":{:.0},"cgroup_peak_mb":{:.0},"disk_mb":{:.0},{}}}"#,
+                args.engine,
+                args.label,
+                phase,
+                open_secs,
+                started.elapsed().as_secs_f64(),
+                cpu_secs() - cpu0,
+                (r1 - r0) as f64 / 1e6,
+                (w1 - w0) as f64 / 1e6,
+                status_bytes("VmHWM:") as f64 / 1e6,
+                cgroup_peak_bytes() as f64 / 1e6,
+                dir_bytes(std::path::Path::new(&args.dir)) as f64 / 1e6,
+                fields
+            );
+            continue;
+        }
         let result = if phase == "load" {
             let r = run_load(&engine, &args);
             records.store(args.records, Ordering::SeqCst);
@@ -526,6 +671,31 @@ fn main() {
                 h.value_at_quantile(0.999) as f64 / 1e3,
                 h.max() as f64 / 1e3
             ));
+        }
+        if let Some(fields) = &result.backup {
+            lat.push_str(&format!(r#","disk_peak_mb":{:.0},"backup":{fields},"windows":{{"#, result.disk_peak as f64 / 1e6));
+            let mut first = true;
+            for (name, hists) in ["before", "during", "after"].iter().zip(&result.windows) {
+                for (op, h) in OPS.iter().zip(hists) {
+                    if h.is_empty() {
+                        continue;
+                    }
+                    lat.push_str(&format!(
+                        r#"{}"{name}_{}":{{"count":{},"p50_us":{:.2},"p99_us":{:.2},"p999_us":{:.2},"max_us":{:.1}}}"#,
+                        if first { "" } else { "," },
+                        op_name(*op),
+                        h.len(),
+                        h.value_at_quantile(0.5) as f64 / 1e3,
+                        h.value_at_quantile(0.99) as f64 / 1e3,
+                        h.value_at_quantile(0.999) as f64 / 1e3,
+                        h.max() as f64 / 1e3
+                    ));
+                    first = false;
+                }
+            }
+            lat.push('}');
+        } else if result.disk_peak > 0 {
+            lat.push_str(&format!(r#","disk_peak_mb":{:.0}"#, result.disk_peak as f64 / 1e6));
         }
         let written_user: u64 = result.hist[1].len() + result.hist[2].len() + result.hist[4].len();
         println!(
