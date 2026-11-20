@@ -29,7 +29,7 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **Range deletes.** `delete_range` and `delete_prefix` remove every key in a range, at a cost that does not depend on how many keys it holds. Reads honor the range at once. The next checkpoint drops the subtrees inside it without reading them and leaves no range tombstone behind, so reads then pay nothing for it. On 4M records, dropping 100 of 1,000 tenants by prefix took that checkpoint 21 ms, wrote 0.8 MB and removed 22 of 230 leaves; deleting as many keys one by one took 44 ms, wrote 8.3 MB and removed none (`cargo run --release -p lionturtle --example range_deletes`).
 
-**Large values written once.** A value of 32 KiB or more goes to a blob: a slot of its own that its writer compresses and writes before it logs a 21-byte pointer. Writers write their blobs side by side, the tree moves pointers, and an overwritten blob frees its slot at the next checkpoint, with no garbage collector copying live values. Against RocksDB with BlobDB on 16 GB of 1 MiB values with LZ4, lionturtle loaded 3.9 times as fast with an insert p99.9 of 30 ms against 127, wrote 0.51 bytes per user byte against 1.77, and ran workload A 3.1 times and C 1.7 times as fast; on 64 KiB values it loaded 2.4 times as fast and read 2.3 times as fast. At a fixed 1,000 updates and reads a second on 1 MiB values, update p99 was 3 to 5 ms against 63 ms to 1 s ([results](BENCHMARKS.md#large-values)).
+**Large values written once.** A value of 32 KiB or more goes to a blob: a slot of its own that its writer compresses and writes before it logs a 21-byte pointer. Writers write their blobs side by side, the tree moves pointers, and an overwritten blob frees its slot at the next checkpoint while live values stay in place. On 16 GB of 1 MiB values with LZ4, lionturtle loaded 3.9 times as fast as RocksDB with BlobDB and wrote 0.51 bytes per user byte against 1.77 ([results](BENCHMARKS.md#large-values)).
 
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
@@ -80,13 +80,27 @@ Durable writes: workload A on 20M records of 1 KB, with 128 client threads under
 
 ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 9 minutes or more, sustained throughput was 257k ops/s for lionturtle, 207k for RocksDB and 88k for ScyllaDB.
 
+Large values: 16 GB of values that LZ4 halves, stored as blobs by lionturtle and by RocksDB's BlobDB, with LZ4 on both and 16 client threads under a 4 GB memory cap. These ran twice each on a workstation with a consumer NVMe drive:
+
+| | 1 MiB values: lionturtle | RocksDB BlobDB | 64 KiB values: lionturtle | RocksDB BlobDB |
+|---|--:|--:|--:|--:|
+| Load (inserts/s) | 3,849 | 993 | 26,520 | 11,079 |
+| A: 50% read, 50% update (ops/s) | 6,421 | 2,060 | 56,172 | 19,014 |
+| C: 100% read (ops/s) | 66,039 | 39,653 | 1,205,362 | 514,337 |
+| E: 95% scan, 5% insert (ops/s) | 342 | 276 | 6,305 | 4,847 |
+| Load: insert p99.9 (ms) | 30 | 127 | 17 | 4.2 |
+| Load: bytes written per user byte | 0.51 | 1.77 | 0.58 | 1.89 |
+| Disk after A (GB) | 8.8 | 17.9 | 11.0 | 15.4 |
+
+lionturtle ran 1.2–3.9× RocksDB's rate on every workload. With A at a fixed rate, about half of what RocksDB reached in closed loop, update p99 was 3–5 ms against 63 ms–1 s at 1 MiB, and 9–10 ms against 15–325 ms at 64 KiB ([results](BENCHMARKS.md#large-values)).
+
 ### Trade-offs
 
 - **Memory.** RSS runs about twice RocksDB's: 2.5 GB against 1.3 GB under 128 durable writers.
 - **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.78 s against RocksDB's 116 ms, though update p99.9 was 4.7 ms against 15 ms.
 - **Scans.** A scan merges every buffer level on its path, so its median runs above RocksDB's. At 50M records with LZ4 it was 37 µs against 27, and RocksDB ran workload E 8% faster. At 400M it was 58 µs against 49, though lionturtle ran E 11% faster with a p99.9 of 514 µs against 755.
 - **Many narrow range deletes.** Until its checkpoint, each range delete adds to the reads that cross it. With 100,000 one-key range deletes waiting in memtables, a 50-entry scan took 13 µs on average against 4 µs, with p99 at 83 µs against 5, and a get 1.6 µs against 0.8. Point deletes of as many keys cost reads nothing extra and went 25 times faster, so a range delete pays off when it covers many keys.
-- **Blob write tails in closed loop.** A writer writes its blob to the drive, and waits when a checkpoint's syncs have the drive flush its cache. Loading 64 KiB values flat out, insert p99.9 was 17 ms against 4 ms for RocksDB with BlobDB, whose writers copy into memory, though lionturtle loaded 2.4 times as fast with a lower median and maximum. At equal load its tails were the lower ones.
+- **Blob write tails in closed loop.** A writer writes its blob to the drive, and waits when a checkpoint's syncs have the drive flush its cache. Loading 64 KiB values flat out, insert p99.9 was 17 ms against 4 ms for RocksDB with BlobDB, whose writers copy into memory, though lionturtle loaded 2.4 times as fast with a lower median and maximum. At equal load its tails were the lower ones. On 1 MiB values under the memory cap, one run of A in two paused for 0.7 s, which put its update p99.9 at 246 ms against 112.
 - **Read p99 under writes.** At 50M records with LZ4, read p99 on workload A was 120 µs against RocksDB's 111, though p99.9 was 232 µs against 276.
 
 ## Quick start
