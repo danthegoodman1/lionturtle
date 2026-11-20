@@ -90,6 +90,12 @@ pub struct lt_options {
     pub filter_bits: u32,
     /// Pivots per node before it splits.
     pub max_pivots: usize,
+    /// Values of at least this many bytes are stored apart from the tree,
+    /// each in a blob of its own, and the tree holds a pointer in the
+    /// value's place. SIZE_MAX keeps every value in the tree. A store that
+    /// has written a blob opens only with a version of lionturtle that has
+    /// blobs.
+    pub blob_threshold: usize,
 }
 
 impl lt_options {
@@ -123,6 +129,7 @@ impl lt_options {
             pace_checkpoints: self.pace_checkpoints,
             preallocate_log: self.preallocate_log,
             compression,
+            blob_threshold: self.blob_threshold,
         })
     }
 }
@@ -332,6 +339,7 @@ pub extern "C" fn lt_options_default() -> lt_options {
         max_levels: o.tree.max_levels,
         filter_bits: o.tree.filter_bits,
         max_pivots: o.tree.max_pivots,
+        blob_threshold: o.blob_threshold,
     }
 }
 

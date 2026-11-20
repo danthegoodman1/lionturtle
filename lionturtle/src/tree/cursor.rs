@@ -8,7 +8,7 @@ use super::Segment;
 use super::io::{DataPage, PageIo};
 use super::ranges::KeyRanges;
 use crate::error::Result;
-use crate::page::{Block, EntryRef, PageMeta};
+use crate::page::{Block, EntryRef, EntrySpan, PageMeta};
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ pub struct PageCursor {
     block: Option<Block>,
     entry: usize,
     /// The current entry's offsets in the block, decoded once.
-    cur: Option<(usize, usize, Option<(usize, usize)>)>,
+    cur: Option<EntrySpan>,
 }
 
 impl PageCursor {
@@ -195,14 +195,15 @@ impl PageCursor {
 
     #[inline]
     pub fn peek(&self) -> Option<EntryRef<'_>> {
-        let (k, kl, v) = self.cur?;
+        let (k, kl, v, blob) = self.cur?;
         let raw = self.block.as_ref()?.raw();
-        Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]) })
+        Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]), blob })
     }
 
-    /// The current entry as slices sharing the block's buffer.
+    /// The current entry as slices sharing the block's buffer. The value is
+    /// an encoded blob pointer where [`PageCursor::peek`] says so.
     pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
-        let (k, kl, v) = self.cur?;
+        let (k, kl, v, _) = self.cur?;
         let raw = self.block.as_ref()?.raw();
         Some((raw.slice(k..k + kl), v.map(|(vs, vl)| raw.slice(vs..vs + vl))))
     }

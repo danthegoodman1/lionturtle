@@ -14,6 +14,7 @@
 //! is gone (see [`Epoch`]).
 
 use crate::arena::ChunkPool;
+use crate::blob::BlobPtr;
 use crate::bloom::{self, SharedFilter};
 use crate::error::{Error, Result};
 use crate::memtable::{Entry, MemTable, MemTableKind, View, new_memtable};
@@ -22,14 +23,14 @@ use crate::pagestore::{PagePtr, PageStore, Superblock};
 use crate::rangedel::{FrozenDeletes, Overlay, RangeDelete, RangeDeletes};
 use crate::storage::Storage;
 use crate::tree::io::{DataPage, Pace, PageIo};
-use crate::tree::{self, Ctx, Subtree, TreeConfig, TreeScan};
+use crate::tree::{self, Ctx, Found, Subtree, TreeConfig, TreeScan};
 use crate::types::{MAX_KEY_LEN, MAX_VALUE_LEN, Op, OpRef, Value, WriteOp, cmp_keys, prefix_end};
 use crate::wal::{self, WalWriter};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
 use std::cell::UnsafeCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
@@ -97,6 +98,27 @@ pub struct Options {
     /// each page records how it was stored. lionturtle 0.4.0 and later read
     /// compressed pages; earlier versions report them as corrupt.
     pub compression: Compression,
+    /// Values of at least this many bytes are stored apart from the tree,
+    /// each in a slot of its own, a blob. A writer writes the blob before it
+    /// logs the put, and the log and the tree hold a pointer of 21 bytes in
+    /// the value's place. The value thus reaches the drive once, where the
+    /// tree rewrites a value it holds at each buffer level the value passes,
+    /// and writers of large values write in parallel instead of through the
+    /// log. A read of such a value reads its tree entry and then its blob.
+    ///
+    /// Each blob takes about 60 bytes of memory while the tree references
+    /// it, and its slot is padded to 4 KiB, so both costs double with each
+    /// halving of the threshold. Values of 8 KiB and over loaded, updated,
+    /// read and scanned faster as blobs than in the tree; the default of
+    /// 32 KiB keeps the memory near 2 GB per TB of the smallest blobs and
+    /// the padding near an eighth of them.
+    ///
+    /// With [`Compression::Lz4`], a blob is compressed whole when that saves
+    /// at least an eighth of it. A store may change the threshold between
+    /// opens: each entry records whether its value is a blob. `usize::MAX`
+    /// keeps every value in the tree. A store that has written a blob opens
+    /// only with a version of lionturtle that has blobs.
+    pub blob_threshold: usize,
 }
 
 /// A paced checkpoint aims to finish its I/O within this share of the time
@@ -127,6 +149,7 @@ impl Default for Options {
             pace_checkpoints: true,
             preallocate_log: false,
             compression: Compression::Lz4,
+            blob_threshold: 32 << 10,
         }
     }
 }
@@ -165,6 +188,10 @@ pub struct Mem {
     counts: MemCounts,
     /// Writers assigned to this memtable that have not finished inserting.
     inflight: Inflight,
+    /// The blob each large put wrote before it was logged, by the put's
+    /// sequence number. The memtable keeps the value too, for reads; its
+    /// checkpoint gives the tree the pointer.
+    blobs: Mutex<Vec<(u64, BlobPtr)>>,
 }
 
 /// Counters the writer lock's holder updates for every batch. They sit on a
@@ -372,12 +399,17 @@ impl Mem {
             ranges: RangeDeletes::default(),
             counts: MemCounts { bytes: AtomicU64::new(0), last_seq: AtomicU64::new(last_seq) },
             inflight: Inflight::default(),
+            blobs: Mutex::new(Vec::new()),
         }
     }
 
-    fn replay(&self, op: &WriteOp, seq: u64) {
+    /// Adds a logged op, with the blob its record pointed to, if any.
+    fn replay(&self, op: &WriteOp, seq: u64, blob: Option<BlobPtr>) {
         self.insert_op(op.op(), seq, 0);
         self.counts.bytes.fetch_add(op_entry_bytes(op.op()), Relaxed);
+        if let Some(blob) = blob {
+            self.blobs.lock().push((seq, blob));
+        }
     }
 
     /// Adds the version of `key` written at `seq` by batch `ticket`. The
@@ -458,16 +490,23 @@ fn op_entry_bytes(op: OpRef<'_>) -> u64 {
 /// keeps the next one alive.
 struct Epoch {
     io: Arc<PageIo>,
-    garbage: Mutex<Vec<PagePtr>>,
+    garbage: Mutex<Garbage>,
     next: Mutex<Option<Arc<Epoch>>>,
+}
+
+/// Slots no durable tree references: pages, and blobs.
+#[derive(Default)]
+struct Garbage {
+    pages: Vec<PagePtr>,
+    blobs: Vec<PagePtr>,
 }
 
 impl Epoch {
     fn new(io: Arc<PageIo>) -> Self {
-        Self { io, garbage: Mutex::new(Vec::new()), next: Mutex::new(None) }
+        Self { io, garbage: Mutex::new(Garbage::default()), next: Mutex::new(None) }
     }
 
-    fn retire(&self, garbage: Vec<PagePtr>, next: Arc<Epoch>) {
+    fn retire(&self, garbage: Garbage, next: Arc<Epoch>) {
         *self.garbage.lock() = garbage;
         *self.next.lock() = Some(next);
     }
@@ -480,10 +519,11 @@ impl Drop for Epoch {
         let mut garbage = std::mem::take(self.garbage.get_mut());
         let mut next = self.next.get_mut().take();
         loop {
-            for ptr in &garbage {
+            for ptr in &garbage.pages {
                 self.io.evict(ptr.id);
             }
-            self.io.store.free(garbage);
+            self.io.store.free(garbage.pages);
+            self.io.blobs.free(garbage.blobs);
             let Some(arc) = next else { break };
             match Arc::try_unwrap(arc) {
                 Ok(mut e) => {
@@ -628,7 +668,61 @@ impl Drop for WriterGuard<'_> {
 struct Durable {
     sb: Superblock,
     live: HashSet<PagePtr>,
+    blobs: BlobRefs,
     epoch: Arc<Epoch>,
+}
+
+/// The blobs the durable tree references. A blob stays allocated while any
+/// page of the tree lists it. A flush copies an entry to a child and leaves
+/// the original in its segment's page, so two pages can list one blob.
+#[derive(Default)]
+struct BlobRefs {
+    /// The tree's pages that list blobs.
+    pages: HashMap<PagePtr, Arc<DataPage>>,
+    /// How many of those pages list each blob.
+    counts: HashMap<BlobPtr, u32>,
+    /// Bytes the blobs occupy, as stored.
+    bytes: u64,
+}
+
+impl BlobRefs {
+    /// Counts the blobs `page` lists, unless they are counted already.
+    fn add(&mut self, page: Arc<DataPage>) {
+        let ptr = page.ptr().expect("a durable page is written");
+        if self.pages.contains_key(&ptr) {
+            return;
+        }
+        for blob in page.meta.blobs() {
+            let count = self.counts.entry(blob).or_insert(0);
+            if *count == 0 {
+                self.bytes += blob.len as u64;
+            }
+            *count += 1;
+        }
+        self.pages.insert(ptr, page);
+    }
+
+    /// Stops counting the blobs that the page at `ptr` lists, and adds the
+    /// slot of each blob no page lists any more to `dead`.
+    fn remove(&mut self, ptr: &PagePtr, dead: &mut Vec<PagePtr>) {
+        let Some(page) = self.pages.remove(ptr) else { return };
+        for blob in page.meta.blobs() {
+            let count = self.counts.get_mut(&blob).expect("a listed blob is counted");
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&blob);
+                self.bytes -= blob.len as u64;
+                dead.push(blob.page_ptr());
+            }
+        }
+    }
+
+    /// Counts the blobs of every page in `pages`.
+    fn of(pages: Vec<Arc<DataPage>>) -> Self {
+        let mut refs = Self::default();
+        pages.into_iter().for_each(|p| refs.add(p));
+        refs
+    }
 }
 
 /// The applier's view: the newest tree, which may be ahead of the committed
@@ -646,11 +740,21 @@ struct Applied {
     /// Pages written while the checkpoint applied. Any that a later batch
     /// superseded are garbage no committed tree references.
     written: Vec<PagePtr>,
+    /// Every blob written for the memtable: by its writers before they
+    /// logged, and by the checkpoint for large values that arrived without
+    /// one. Those the new tree leaves unreferenced are garbage: their puts
+    /// were overwritten or deleted within the memtable.
+    blobs: Vec<BlobPtr>,
+    /// Whether the checkpoint wrote any of them.
+    wrote_blobs: bool,
 }
 
 /// An applied checkpoint's tree, whether it created an arena file, and the
 /// pages it wrote while applying.
 type Checkpointed = (Option<Subtree>, bool, Vec<PagePtr>);
+
+/// The blobs written while cutting a checkpoint's batches.
+type Built = Vec<BlobPtr>;
 
 #[derive(Debug, Default, Clone)]
 pub struct DbStats {
@@ -671,6 +775,15 @@ pub struct DbStats {
     /// checkpoints apply them to the tree.
     pub range_deletes: usize,
     pub tree: tree::TreeStats,
+    /// Blobs the durable tree references, and the bytes they occupy as
+    /// stored.
+    pub blobs: u64,
+    pub blob_bytes: u64,
+    /// Blobs written and read since the store opened, and the bytes written
+    /// as stored.
+    pub blobs_written: u64,
+    pub blob_bytes_written: u64,
+    pub blob_reads: u64,
     pub arena_bytes: u64,
     /// Seconds in each checkpoint stage: build, apply, write, sync, commit;
     /// then seconds writers stalled, and seconds checkpoint I/O waited on
@@ -718,7 +831,37 @@ struct Inner {
     /// Whether the superblock marks the store for range deletes; see
     /// [`Superblock::range_deletes`].
     range_deletes: AtomicBool,
+    /// Ids for new blobs, none of them used before.
+    blob_ids: BlobIds,
+    /// Makes the blobs written so far durable. Each log sync runs it first,
+    /// so no record becomes durable ahead of a blob it points to.
+    sync_blobs: wal::PreSync,
+    /// The buffers of a log segment that has written its last record, for
+    /// the next memtable rotation's segment.
+    log_buffers: Arc<Mutex<Option<wal::Buffers>>>,
+    /// The newest log segment, for the committer, which must not take the
+    /// writer lock: a writer holds that lock while it waits for a commit.
+    newest_log: Mutex<Arc<wal::Log>>,
 }
+
+/// Where blob ids come from. No id is used twice, across crashes too: the
+/// superblock reserves a range durably before the store uses an id in it
+/// (see [`Superblock::next_blob_id`]), and each open starts past the last
+/// reservation, leaving the rest of it unused.
+struct BlobIds {
+    next: AtomicU64,
+    /// The end of the reserved range.
+    reserved: AtomicU64,
+}
+
+/// Freed blob slots keep their disk space for reuse up to this many
+/// memtables' worth: what a few checkpoints of overwrites free and take
+/// again. See [`PageStore::open_blobs`].
+const FREE_BLOB_MEMTABLES: u64 = 4;
+
+/// Blob ids reserved at a time. Each reservation writes the superblock, and
+/// the writer whose blob needs it waits for that write.
+const BLOB_ID_BATCH: u64 = 1 << 24;
 
 /// Cumulative nanoseconds spent in each checkpoint stage, and by writers
 /// waiting for a frozen-memtable slot.
@@ -758,19 +901,19 @@ impl Db {
             Err(e) => return Err(e),
         };
         let max_image = opts.tree.leaf_size * 2 + (1 << 20);
-        // Load the tree through a provisional store, then reopen the arenas
-        // knowing which slots the tree uses.
-        let probe = PageIo::new(PageStore::open(storage.clone(), &[])?, 0, max_image, Compression::None);
+        // Load the tree and replay the log through provisional stores, then
+        // reopen the arenas knowing which slots the tree and the log use.
+        let probe = PageIo::open(storage.clone(), 0, max_image, Compression::None)?;
         let root = sb.root.map(|r| tree::load_tree(&probe, r)).transpose()?;
         let mut live = HashSet::new();
+        let mut blob_pages = Vec::new();
         if let Some(r) = &root {
-            tree::reachable(r, &mut live);
+            tree::reachable(r, &mut live, &mut blob_pages);
         }
-        let live_vec: Vec<PagePtr> = live.iter().copied().collect();
-        let io = Arc::new(PageIo::new(PageStore::open(storage.clone(), &live_vec)?, opts.cache_bytes, max_image, opts.compression));
-        io.store.punch_free();
+        let blobs = BlobRefs::of(blob_pages);
 
-        // Replay the log into one memtable.
+        // Replay the log into one memtable. A put that points to a blob
+        // takes its value from the blob, which shows the blob is whole.
         let mem_pool = ChunkPool::new(opts.memtable_limit());
         let mut last_seq = sb.last_seq;
         let mut max_id = sb.last_memtable_id;
@@ -786,10 +929,24 @@ impl Db {
                 continue;
             }
             let before = last_seq;
-            let r = wal::replay(&*storage, id, last_seq, |seq, op| replayed.replay(&op, seq))?;
+            let blobs_before = replayed.blobs.lock().len();
+            let read = |ptr: &BlobPtr| match probe.read_blob(ptr) {
+                Ok(value) => Ok(Some(value)),
+                // The blob's write was lost or torn, or its arena never
+                // grew to hold it.
+                Err(Error::Corruption(_)) => Ok(None),
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                Err(e) => Err(e),
+            };
+            let r = wal::replay_blobs(&*storage, id, last_seq, read, |seq, op, blob| replayed.replay(&op, seq, blob))?;
             // Replay may have read records that only reached the OS cache
             // (after a process crash). New writes build on them, so they must
-            // be durable before the store accepts any.
+            // be durable before the store accepts any: the blobs they point
+            // to first, as in any sync.
+            if replayed.blobs.lock().len() > blobs_before {
+                probe.blobs.sync()?;
+                storage.sync_dir()?;
+            }
             storage.open(&wal::segment_name(id), false)?.sync_data()?;
             if std::env::var_os("TURTLEKV_DEBUG").is_some() {
                 eprintln!("recovery: sb {sb:?}, segment {id}: {} -> {} {:?}", last_seq, r.last_seq, r.end);
@@ -806,6 +963,27 @@ impl Db {
             }
         }
         storage.sync_dir()?;
+        drop(probe);
+        // The slots in use are the tree's and those of the blobs that
+        // replayed puts point to.
+        let logged: Vec<BlobPtr> = replayed.blobs.lock().iter().map(|&(_, blob)| blob).collect();
+        let live_vec: Vec<PagePtr> = live.iter().copied().collect();
+        let live_blobs: Vec<PagePtr> = blobs.counts.keys().chain(&logged).map(BlobPtr::page_ptr).collect();
+        let io = Arc::new(PageIo::new(
+            PageStore::open(storage.clone(), &live_vec)?,
+            PageStore::open_blobs(storage.clone(), &live_blobs, FREE_BLOB_MEMTABLES * opts.memtable_limit())?,
+            opts.cache_bytes,
+            max_image,
+            opts.compression,
+        ));
+        io.store.punch_free();
+        io.blobs.punch_free();
+        io.counters.blobs_live.store(blobs.counts.len() as u64, Relaxed);
+        io.counters.blob_bytes_live.store(blobs.bytes, Relaxed);
+        let sync_blobs: wal::PreSync = {
+            let io = io.clone();
+            Arc::new(move || io.blobs.sync_new())
+        };
         let mut frozen = Vec::new();
         if !replayed.is_empty() {
             replayed.counts.last_seq.store(last_seq, Relaxed);
@@ -817,7 +995,8 @@ impl Db {
         if opts.preallocate_log && recycler.is_empty() {
             recycler.prepare(&*storage, recycler.segment_len(opts.log_segment_len()), |_| true);
         }
-        let wal = WalWriter::create(&*storage, active_id, recycler.take(), wal::Buffers::default())?;
+        let wal = WalWriter::create_after(&*storage, active_id, recycler.take(), wal::Buffers::default(), Some(sync_blobs.clone()))?;
+        let newest_log = Mutex::new(wal.log());
         let active = Arc::new(Mem::new(active_id, &opts, last_seq, &mem_pool));
         let epoch = Arc::new(Epoch::new(io.clone()));
         let applier = Applier { root: root.clone(), last_applied: sb.last_memtable_id };
@@ -852,7 +1031,11 @@ impl Db {
             signal_lock: Mutex::new(()),
             signal: Condvar::new(),
             range_deletes: AtomicBool::new(sb.range_deletes),
-            durable: Mutex::new(Durable { sb, live, epoch }),
+            blob_ids: BlobIds { next: AtomicU64::new(sb.next_blob_id), reserved: AtomicU64::new(sb.next_blob_id) },
+            sync_blobs,
+            log_buffers: Arc::default(),
+            newest_log,
+            durable: Mutex::new(Durable { sb, live, blobs, epoch }),
             applier: Mutex::new(applier),
             pending: Mutex::new(VecDeque::new()),
             poisoned: AtomicBool::new(false),
@@ -1047,7 +1230,12 @@ impl Db {
             frozen_memtables: v.frozen.len(),
             range_deletes: std::iter::once(&v.active).chain(&v.frozen).map(|m| m.ranges.len()).sum(),
             tree: v.tree.as_ref().map(tree::stats).unwrap_or_default(),
-            arena_bytes: inner.io.store.arena_bytes(),
+            blobs: c.blobs_live.load(Relaxed),
+            blob_bytes: c.blob_bytes_live.load(Relaxed),
+            blobs_written: c.blobs_written.load(Relaxed),
+            blob_bytes_written: c.blob_bytes_written.load(Relaxed),
+            blob_reads: c.blob_reads.load(Relaxed),
+            arena_bytes: inner.io.store.arena_bytes() + inner.io.blobs.arena_bytes(),
             stage_secs: [
                 &inner.timing.build_ns,
                 &inner.timing.apply_ns,
@@ -1061,9 +1249,10 @@ impl Db {
         }
     }
 
-    /// Checks the tree's structure and that the allocator holds exactly the
-    /// pages the durable tree references, plus garbage still pinned by
-    /// readers. Reads every page; for tests and simulation.
+    /// Checks the tree's structure and that the allocators hold exactly the
+    /// pages and blobs that the durable tree, the checkpoints under way and
+    /// the memtables reference, plus garbage still pinned by readers. Reads
+    /// every page; for tests and simulation, while no write is in flight.
     pub fn check_invariants(&self) -> Result<()> {
         let inner = &self.inner;
         // A commit holds `durable` from replacing the version until it lets
@@ -1073,23 +1262,40 @@ impl Db {
         if let Some(t) = &v.tree {
             tree::check_invariants(&inner.io, &inner.opts.tree, t)?;
         }
-        let allocated: HashSet<(u8, u32)> = inner.io.store.allocated().into_iter().collect();
-        let mut expected = durable.live.clone();
-        for a in inner.pending.lock().iter() {
-            if let Some(r) = &a.root {
-                tree::reachable(r, &mut expected);
-            }
-            // Its superseded pages stay allocated until it commits.
-            expected.extend(a.written.iter().copied());
+        // The durable tree's blob counts match a count from scratch.
+        let (mut pages, mut blob_pages) = (HashSet::new(), Vec::new());
+        if let Some(t) = &v.tree {
+            tree::reachable(t, &mut pages, &mut blob_pages);
         }
-        let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
-        assert!(live.is_subset(&allocated), "a live page is not allocated");
-        // With no older version left, no garbage awaits release. A
-        // background thread can hold an older version for a moment after a
-        // commit, so a check after `checkpoint` may find one.
-        if inner.live_versions.load(SeqCst) == 1 {
-            let leaked: Vec<_> = allocated.difference(&live).collect();
-            assert!(leaked.is_empty(), "leaked page slots: {leaked:?}");
+        let recount = BlobRefs::of(blob_pages);
+        assert!(recount.counts == durable.blobs.counts && recount.bytes == durable.blobs.bytes, "blob counts drifted from the tree");
+        let mut expected = durable.live.clone();
+        let mut blobs: HashSet<PagePtr> = durable.blobs.counts.keys().map(BlobPtr::page_ptr).collect();
+        for a in inner.pending.lock().iter() {
+            let mut blob_pages = Vec::new();
+            if let Some(r) = &a.root {
+                tree::reachable(r, &mut expected, &mut blob_pages);
+            }
+            // Its superseded pages stay allocated until it commits, as do
+            // the blobs written for its memtable.
+            expected.extend(a.written.iter().copied());
+            blobs.extend(blob_pages.iter().flat_map(|p| p.meta.blobs()).chain(a.blobs.iter().copied()).map(|b| b.page_ptr()));
+        }
+        // A memtable's blobs stay allocated until its checkpoint commits.
+        for m in std::iter::once(&v.active).chain(&v.frozen) {
+            blobs.extend(m.blobs.lock().iter().map(|(_, b)| b.page_ptr()));
+        }
+        for (what, store, expected) in [("page", &inner.io.store, &expected), ("blob", &inner.io.blobs, &blobs)] {
+            let allocated: HashSet<(u8, u32)> = store.allocated().into_iter().collect();
+            let live: HashSet<(u8, u32)> = expected.iter().map(|p| (p.class, p.slot)).collect();
+            assert!(live.is_subset(&allocated), "a live {what} is not allocated");
+            // With no older version left, no garbage awaits release. A
+            // background thread can hold an older version for a moment
+            // after a commit, so a check after `checkpoint` may find one.
+            if inner.live_versions.load(SeqCst) == 1 {
+                let leaked: Vec<_> = allocated.difference(&live).collect();
+                assert!(leaked.is_empty(), "leaked {what} slots: {leaked:?}");
+            }
         }
         Ok(())
     }
@@ -1149,17 +1355,50 @@ impl Inner {
         Ok(())
     }
 
+    /// An id for a new blob, reserved durably before it is returned. The
+    /// first reservation also marks the superblock for blobs.
+    fn new_blob_id(&self) -> Result<u64> {
+        let id = self.blob_ids.next.fetch_add(1, Relaxed);
+        if id >= self.blob_ids.reserved.load(Acquire) {
+            let mut durable = self.durable.lock();
+            if id >= self.blob_ids.reserved.load(Acquire) {
+                // Past every id handed out so far, this one included.
+                let upto = self.blob_ids.next.load(Relaxed).max(id + 1) + BLOB_ID_BATCH;
+                durable.sb.reserve_blob_ids(upto, &*self.storage)?;
+                self.blob_ids.reserved.store(upto, Release);
+            }
+        }
+        Ok(id)
+    }
+
+    /// Writes `value` to a blob of its own and returns the blob's pointer.
+    /// A checkpoint's write is `paced`; see [`PageIo::write_blob`].
+    fn write_blob(&self, value: &[u8], paced: bool) -> Result<BlobPtr> {
+        self.io.write_blob(self.new_blob_id()?, value, paced)
+    }
+
     /// Logs `ops` and inserts them in the memtable, each of which copies
     /// the bytes it keeps.
+    ///
+    /// A put of at least [`Options::blob_threshold`] bytes first writes its
+    /// value to a blob, on this thread and outside every lock, and its
+    /// record carries the blob's pointer. Writers thus write their large
+    /// values in parallel, and the value reaches the drive once. The
+    /// memtable keeps the value for reads and the pointer for the
+    /// checkpoint.
     fn write<O: Op>(&self, ops: &[O], sync: bool) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        let (mut entry_bytes, mut user_bytes, mut ranges) = (0, 0, false);
+        let threshold = self.opts.blob_threshold;
+        let (mut entry_bytes, mut user_bytes, mut ranges, mut large) = (0, 0, false, false);
         for op in ops {
             let op = op.op();
             let (key, value) = match op {
-                OpRef::Put(key, value) => (key.len(), value.len()),
+                OpRef::Put(key, value) => {
+                    large |= value.len() >= threshold;
+                    (key.len(), value.len())
+                }
                 OpRef::Delete(key) => (key.len(), 0),
                 OpRef::DeleteRange(start, end) => {
                     ranges = true;
@@ -1180,13 +1419,24 @@ impl Inner {
             let r = self.mark_range_deletes();
             self.poison_on_err(r)?;
         }
+        let blobs: Vec<Option<BlobPtr>> = match large {
+            true => {
+                let written = ops.iter().map(|op| match op.op() {
+                    OpRef::Put(_, value) if value.len() >= threshold => self.write_blob(value, false).map(Some),
+                    _ => Ok(None),
+                });
+                let written = written.collect();
+                self.poison_on_err(written)?
+            }
+            false => Vec::new(),
+        };
         thread_local! {
             static BODY: std::cell::RefCell<wal::Body> = Default::default();
         }
         BODY.with_borrow_mut(|body| {
             // Everything but the sequence number is encoded and checksummed
             // before queueing, which keeps the writer lock's turns short.
-            body.encode(ops);
+            body.encode(ops, &blobs);
             let request = Request {
                 body,
                 ops: ops.len() as u64,
@@ -1204,13 +1454,14 @@ impl Inner {
             // has stored `out` and no longer touches it.
             let a = unsafe { (*request.out.get()).take() }.expect("served request")?;
             // A synchronous batch becomes visible once it is durable.
-            let flushed = a
-                .flush
-                .map_or(Ok(()), |log| log.start_flush().write())
-                .and_then(|()| a.sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
+            let flushed = a.flush.map_or(Ok(()), |log| log.flush()).and_then(|()| a.sync_to.map_or(Ok(()), |(log, end)| log.sync_to(end)));
             // SAFETY: see `Assigned::mem`; this writer stays counted in
             // until the `exit` below, its last use of the memtable.
             let mem = unsafe { &*a.mem };
+            if large {
+                let logged = blobs.iter().enumerate().filter_map(|(i, blob)| blob.map(|blob| (a.seq + i as u64, blob)));
+                mem.blobs.lock().extend(logged);
+            }
             mem.insert_all(ops, a.seq, a.ticket, ranges);
             self.commits.commit(a.ticket);
             mem.inflight.exit(request.shard);
@@ -1381,17 +1632,31 @@ impl Inner {
             }
         }
         self.timing.stall_ns.fetch_add(since(stall), Relaxed);
-        // The old segment must be durable before the new one takes writes,
-        // so that recovery always replays a prefix of history.
-        w.wal.sync()?;
         let id = w.active.id + 1;
         if self.opts.preallocate_log && !self.opts.background && self.recycler.is_empty() {
             // No thread prepares segments ahead, so this one is prepared
             // now, and a simulated run stays deterministic.
             self.recycler.prepare(&*self.storage, self.recycler.segment_len(self.opts.log_segment_len()), |_| true);
         }
-        let buffers = w.wal.take_buffers();
-        let wal = WalWriter::create(&*self.storage, id, self.recycler.take(), buffers)?;
+        // The old segment must be durable before the new one's file takes a
+        // record, so that recovery always replays a prefix of history. This
+        // thread holds the writer lock, so it leaves that sync, and the sync
+        // of the new segment's directory entry, to the new segment's first
+        // write: the new segment buffers its records until then, and its
+        // first flush or sync, outside the writer lock, runs this first.
+        // The old segment's buffers then wait here for the next rotation.
+        let settle = {
+            let (old, storage, spare) = (w.wal.log(), self.storage.clone(), self.log_buffers.clone());
+            move || -> Result<()> {
+                old.sync_to(old.len())?;
+                storage.sync_dir()?;
+                *spare.lock() = Some(old.take_buffers());
+                Ok(())
+            }
+        };
+        let buffers = self.log_buffers.lock().take().unwrap_or_default();
+        let sync_blobs = Some(self.sync_blobs.clone());
+        let wal = WalWriter::create_deferred(&*self.storage, id, self.recycler.take(), buffers, sync_blobs, Box::new(settle))?;
         let mem = Arc::new(Mem::new(id, &self.opts, w.next_seq - 1, &self.mem_pool));
         {
             let _g = self.version_lock.lock();
@@ -1411,6 +1676,7 @@ impl Inner {
                 _live: LiveVersion::new(&self.live_versions),
             }));
         }
+        *self.newest_log.lock() = wal.log();
         w.wal = wal;
         w.flush_claimed = 0;
         w.active = mem;
@@ -1444,7 +1710,10 @@ impl Inner {
         if covered == 0 {
             return match (found, &v.tree) {
                 (Some(val), _) => Ok(val.into_put()),
-                (None, Some(t)) => Ok(tree::get(&self.io, t, key, hash)?.and_then(Value::into_put)),
+                (None, Some(t)) => match tree::get(&self.io, t, key, hash)? {
+                    Some(found) => found.resolve(&self.io),
+                    None => Ok(None),
+                },
                 (None, None) => Ok(None),
             };
         }
@@ -1546,32 +1815,44 @@ impl Inner {
     /// a newer range delete covers, and carry a tombstone for each key of
     /// `tombstones`, the tree's keys the range deletes left, unless the
     /// memtable has a newer entry for it.
-    fn build_batches(&self, mem: &Mem, deletes: Option<&FrozenDeletes>, tombstones: &[Bytes], send: &mut dyn FnMut(Arc<DataPage>) -> bool) {
-        let mut b = Batcher::new(self, send);
+    ///
+    /// An entry whose value is at least [`Options::blob_threshold`] bytes
+    /// carries a pointer to its blob: the one its writer wrote, or one
+    /// written as the entry is cut, for a value that arrived without one,
+    /// as when the threshold was higher when its put was logged. Returns
+    /// the blobs written here.
+    fn build_batches(
+        &self,
+        mem: &Mem,
+        deletes: Option<&FrozenDeletes>,
+        tombstones: &[Bytes],
+        send: &mut dyn FnMut(Arc<DataPage>) -> bool,
+    ) -> Result<Built> {
+        let mut b = Batcher::new(self, mem.blobs.lock().iter().copied().collect(), send);
         let Some(deletes) = deletes else {
-            mem.table.for_each(&mut |key, value, _| b.push(EntryRef { key, value }));
+            mem.table.for_each(&mut |key, value, seq| b.push(key, value, seq));
             return b.finish();
         };
         let mut cover = deletes.cursor();
         let mut t = 0;
         mem.table.for_each(&mut |key, value, seq| {
             while t < tombstones.len() && tombstones[t][..] < *key {
-                b.push(EntryRef { key: &tombstones[t], value: None });
+                b.push(&tombstones[t], None, 0);
                 t += 1;
             }
             let hidden = cover.newest(key) > seq;
             let in_tree = t < tombstones.len() && tombstones[t][..] == *key;
             t += in_tree as usize;
             match (hidden, in_tree) {
-                (false, _) => b.push(EntryRef { key, value }),
-                (true, true) => b.push(EntryRef { key, value: None }),
+                (false, _) => b.push(key, value, seq),
+                (true, true) => b.push(key, None, 0),
                 (true, false) => {}
             }
         });
         for key in &tombstones[t..] {
-            b.push(EntryRef { key, value: None });
+            b.push(key, None, 0);
         }
-        b.finish();
+        b.finish()
     }
 
     /// Runs `f` on the store's merge pool, if it has one.
@@ -1627,7 +1908,10 @@ impl Inner {
             });
         }
         drop(version);
-        let io_bytes = || self.io.counters.span_read_bytes.load(Relaxed) + self.io.counters.page_bytes_written.load(Relaxed);
+        let io_bytes = || {
+            let c = &self.io.counters;
+            c.span_read_bytes.load(Relaxed) + c.page_bytes_written.load(Relaxed) + c.checkpoint_blob_bytes.load(Relaxed)
+        };
         let io_before = io_bytes();
         // The memtable's range deletes go first: everything in the tree is
         // older than they are.
@@ -1657,38 +1941,43 @@ impl Inner {
             if self.opts.background { self.apply_writing(&ctx, root, batches) } else { self.apply_then_write(&ctx, root, batches) }
         };
         let run = |rx| self.in_pool(|| apply(rx));
-        let applied = if self.opts.background {
+        let (applied, built) = if self.opts.background {
             // Another thread cuts the batches while this one applies them,
             // one batch ahead, so the checkpoint never holds a copy of the
             // memtable.
             std::thread::scope(|scope| {
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 let frozen = &*mem;
-                scope.spawn(move || {
+                let builder = scope.spawn(move || {
                     let t = std::time::Instant::now();
                     let mut blocked = 0;
-                    self.build_batches(frozen, deletes.as_ref(), &tombstones, &mut |batch| {
+                    let built = self.build_batches(frozen, deletes.as_ref(), &tombstones, &mut |batch| {
                         let t = std::time::Instant::now();
                         let open = tx.send(batch).is_ok();
                         blocked += since(t);
                         open
                     });
                     self.timing.build_ns.fetch_add(since(t) - blocked, Relaxed);
+                    built
                 });
-                run(rx)
+                let applied = run(rx);
+                (applied, builder.join().expect("batch builder panicked"))
             })
         } else {
             // Cut every batch first, so page ids, and with them simulated
             // runs, stay deterministic.
             let (tx, rx) = std::sync::mpsc::channel();
             let t = std::time::Instant::now();
-            self.build_batches(&mem, deletes.as_ref(), &tombstones, &mut |batch| tx.send(batch).is_ok());
+            let built = self.build_batches(&mem, deletes.as_ref(), &tombstones, &mut |batch| tx.send(batch).is_ok());
             self.timing.build_ns.fetch_add(since(t), Relaxed);
             drop(tx);
-            run(rx)
+            (run(rx), built)
         };
         self.io.pacer.stop();
+        let mut blobs = built?;
+        let wrote_blobs = !blobs.is_empty();
         let (root, created_files, written) = applied?;
+        blobs.extend(mem.blobs.lock().iter().map(|&(_, blob)| blob));
         let mut recent = self.checkpoint_io.lock();
         if recent.len() == 3 {
             recent.pop_front();
@@ -1697,7 +1986,7 @@ impl Inner {
         drop(recent);
         applier.root = root.clone();
         applier.last_applied = mem.id;
-        self.pending.lock().push_back(Applied { mem, root, created_files, written });
+        self.pending.lock().push_back(Applied { mem, root, created_files, written, blobs, wrote_blobs });
         Ok(true)
     }
 
@@ -1780,11 +2069,25 @@ impl Inner {
     fn commit_step(&self) -> Result<bool> {
         self.check_poisoned()?;
         let mut durable = self.durable.lock();
-        let Some(Applied { mem, root, created_files, written }) = self.pending.lock().pop_front() else {
+        let Some(Applied { mem, root, created_files, written, blobs, wrote_blobs }) = self.pending.lock().pop_front() else {
             return Ok(false);
         };
         let t = std::time::Instant::now();
-        self.io.store.sync()?;
+        // The memtable's writers wrote its blobs before they logged, and a
+        // segment's sync makes durable the blobs its records point to. So
+        // settling the newest segment, which syncs every segment before it
+        // that has yet to sync, the memtable's among them, leaves those
+        // blobs durable. It also leaves the memtable's segment with nothing
+        // more to write, and its file is reused once it retires. Only blobs
+        // the checkpoint wrote itself are left to sync, and of the page
+        // arenas, those it wrote to: each sync has the drive flush its
+        // cache, which holds up the writes then in flight.
+        let newest = self.newest_log.lock().clone();
+        newest.settle()?;
+        self.io.store.sync_new()?;
+        if wrote_blobs {
+            self.io.blobs.sync_new()?;
+        }
         if created_files {
             self.storage.sync_dir()?;
         }
@@ -1797,6 +2100,8 @@ impl Inner {
             next_page_id: self.next_page_id.load(SeqCst),
             root: root.as_ref().and_then(tree::root_ptr),
             range_deletes: durable.sb.range_deletes,
+            blobs: durable.sb.blobs,
+            next_blob_id: durable.sb.next_blob_id,
         };
         sb.store(&*self.storage)?;
         if std::env::var_os("TURTLEKV_DEBUG").is_some() {
@@ -1804,11 +2109,26 @@ impl Inner {
         }
 
         let mut live = HashSet::new();
+        let mut blob_pages = Vec::new();
         if let Some(r) = &root {
-            tree::reachable(r, &mut live);
+            tree::reachable(r, &mut live, &mut blob_pages);
         }
         let mut garbage: Vec<PagePtr> = durable.live.difference(&live).copied().collect();
+        // The new tree's pages count their blobs before the old tree's
+        // pages stop counting theirs, so a blob whose entry moved from one
+        // page to another stays counted throughout. A blob no page lists
+        // after that is garbage, as is one written for the memtable whose
+        // put never reached the tree.
+        blob_pages.into_iter().for_each(|p| durable.blobs.add(p));
+        let mut dead = Vec::new();
+        for ptr in &garbage {
+            durable.blobs.remove(ptr, &mut dead);
+        }
+        dead.extend(blobs.iter().filter(|b| !durable.blobs.counts.contains_key(b)).map(BlobPtr::page_ptr));
+        self.io.counters.blobs_live.store(durable.blobs.counts.len() as u64, Relaxed);
+        self.io.counters.blob_bytes_live.store(durable.blobs.bytes, Relaxed);
         garbage.extend(written.into_iter().filter(|p| !live.contains(p)));
+        let garbage = Garbage { pages: garbage, blobs: dead };
         let epoch = Arc::new(Epoch::new(self.io.clone()));
         let old_epoch = std::mem::replace(&mut durable.epoch, epoch.clone());
         durable.live = live;
@@ -1831,6 +2151,7 @@ impl Inner {
         // left free out of it while it punches their holes; holding `durable`
         // meanwhile keeps a leak check from finding a slot in neither.
         self.io.store.reclaim();
+        self.io.blobs.reclaim();
         drop(durable);
         self.timing.commit_ns.fetch_add(since(t), Relaxed);
         self.checkpoints.fetch_add(1, Relaxed);
@@ -1843,8 +2164,8 @@ impl Inner {
     }
 }
 
-/// Cuts sorted entries into batches of about one leaf each; see
-/// [`Inner::build_batches`].
+/// Cuts sorted entries into batches of about one leaf each, giving each
+/// large value's entry a pointer to its blob; see [`Inner::build_batches`].
 struct Batcher<'a> {
     inner: &'a Inner,
     send: &'a mut dyn FnMut(Arc<DataPage>) -> bool,
@@ -1852,23 +2173,58 @@ struct Batcher<'a> {
     open: bool,
     limit: u64,
     bits: u32,
+    /// The blobs the memtable's writers wrote, by sequence number.
+    logged: HashMap<u64, BlobPtr>,
+    /// Blobs written here so far.
+    written: Vec<BlobPtr>,
+    /// The failed blob write that closed the batcher.
+    failed: Option<Error>,
 }
 
 impl<'a> Batcher<'a> {
-    fn new(inner: &'a Inner, send: &'a mut dyn FnMut(Arc<DataPage>) -> bool) -> Self {
+    fn new(inner: &'a Inner, logged: HashMap<u64, BlobPtr>, send: &'a mut dyn FnMut(Arc<DataPage>) -> bool) -> Self {
         let (limit, bits) = (inner.opts.tree.leaf_size, inner.opts.tree.filter_bits);
-        Self { b: Self::builder(inner, limit), inner, send, open: true, limit, bits }
+        Self { b: Self::builder(inner, limit), inner, send, open: true, limit, bits, logged, written: Vec::new(), failed: None }
     }
 
     fn builder(inner: &Inner, limit: u64) -> PageBuilder {
         inner.io.builder(inner.next_page_id.fetch_add(1, Relaxed), (limit + limit / 16) as usize + 4096)
     }
 
+    /// Adds `key` with `value`, written at `seq`, or a tombstone for `None`.
     #[inline]
-    fn push(&mut self, e: EntryRef<'_>) {
+    fn push(&mut self, key: &[u8], value: Option<&[u8]>, seq: u64) {
         if !self.open {
             return;
         }
+        match value {
+            Some(v) if v.len() >= self.inner.opts.blob_threshold => self.push_blob(key, v, seq),
+            _ => self.push_entry(EntryRef::new(key, value)),
+        }
+    }
+
+    /// Adds `key` with a pointer to the blob that holds `value`: the one
+    /// the put at `seq` wrote, or else one written now.
+    #[cold]
+    fn push_blob(&mut self, key: &[u8], value: &[u8], seq: u64) {
+        let ptr = match self.logged.get(&seq) {
+            Some(ptr) => *ptr,
+            None => match self.inner.write_blob(value, true) {
+                Ok(ptr) => {
+                    self.written.push(ptr);
+                    ptr
+                }
+                Err(e) => {
+                    self.failed = Some(e);
+                    self.open = false;
+                    return;
+                }
+            },
+        };
+        self.push_entry(EntryRef { key, value: Some(&ptr.encode()), blob: true });
+    }
+
+    fn push_entry(&mut self, e: EntryRef<'_>) {
         if !self.b.is_empty() && self.b.data_bytes() + e.size() > self.limit {
             let full = std::mem::replace(&mut self.b, Self::builder(self.inner, self.limit));
             self.open = (self.send)(Arc::new(DataPage::unwritten(full.finish(self.bits))));
@@ -1876,10 +2232,14 @@ impl<'a> Batcher<'a> {
         self.b.push(e);
     }
 
-    fn finish(self) {
+    fn finish(self) -> Result<Built> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
         if self.open && !self.b.is_empty() {
             (self.send)(Arc::new(DataPage::unwritten(self.b.finish(self.bits))));
         }
+        Ok(self.written)
     }
 }
 
@@ -1960,11 +2320,16 @@ impl Snapshot {
 /// Small entries are copied into one buffer per call. Sharing them would
 /// make every result touch the reference count of a cached block, and
 /// threads scanning the same hot blocks contend on those counts.
+///
+/// Values that live in blobs are read once the scan has found its entries,
+/// each read started a few blobs ahead of the one being returned, so their
+/// device reads overlap.
 fn collect_scan(mut it: Forward, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
     it.tree.expect(limit);
     enum Part {
         Copied(usize, usize, usize),
         Shared(Bytes, Bytes),
+        Blob(Bytes, BlobPtr),
     }
     const COPY_LIMIT: usize = 512;
     let mut buf = Vec::with_capacity(4096);
@@ -1972,29 +2337,74 @@ fn collect_scan(mut it: Forward, limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
     while parts.len() < limit {
         let part = it.step(|e| {
             let (k, v) = (e.key(), e.value());
-            if k.len() + v.len() <= COPY_LIMIT {
-                let at = buf.len();
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(v);
-                Part::Copied(at, k.len(), v.len())
-            } else {
-                let (k, v) = e.to_owned();
-                Part::Shared(k, v)
+            if e.is_blob() || k.len() + v.len() > COPY_LIMIT {
+                return e.to_found().map(|(k, found)| match found {
+                    Found::Blob(ptr) => Part::Blob(k, ptr),
+                    Found::Value(v) => Part::Shared(k, v),
+                    Found::Delete => unreachable!("a scan steps over tombstones"),
+                });
             }
+            let at = buf.len();
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(v);
+            Ok(Part::Copied(at, k.len(), v.len()))
         })?;
         match part {
-            Some(p) => parts.push(p),
+            Some(p) => parts.push(p?),
             None => break,
         }
     }
+    let io = &it.snap.inner.io;
+    let blobs: Vec<BlobPtr> = parts.iter().filter_map(|p| if let Part::Blob(_, ptr) = p { Some(*ptr) } else { None }).collect();
+    let mut ahead = BlobReadAhead::new(io, &blobs);
     let buf = Bytes::from(buf);
-    Ok(parts
+    parts
         .into_iter()
         .map(|p| match p {
-            Part::Copied(at, kl, vl) => (buf.slice(at..at + kl), buf.slice(at + kl..at + kl + vl)),
-            Part::Shared(k, v) => (k, v),
+            Part::Copied(at, kl, vl) => Ok((buf.slice(at..at + kl), buf.slice(at + kl..at + kl + vl))),
+            Part::Shared(k, v) => Ok((k, v)),
+            Part::Blob(k, _) => Ok((k, ahead.next()?)),
         })
-        .collect())
+        .collect()
+}
+
+/// Reads a run of blobs in order, keeping the reads of the next few started
+/// ahead of the one being returned.
+struct BlobReadAhead<'a> {
+    io: &'a PageIo,
+    blobs: &'a [BlobPtr],
+    /// The next blob to return, and the first not yet started.
+    at: usize,
+    started: usize,
+    /// Stored bytes of the blobs started and not yet returned.
+    in_flight: u64,
+}
+
+/// Stored bytes of blobs a scan keeps reading ahead of the one it returns.
+const BLOB_READ_AHEAD: u64 = 4 << 20;
+
+impl<'a> BlobReadAhead<'a> {
+    fn new(io: &'a PageIo, blobs: &'a [BlobPtr]) -> Self {
+        Self { io, blobs, at: 0, started: 0, in_flight: 0 }
+    }
+
+    /// The value of the next blob.
+    fn next(&mut self) -> Result<Bytes> {
+        // The blob being returned is read by this thread; the ones after it
+        // start now.
+        self.started = self.started.max(self.at + 1);
+        while self.started < self.blobs.len() && self.in_flight < BLOB_READ_AHEAD {
+            self.io.prefetch_blob(&self.blobs[self.started]);
+            self.in_flight += self.blobs[self.started].len as u64;
+            self.started += 1;
+        }
+        let ptr = &self.blobs[self.at];
+        self.at += 1;
+        if self.at < self.started {
+            self.in_flight = self.in_flight.saturating_sub(self.blobs[self.at].len as u64);
+        }
+        self.io.read_blob(ptr)
+    }
 }
 
 /// An iterator over one snapshot's live entries, in either key order.
@@ -2029,8 +2439,9 @@ struct Reverse {
     /// Exclusive upper bound of what remains; `None` for the end of the key
     /// space.
     hi: Option<Bytes>,
-    /// The current window's entries in key order, taken from the back.
-    window: Vec<(Bytes, Bytes)>,
+    /// The current window's entries in key order, taken from the back. A
+    /// value that lives in a blob is read as its entry is returned.
+    window: Vec<(Bytes, Found)>,
     /// Leaf blocks the next window spans.
     blocks: usize,
     done: bool,
@@ -2056,8 +2467,8 @@ impl Reverse {
 
     fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
         loop {
-            if let Some(e) = self.window.pop() {
-                return Ok(Some(e));
+            if let Some((key, found)) = self.window.pop() {
+                return Ok(Some((key, live_value(found, &self.snap.inner.io)?)));
             }
             if self.done || self.hi.as_deref().is_some_and(|h| h <= &self.start[..]) {
                 self.done = true;
@@ -2065,7 +2476,7 @@ impl Reverse {
             }
             let lo = self.window_start();
             let mut forward = Forward::new(&self.snap, &lo, self.hi.as_deref());
-            while let Some(e) = forward.next()? {
+            while let Some(e) = forward.next_found()? {
                 self.window.push(e);
             }
             self.done = lo == self.start;
@@ -2171,6 +2582,11 @@ impl MemSource {
     }
 }
 
+/// The value of a live entry, read from its blob if it lives in one.
+fn live_value(found: Found, io: &PageIo) -> Result<Bytes> {
+    Ok(found.resolve(io)?.expect("a live entry holds a value"))
+}
+
 /// A live entry borrowed from the source that holds it.
 enum EntryView<'a> {
     Mem(&'a Bytes, &'a Bytes),
@@ -2185,6 +2601,7 @@ impl EntryView<'_> {
         }
     }
 
+    /// The value, or the encoded pointer of a value that lives in a blob.
     fn value(&self) -> &[u8] {
         match self {
             EntryView::Mem(_, v) => v,
@@ -2192,11 +2609,17 @@ impl EntryView<'_> {
         }
     }
 
-    /// Handles sharing the source's buffers.
-    fn to_owned(&self) -> (Bytes, Bytes) {
+    /// Whether the value lives in a blob.
+    fn is_blob(&self) -> bool {
+        matches!(self, EntryView::Tree(t) if t.is_blob())
+    }
+
+    /// The key and what its source holds for it, as handles sharing the
+    /// source's buffers.
+    fn to_found(&self) -> Result<(Bytes, Found)> {
         match self {
-            EntryView::Mem(k, v) => ((*k).clone(), (*v).clone()),
-            EntryView::Tree(t) => t.peek_owned().expect("settled"),
+            EntryView::Mem(k, v) => Ok(((*k).clone(), Found::Value((*v).clone()))),
+            EntryView::Tree(t) => Ok(t.peek_found()?.expect("settled")),
         }
     }
 }
@@ -2235,7 +2658,15 @@ impl Forward {
     }
 
     fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
-        self.step(|e| e.to_owned())
+        match self.next_found()? {
+            Some((key, found)) => Ok(Some((key, live_value(found, &self.snap.inner.io)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// The next live entry, with a value that lives in a blob left unread.
+    fn next_found(&mut self) -> Result<Option<(Bytes, Found)>> {
+        self.step(|e| e.to_found())?.transpose()
     }
 
     /// Finds the next live entry, passes it to `f`, and moves past it.

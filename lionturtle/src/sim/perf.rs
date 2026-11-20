@@ -67,6 +67,8 @@ pub fn run(cfg: &PerfConfig) -> PerfReport {
         // The experiment measures the tree's amplification, and its values,
         // zero past their first eight bytes, would mostly measure LZ4's.
         compression: Compression::None,
+        // Likewise, it measures values that travel through the tree.
+        blob_threshold: usize::MAX,
     };
     let db = Db::open(Arc::new(disk.clone()), opts).expect("open");
     let mut value = vec![0u8; cfg.value_size];

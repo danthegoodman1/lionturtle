@@ -1,5 +1,4 @@
 use super::*;
-use crate::pagestore::PageStore;
 use crate::sim::{FaultConfig, Rng, SimStorage};
 use std::collections::BTreeMap;
 
@@ -14,9 +13,8 @@ struct Harness {
 impl Harness {
     fn new(cfg: TreeConfig) -> Self {
         let disk = SimStorage::new(1, FaultConfig::default());
-        let store = PageStore::open(Arc::new(disk), &[]).unwrap();
         Self {
-            io: PageIo::new(store, 1 << 20, 1 << 16, crate::page::Compression::None),
+            io: PageIo::open(Arc::new(disk), 1 << 20, 1 << 16, crate::page::Compression::None).unwrap(),
             cfg,
             ids: AtomicU64::new(1),
             root: None,
@@ -29,7 +27,7 @@ impl Harness {
     }
 
     fn apply(&mut self, ops: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
-        let entries: Vec<EntryRef> = ops.iter().map(|(k, v)| EntryRef { key: k, value: v.as_deref() }).collect();
+        let entries: Vec<EntryRef> = ops.iter().map(|(k, v)| EntryRef::new(k, v.as_deref())).collect();
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let page = Arc::new(DataPage::unwritten(page_from_entries(id, entries, 10)));
         let root = apply_batch(&self.ctx(), self.root.as_ref(), page).unwrap();
@@ -57,7 +55,8 @@ impl Harness {
         assert!(got == self.model, "scan differs from model");
         for _ in 0..50 {
             let k = key(rng.below(2000));
-            let v = get(&self.io, root, &k, crate::bloom::hash_key(&k)).unwrap().and_then(Value::into_put).map(|b| b.to_vec());
+            let v =
+                get(&self.io, root, &k, crate::bloom::hash_key(&k)).unwrap().and_then(|f| f.resolve(&self.io).unwrap()).map(|b| b.to_vec());
             assert_eq!(v.as_ref(), self.model.get(&k), "get {:?}", String::from_utf8_lossy(&k));
         }
         let start = key(rng.below(2000));

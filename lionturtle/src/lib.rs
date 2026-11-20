@@ -7,6 +7,7 @@ pub mod wal;
 pub use error::{Error, Result};
 pub use types::{Op, OpRef, Value, WriteOp};
 pub mod arena;
+pub mod blob;
 pub mod bloom;
 pub mod db;
 pub mod memtable;

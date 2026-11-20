@@ -35,6 +35,7 @@ fn small_options(rng: &mut Rng) -> Options {
         pace_checkpoints: false,
         preallocate_log: false,
         compression: *rng.pick(&[lionturtle::Compression::None, lionturtle::Compression::Lz4]),
+        blob_threshold: *rng.pick(&[usize::MAX, 0, 16, 64]),
     }
 }
 

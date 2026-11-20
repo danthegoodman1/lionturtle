@@ -164,6 +164,14 @@ typedef struct lt_options {
    * Pivots per node before it splits.
    */
   size_t max_pivots;
+  /**
+   * Values of at least this many bytes are stored apart from the tree,
+   * each in a blob of its own, and the tree holds a pointer in the
+   * value's place. SIZE_MAX keeps every value in the tree. A store that
+   * has written a blob opens only with a version of lionturtle that has
+   * blobs.
+   */
+  size_t blob_threshold;
 } lt_options;
 
 /**

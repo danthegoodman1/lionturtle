@@ -15,13 +15,21 @@
 //!
 //! ```text
 //! block  = crc: u32 | count: u32 | offsets_pos: u32 | entry* | offset: u32 * count | padding
-//! entry  = key_len: u16 | value_len: u32 (high bit marks a tombstone) | key | value
+//! entry  = key_len: u16 | value_len: u32 | key | value
 //! ```
 //!
-//! The metadata region (index, keys, filter, footer) is what stays in memory
-//! while a page's blocks live on disk: the index holds each block's location,
-//! first item ordinal, and first key, the keys area holds those keys plus the
-//! page's last key, and the filter is a split-block Bloom filter over all keys.
+//! The top bit of `value_len` marks a tombstone, which has no value. The
+//! next marks an entry whose value lives in a blob: the entry holds a
+//! [`BlobPtr`] in the value's place.
+//!
+//! The metadata region (index, keys, filter, blob list, footer) is what
+//! stays in memory while a page's blocks live on disk: the index holds each
+//! block's location, first item ordinal, and first key, the keys area holds
+//! those keys plus the page's last key, and the filter is a split-block Bloom
+//! filter over all keys. The blob list repeats the pointer of each blob
+//! entry, in key order, so the store knows which blobs a page references
+//! without reading its blocks. It fills the space between the filter and
+//! whatever follows, and a page without blob entries has none.
 //!
 //! With [`Compression::Lz4`], a page's blocks go unpadded in memory, each
 //! holding about as many entries as compress into one 4 KiB page, and
@@ -31,7 +39,7 @@
 //! a map of where each stored block starts:
 //!
 //! ```text
-//! stored page  = stored block* | index | keys | filter | map | footer
+//! stored page  = stored block* | index | keys | filter | blob list | map | footer
 //! stored block = block
 //!              | crc: u32 | COMPRESSED: u32 | raw_len: u32 | payload_len: u32 | payload | padding
 //! map          = offset: u32 * n_blocks
@@ -46,6 +54,7 @@
 //! and stores them as their images, and [`sample_ratio`] compresses a sample
 //! of their blocks to tell when that changes.
 
+use crate::blob::BlobPtr;
 use crate::bloom;
 use crate::error::{Result, corruption};
 use crate::types::cmp_keys;
@@ -57,6 +66,10 @@ pub const BLOCK_SIZE: usize = 4096;
 const BLOCK_HEADER: usize = 12;
 const ENTRY_HEADER: usize = 6;
 const TOMBSTONE: u32 = 1 << 31;
+/// Marks an entry that holds a [`BlobPtr`] in place of its value.
+const BLOB: u32 = 1 << 30;
+/// The bits of an entry's value word that hold the value's length.
+const VALUE_LEN: u32 = BLOB - 1;
 const INDEX_RECORD: usize = 20;
 pub const FOOTER_LEN: usize = 64;
 const MAGIC: u32 = 0x5054_4b56;
@@ -88,14 +101,21 @@ pub fn entry_size(key_len: usize, value_len: usize) -> u64 {
     (ENTRY_HEADER + key_len + value_len) as u64
 }
 
-/// A borrowed entry: `value` is `None` for a tombstone.
+/// A borrowed entry: `value` is `None` for a tombstone, and an encoded
+/// [`BlobPtr`] when `blob` is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryRef<'a> {
     pub key: &'a [u8],
     pub value: Option<&'a [u8]>,
+    pub blob: bool,
 }
 
-impl EntryRef<'_> {
+impl<'a> EntryRef<'a> {
+    /// An entry holding `value` itself, or a tombstone for `None`.
+    pub fn new(key: &'a [u8], value: Option<&'a [u8]>) -> Self {
+        Self { key, value, blob: false }
+    }
+
     pub fn size(&self) -> u64 {
         entry_size(self.key.len(), self.value.map_or(0, <[u8]>::len))
     }
@@ -139,6 +159,9 @@ pub struct PageMeta {
     /// Offset of the stored-block map within the region; 0 when blocks are
     /// stored as in the image.
     map_off: u32,
+    /// Offset and length of the blob list within the region.
+    blobs_off: u32,
+    blobs_len: u32,
 }
 
 impl std::fmt::Debug for PageMeta {
@@ -178,11 +201,25 @@ impl PageMeta {
             data_bytes: u64_at(footer, 48),
             tombstones: u32_at(footer, 56),
             map_off: u32_at(footer, 60),
+            blobs_off: 0,
+            blobs_len: 0,
             raw,
         };
         if meta.id != expected_id {
             return Err(corruption(format!("expected page {expected_id}, found {}", meta.id)));
         }
+        // The blob list runs from the filter's end to the block map, or to
+        // the footer in a page without one.
+        let blobs_off = meta.filter_off as usize + meta.filter_len as usize;
+        let blobs_end = if meta.map_off != 0 { meta.map_off as usize } else { f };
+        if blobs_off > blobs_end || blobs_end > f || !(blobs_end - blobs_off).is_multiple_of(BlobPtr::ENCODED_LEN) {
+            return Err(corruption(format!("page {expected_id} blob list out of range")));
+        }
+        if raw_blobs(&meta.raw[blobs_off..blobs_end]).any(|b| BlobPtr::decode(b).is_err()) {
+            return Err(corruption(format!("page {expected_id} lists a malformed blob pointer")));
+        }
+        let mut meta = meta;
+        (meta.blobs_off, meta.blobs_len) = (blobs_off as u32, (blobs_end - blobs_off) as u32);
         if meta.map_off != 0 {
             let map_end = meta.map_off as usize + meta.n_blocks as usize * 4;
             if meta.map_off < meta.filter_off + meta.filter_len || map_end > f {
@@ -296,6 +333,17 @@ impl PageMeta {
         self.filter_len as usize
     }
 
+    /// Blob entries in the page.
+    pub fn n_blobs(&self) -> usize {
+        self.blobs_len as usize / BlobPtr::ENCODED_LEN
+    }
+
+    /// The pointer of each blob entry, in key order.
+    pub fn blobs(&self) -> impl Iterator<Item = BlobPtr> + '_ {
+        let list = &self.raw[self.blobs_off as usize..(self.blobs_off + self.blobs_len) as usize];
+        raw_blobs(list).map(|b| BlobPtr::decode(b).expect("verified when the metadata was decoded"))
+    }
+
     /// The block that would hold `key`, or `None` if `key` is outside the
     /// page's key range.
     pub fn find_block(&self, key: &[u8]) -> Option<usize> {
@@ -381,6 +429,14 @@ impl PageMeta {
     }
 }
 
+/// The encoded pointers of a blob list.
+fn raw_blobs(list: &[u8]) -> impl Iterator<Item = &[u8]> {
+    list.chunks_exact(BlobPtr::ENCODED_LEN)
+}
+
+/// Where an entry's parts lie in its block; see [`Block::entry_span`].
+pub type EntrySpan = (usize, usize, Option<(usize, usize)>, bool);
+
 /// A verified block.
 #[derive(Clone)]
 pub struct Block {
@@ -437,16 +493,17 @@ impl Block {
     }
 
     /// Byte offsets of entry `i` within the block: key start, key length,
-    /// and value start and length (`None` for a tombstone).
+    /// value start and length (`None` for a tombstone), and whether the
+    /// value is a blob pointer.
     #[inline]
-    pub fn entry_span(&self, i: usize) -> (usize, usize, Option<(usize, usize)>) {
+    pub fn entry_span(&self, i: usize) -> EntrySpan {
         let pos = self.entry_pos(i);
         let b = &self.bytes;
         let klen = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
         let vword = u32_at(b, pos + 2);
         let kstart = pos + ENTRY_HEADER;
-        let value = (vword & TOMBSTONE == 0).then_some((kstart + klen, vword as usize));
-        (kstart, klen, value)
+        let value = (vword & TOMBSTONE == 0).then_some((kstart + klen, (vword & VALUE_LEN) as usize));
+        (kstart, klen, value, vword & BLOB != 0)
     }
 
     pub fn raw(&self) -> &Bytes {
@@ -454,32 +511,16 @@ impl Block {
     }
 
     pub fn entry(&self, i: usize) -> EntryRef<'_> {
-        let pos = self.entry_pos(i);
+        let (kstart, klen, value, blob) = self.entry_span(i);
         let b = &self.bytes;
-        let klen = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
-        let vword = u32_at(b, pos + 2);
-        let kstart = pos + ENTRY_HEADER;
-        let key = &b[kstart..kstart + klen];
-        let value = if vword & TOMBSTONE != 0 {
-            None
-        } else {
-            let vstart = kstart + klen;
-            Some(&b[vstart..vstart + vword as usize])
-        };
-        EntryRef { key, value }
+        EntryRef { key: &b[kstart..kstart + klen], value: value.map(|(vstart, vlen)| &b[vstart..vstart + vlen]), blob }
     }
 
-    /// The value of entry `i` as a zero-copy slice; `None` for a tombstone.
-    pub fn value_bytes(&self, i: usize) -> Option<Bytes> {
-        let pos = self.entry_pos(i);
-        let b = &self.bytes;
-        let klen = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
-        let vword = u32_at(b, pos + 2);
-        if vword & TOMBSTONE != 0 {
-            return None;
-        }
-        let vstart = pos + ENTRY_HEADER + klen;
-        Some(self.bytes.slice(vstart..vstart + vword as usize))
+    /// The value of entry `i` as a zero-copy slice, `None` for a tombstone,
+    /// and whether it is a blob pointer.
+    pub fn value_bytes(&self, i: usize) -> (Option<Bytes>, bool) {
+        let (_, _, value, blob) = self.entry_span(i);
+        (value.map(|(vstart, vlen)| self.bytes.slice(vstart..vstart + vlen)), blob)
     }
 
     pub fn key_bytes(&self, i: usize) -> Bytes {
@@ -551,6 +592,8 @@ pub struct PageBuilder {
     data_bytes: u64,
     tombstones: u32,
     last_key: Vec<u8>,
+    /// The page's blob list so far.
+    blobs: Vec<u8>,
 }
 
 impl PageBuilder {
@@ -570,6 +613,7 @@ impl PageBuilder {
             data_bytes: 0,
             tombstones: 0,
             last_key: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -623,6 +667,11 @@ impl PageBuilder {
         self.block_entries.push((self.buf.len() - self.block_start) as u32);
         self.buf.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
         let vword = match e.value {
+            Some(v) if e.blob => {
+                debug_assert_eq!(v.len(), BlobPtr::ENCODED_LEN);
+                self.blobs.extend_from_slice(v);
+                v.len() as u32 | BLOB
+            }
             Some(v) => v.len() as u32,
             None => {
                 self.tombstones += 1;
@@ -680,6 +729,7 @@ impl PageBuilder {
         for &h in &self.hashes {
             bloom::insert(&mut self.buf[filter_start..], h);
         }
+        self.buf.extend_from_slice(&self.blobs);
         let footer_start = self.buf.len();
         self.buf.extend_from_slice(&MAGIC.to_le_bytes());
         self.buf.extend_from_slice(&[0; 4]);
@@ -928,7 +978,7 @@ mod tests {
             let key = format!("key{i:08}");
             let value = vec![i as u8; vlen];
             let v = if i % 7 == 3 { None } else { Some(&value[..]) };
-            b.push(EntryRef { key: key.as_bytes(), value: v });
+            b.push(EntryRef::new(key.as_bytes(), v));
         }
         b.finish(10)
     }
@@ -987,7 +1037,7 @@ mod tests {
                 value[j] = value[j - period];
             }
             let key = format!("key{i:08}");
-            b.push(EntryRef { key: key.as_bytes(), value: (i % 11 != 5).then_some(&value[..]) });
+            b.push(EntryRef::new(key.as_bytes(), (i % 11 != 5).then_some(&value[..])));
         }
         b.finish(10)
     }
@@ -1012,6 +1062,61 @@ mod tests {
     fn stored_block<'a>(stored: &'a [u8], meta: &PageMeta, i: usize) -> &'a [u8] {
         let end = if i + 1 < meta.n_blocks as usize { meta.stored_offset(i + 1) } else { meta.meta_off };
         &stored[meta.stored_offset(i) as usize..end as usize]
+    }
+
+    /// Blob entries keep their pointers and their mark through a page stored
+    /// either way, and the metadata lists the pointers in key order.
+    #[test]
+    fn blob_entries_and_their_list_round_trip() {
+        let ptr = |i: u32| BlobPtr { id: 1000 + i as u64, class: 8, slot: i, len: 5000 + i, raw_len: 9000 + i };
+        for block_cap in [None, Some(2 * BLOCK_SIZE)] {
+            let mut b = PageBuilder::new(7);
+            if let Some(cap) = block_cap {
+                b = b.for_compression(cap);
+            }
+            let mut want = Vec::new();
+            for i in 0..600u32 {
+                let key = format!("key{i:08}");
+                match i % 3 {
+                    0 => {
+                        want.push(ptr(i));
+                        b.push(EntryRef { key: key.as_bytes(), value: Some(&ptr(i).encode()), blob: true });
+                    }
+                    // A value as long as a pointer stays a value.
+                    1 => b.push(EntryRef::new(key.as_bytes(), Some(&[b'v'; BlobPtr::ENCODED_LEN]))),
+                    _ => b.push(EntryRef::new(key.as_bytes(), None)),
+                }
+            }
+            let page = b.finish(10);
+            assert_eq!(page.meta.n_blobs(), 200);
+            assert_eq!(page.meta.blobs().collect::<Vec<_>>(), want);
+            let check = |block: &Block, seen: &mut u32| {
+                for i in 0..block.len() {
+                    let e = block.entry(i);
+                    match *seen % 3 {
+                        0 => assert!(e.blob && BlobPtr::decode(e.value.unwrap()).unwrap() == ptr(*seen)),
+                        1 => assert!(!e.blob && e.value == Some(&[b'v'; BlobPtr::ENCODED_LEN][..])),
+                        _ => assert!(!e.blob && e.value.is_none()),
+                    }
+                    assert_eq!(block.value_bytes(i).1, e.blob);
+                    *seen += 1;
+                }
+            };
+            let mut seen = 0;
+            for bi in 0..page.meta.n_blocks as usize {
+                check(&sealed(page.clone()).block(bi).unwrap(), &mut seen);
+            }
+            assert_eq!(seen, 600);
+            let (stored, meta) = store(&page);
+            assert_eq!(meta.blobs().collect::<Vec<_>>(), want);
+            let mut seen = 0;
+            for bi in 0..meta.n_blocks as usize {
+                check(&Block::decode_stored(Bytes::copy_from_slice(stored_block(&stored, &meta, bi)), 7).unwrap(), &mut seen);
+            }
+            assert_eq!(seen, 600);
+        }
+        // A page without blob entries has an empty list.
+        assert_eq!(build(100, 50).meta.n_blobs(), 0);
     }
 
     #[test]

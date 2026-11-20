@@ -246,7 +246,6 @@ fn with_hi(t: &Subtree, hi: Option<&Bytes>) -> Subtree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pagestore::PageStore;
     use crate::sim::{FaultConfig, Rng, SimStorage};
     use std::collections::BTreeMap;
 
@@ -265,9 +264,8 @@ mod tests {
     impl Harness {
         fn new(cfg: TreeConfig, seed: u64) -> Self {
             let disk = SimStorage::new(seed, FaultConfig::default());
-            let store = PageStore::open(Arc::new(disk), &[]).unwrap();
             Self {
-                io: PageIo::new(store, 1 << 18, 1 << 16, crate::page::Compression::None),
+                io: PageIo::open(Arc::new(disk), 1 << 18, 1 << 16, crate::page::Compression::None).unwrap(),
                 cfg,
                 ids: AtomicU64::new(1),
                 root: None,
@@ -283,7 +281,7 @@ mod tests {
             if ops.is_empty() {
                 return;
             }
-            let entries: Vec<EntryRef> = ops.iter().map(|(k, v)| EntryRef { key: k, value: v.as_deref() }).collect();
+            let entries: Vec<EntryRef> = ops.iter().map(|(k, v)| EntryRef::new(k, v.as_deref())).collect();
             let id = self.ids.fetch_add(1, Ordering::Relaxed);
             let page = Arc::new(DataPage::unwritten(page_from_entries(id, entries, 10)));
             self.root = apply_batch(&self.ctx(), self.root.as_ref(), page).unwrap();
@@ -334,7 +332,10 @@ mod tests {
             assert!(got == self.model, "scan differs from model: {} vs {}", got.len(), self.model.len());
             for _ in 0..50 {
                 let k = key(rng.below(3000));
-                let v = get(&self.io, root, &k, crate::bloom::hash_key(&k)).unwrap().and_then(Value::into_put).map(|b| b.to_vec());
+                let v = get(&self.io, root, &k, crate::bloom::hash_key(&k))
+                    .unwrap()
+                    .and_then(|f| f.resolve(&self.io).unwrap())
+                    .map(|b| b.to_vec());
                 assert_eq!(v.as_ref(), self.model.get(&k));
             }
         }

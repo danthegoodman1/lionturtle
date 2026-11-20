@@ -12,6 +12,7 @@ Each section names its machine and setup. [How the benchmarks run](#how-the-benc
 - [Synchronous writes](#synchronous-writes)
 - [Clock speed](#clock-speed)
 - [Compression](#compression)
+- [Large values](#large-values)
 - [fjall in these runs](#fjall-in-these-runs)
 - [How the benchmarks run](#how-the-benchmarks-run)
 
@@ -358,6 +359,129 @@ bench/compression.sh bench-data/ycsb > compression.jsonl
   --cache-mb 256 --compression lz4 --compression-ratio 0.5
 ```
 
+## Large values
+
+16 GB of values under 8-byte keys, as 16,000 values of 1 MiB and as 250,000 of 64 KiB, on the workstation of [Compression](#compression): an Intel Core Ultra 9 285 (24 cores), 125 GB of RAM and a 2 TB Micron consumer NVMe drive (ext4, volatile write cache), under a 4 GB memory cap that covers page cache. Every engine got a 1 GB block cache, 128 MiB memtables, 16 client threads and LZ4, on values that LZ4 halves: each 32 KiB piece repeats its first half. lionturtle stored values of 32 KiB and over as [blobs](DESIGN.md#blobs) (`--blob-kb 32`). RocksDB ran BlobDB with the same `min_blob_size`, its garbage collection on and LZ4 on its blob files.
+
+`bench/blobs.sh` loads a store and runs A in one process, then C and E in a process each on the store it kept, so each read phase starts cold. It trims the drive before each load. Each engine ran twice, the second pass in reverse order. The tables give the mean of the two passes and the larger of their two maximums.
+
+| 1 MiB values (ops/s) | lionturtle | RocksDB BlobDB | vs RocksDB |
+|---|--:|--:|--:|
+| Load (inserts) | 3,849 | 993 | 3.88× |
+| A: 50% read, 50% update | 6,421 | 2,060 | 3.12× |
+| C: 100% read | 66,039 | 39,653 | 1.67× |
+| E: 95% scan of up to 100 keys, 5% insert | 342 | 276 | 1.24× |
+| Bytes written per user byte, load | 0.51 | 1.77 | |
+| Disk after A (GB) | 8.8 | 17.9 | |
+
+| 1 MiB values, latency (ms) | | p50 | p99 | p99.9 | max |
+|---|---|--:|--:|--:|--:|
+| Load: insert | lionturtle | 1.98 | 24.5 | 30.0 | 40 |
+| | RocksDB BlobDB | 13.9 | 57.7 | 127 | 201 |
+| A: update | lionturtle | 3.10 | 13.7 | 246 | 740 |
+| | RocksDB BlobDB | 14.5 | 32.0 | 112 | 153 |
+| A: read | lionturtle | 0.30 | 9.71 | 22.1 | 633 |
+| | RocksDB BlobDB | 0.35 | 5.43 | 28.7 | 60 |
+| C: read | lionturtle | 0.20 | 0.81 | 1.66 | 12 |
+| | RocksDB BlobDB | 0.37 | 0.98 | 3.08 | 51 |
+| E: scan | lionturtle | 37.5 | 120 | 136 | 147 |
+| | RocksDB BlobDB | 32.6 | 194 | 245 | 246 |
+
+| 64 KiB values (ops/s) | lionturtle | RocksDB BlobDB | vs RocksDB |
+|---|--:|--:|--:|
+| Load (inserts) | 26,520 | 11,079 | 2.39× |
+| A: 50% read, 50% update | 56,172 | 19,014 | 2.95× |
+| C: 100% read | 1,205,362 | 514,337 | 2.34× |
+| E: 95% scan of up to 100 keys, 5% insert | 6,305 | 4,847 | 1.30× |
+| Bytes written per user byte, load | 0.58 | 1.89 | |
+| Disk after A (GB) | 11.0 | 15.4 | |
+
+| 64 KiB values, latency (ms) | | p50 | p99 | p99.9 | max |
+|---|---|--:|--:|--:|--:|
+| Load: insert | lionturtle | 0.49 | 5.10 | 17.3 | 43 |
+| | RocksDB BlobDB | 1.38 | 2.23 | 4.16 | 58 |
+| A: update | lionturtle | 0.11 | 3.15 | 16.5 | 42 |
+| | RocksDB BlobDB | 1.53 | 2.44 | 4.41 | 96 |
+| A: read | lionturtle | 0.00 | 2.81 | 8.89 | 26 |
+| | RocksDB BlobDB | 0.03 | 1.87 | 12.8 | 466 |
+| C: read | lionturtle | 0.00 | 0.18 | 0.35 | 22 |
+| | RocksDB BlobDB | 0.03 | 0.13 | 0.37 | 26 |
+| E: scan | lionturtle | 2.33 | 9.47 | 16.5 | 140 |
+| | RocksDB BlobDB | 1.92 | 15.3 | 59.5 | 92 |
+
+The two passes agreed within 8%, except lionturtle's A at 1 MiB (8,304 and 4,537 ops/s), C at 64 KiB (1,131 and 1,279 thousand) and E at 64 KiB (5,993 and 6,618).
+
+- **Writes.** A lionturtle writer compresses its value and writes it to its blob's slot itself, then logs a pointer, so 16 writers write at once and the value reaches the drive once: 0.51 bytes per user byte at 1 MiB, on values LZ4 halves. RocksDB writes each value to its log and again to a blob file from its one flush thread, 1.77 bytes per user byte, and its writers stalled for 1.5 s of the 1 MiB load and 2.0 s of A.
+- **Pauses under the memory cap.** In the second pass, one pause held lionturtle's reads and updates on A at 1 MiB for 0.7 s; the first pass's slowest update took 30 ms. Pauses of 0.5 to 1.9 s struck both engines in their heaviest write phases: RocksDB's reads on A at 64 KiB, and both engines' A at 1 MiB without compression. lionturtle's come with the 4 GB cap: five runs of its A at 1 MiB without the cap ran as fast, and their slowest updates took 27 to 49 ms.
+- **Write tails at 64 KiB.** RocksDB's insert and update p99 and p99.9 are lower in closed loop: 2.2 and 4.2 ms on the load against 5.1 and 17.3. Its writers copy into a memtable and touch no file, where each lionturtle writer writes its blob to the drive, and waits when a checkpoint's syncs have the drive flush its cache, six times per checkpoint and a checkpoint every 75 ms at this rate. lionturtle's median and maximum are lower, and it wrote 2.4 times as many values a second. At equal load the order reverses; see below.
+- **Reads.** A value of up to 256 KiB enters lionturtle's block cache once read, verified and decompressed, so reads of hot 64 KiB values copy nothing: 2.3 times RocksDB's rate on C. At 1 MiB both read through the page cache, and lionturtle's store is half the size, so C read 3.9 GB from the drive against 8.0 GB.
+- **Scans.** A lionturtle scan finds its entries, then reads their blobs with the next 4 MiB of them started ahead. Its median scan is slower, 2.33 ms against 1.92 at 64 KiB and 37.5 against 32.6 at 1 MiB, and its p99.9 is 16.5 ms against 59.5 and 136 against 245.
+- **Space.** Each overwritten blob frees its own slot at the next checkpoint. BlobDB's garbage collection had yet to catch up when A ended: 17.9 GB on disk against 8.8 GB at 1 MiB, and 15.4 against 11.0 at 64 KiB.
+
+Workload A again at a fixed rate, about half of what RocksDB reached in closed loop, for 40 seconds after a load, with each latency counted from its operation's scheduled start. Two runs of each, alternating:
+
+| Workload A at a fixed rate, latency (ms) | | Read p99 | p99.9 | max | Update p99 | p99.9 | max |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 1 MiB values, 1,000 ops/s | lionturtle | 4.3, 4.0 | 21, 12 | 43, 31 | 4.6, 3.1 | 40, 33 | 50, 51 |
+| | RocksDB BlobDB | 1,029, 46 | 1,225, 213 | 1,319, 235 | 1,044, 63 | 1,247, 239 | 1,331, 251 |
+| 64 KiB values, 10,000 ops/s | lionturtle | 7.5, 6.3 | 28, 19 | 57, 29 | 10.4, 9.0 | 30, 20 | 59, 32 |
+| | RocksDB BlobDB | 323, 17 | 412, 41 | 430, 87 | 325, 15 | 414, 40 | 429, 88 |
+
+RocksDB reported 0.1 to 3.0 s of stalled writers in each run, and every operation scheduled during a stall waited behind it.
+
+With values kept in each engine's tree, one pass on the same data, lionturtle loaded 200 values of 1 MiB a second, 5.98 bytes written per user byte, and 4,300 of 64 KiB; RocksDB loaded 500 and 7,300. Blobs raised lionturtle's load 19 times at 1 MiB and 6 times at 64 KiB.
+
+Without compression, on values of random bytes, one pass:
+
+| Uncompressed (ops/s) | lionturtle | RocksDB BlobDB | vs RocksDB |
+|---|--:|--:|--:|
+| 1 MiB: load | 2,694 | 695 | 3.87× |
+| 1 MiB: A | 2,624 | 1,439 | 1.82× |
+| 1 MiB: C | 33,855 | 16,272 | 2.08× |
+| 1 MiB: bytes written per user byte, load | 1.01 | 2.40 | |
+| 1 MiB: disk after A (GB) | 17.4 | 32.9 | |
+| 64 KiB: load | 19,782 | 11,115 | 1.78× |
+| 64 KiB: A | 34,967 | 19,172 | 1.82× |
+| 64 KiB: C | 412,286 | 224,694 | 1.83× |
+| 64 KiB: bytes written per user byte, load | 1.08 | 2.30 | |
+| 64 KiB: disk after A (GB) | 21.1 | 31.1 | |
+
+| Uncompressed, p99.9 and max (ms) | lionturtle | RocksDB BlobDB |
+|---|--:|--:|
+| 1 MiB: load insert | 36, 54 | 698, 910 |
+| 1 MiB: A update | 655, 1,652 | 492, 1,873 |
+| 1 MiB: A read | 27, 244 | 113, 147 |
+| 1 MiB: C read | 6.2, 10 | 19, 63 |
+| 64 KiB: load insert | 20, 33 | 41, 621 |
+| 64 KiB: A update | 18, 59 | 3.0, 238 |
+| 64 KiB: A read | 16, 34 | 3.8, 106 |
+| 64 KiB: C read | 0.72, 4.8 | 1.7, 45 |
+
+Each value reaches the drive once, 1.01 bytes per user byte. At 1 MiB that is 2.7 GB/s of the drive's bandwidth during the load, and both engines paused on A, as above.
+
+Where blobs start to pay, on lionturtle alone: 4 GB of values of one size, kept in the tree or stored as blobs (`--blob-kb 1`), with LZ4, one pass:
+
+| Value size | Values | Load (ops/s) | A | C | E | Insert p99.9 (ms) | A update p99.9 | C read p99.9 | Written per user byte, load | Disk after A (GB) |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 4 KiB | in the tree | 80,996 | 145,474 | 1,087,734 | 11,862 | 7.5 | 0.77 | 0.32 | 4.79 | 5.8 |
+| | blobs | 62,167 | 139,773 | 1,620,674 | 41,341 | 4.7 | 5.1 | 0.12 | 1.05 | 4.9 |
+| 8 KiB | in the tree | 42,936 | 96,661 | 833,526 | 7,401 | 15 | 9.5 | 1.4 | 4.94 | 5.5 |
+| | blobs | 49,985 | 149,882 | 1,039,223 | 11,529 | 9.9 | 8.5 | 0.56 | 1.02 | 4.9 |
+| 16 KiB | in the tree | 27,151 | 59,850 | 667,033 | 6,350 | 236 | 133 | 1.6 | 3.95 | 4.3 |
+| | blobs | 41,335 | 109,136 | 951,521 | 8,779 | 14 | 13 | 0.26 | 0.77 | 3.7 |
+| 32 KiB | in the tree | 13,538 | 30,285 | 740,520 | 4,101 | 289 | 192 | 0.43 | 3.47 | 3.7 |
+| | blobs | 35,348 | 85,780 | 766,503 | 6,210 | 15 | 17 | 0.36 | 0.65 | 3.1 |
+
+From 8 KiB up, blobs led on every workload. At 4 KiB the tree loaded 30% faster and held update p99.9 under a millisecond, while blobs read and scanned faster. A blob's slot is padded to 4 KiB and its pointer and count take about 60 bytes of memory, so a 4 KiB value that LZ4 halves saves nothing as a blob, and each halving of the threshold doubles both costs. `blob_threshold` defaults to 32 KiB, where blobs loaded 2.6 times as fast as the tree and cut insert p99.9 from 289 to 15 ms.
+
+```console
+cargo build --release -p kvbench --features rocksdb
+# <dir> <value bytes> <records> <A ops> <C ops> <E ops> <blob KiB> <compression> "<engine:blobs ...>"
+bench/blobs.sh bench-data/blobs 1048576 16000 40000 400000 4000 32 lz4 "lionturtle:1 rocksdb:1"
+bench/blobs.sh bench-data/blobs 65536 250000 600000 4000000 400000 32 lz4 "lionturtle:1 rocksdb:1"
+bench/blobs.sh bench-data/blobs 32768 131072 65536 262144 26214 1 lz4 "lionturtle:0 lionturtle:1"
+```
+
 ## fjall in these runs
 
 fjall trails here by more than its own benchmarks suggest, because these runs use 16–32 client threads and scan after update phases. Both stress parts of fjall's design:
@@ -375,6 +499,7 @@ fjall trails here by more than its own benchmarks suggest, because these runs us
 - RocksDB runs on jemalloc, its production allocator. lionturtle and fjall run on mimalloc.
 - kvbench turns off transparent huge pages for its process. mimalloc asks for them on its arenas, and under a memory cap they leave less of it for page cache: on C at 50M records with LZ4 under a 4 GB cap, lionturtle kept 1.2 GB of page cache with them and 2.3 GB without, and ran 37% faster without. Between two runs of `bench/compression.sh`, turning them off raised lionturtle's throughput after the load by 13–33% with LZ4 and 4–19% without, and moved RocksDB's by at most 7%. Reads during sustained writes, Clock speed and the workstation rows of Synchronous writes ran with them on; every other section ran with them off.
 - lionturtle's Bloom filters use 12 bits per key against RocksDB's 10. The extra memory counts against its cap.
+- `--blob-kb <n>` stores values of at least `n` KiB apart from each tree: it sets lionturtle's `blob_threshold`, and turns on RocksDB's BlobDB with that `min_blob_size`, its garbage collection, and the tree's compression on its blob files. Without it, lionturtle keeps every value in its tree. `--compression-ratio` fills a value a 32 KiB piece at a time, each piece repeating its random start, so LZ4, which finds repeats within 64 KiB, compresses values of any length to that ratio.
 - Latency runs need a quiet drive. Each read of an NVMe drive's temperature in `/sys/class/hwmon` sends the drive a SMART log request, and the workstation's drive holds reads about 3.4 ms behind each one; monitoring agents that poll every second put a floor under every second's p99. Eight ClickHouse processes, polling together, made that floor about 40 ms.
 - Runs on an SSD need it trimmed. A drive that has not been told which blocks were freed copies them during garbage collection, and on the workstation's drive, mounted without `discard` and trimmed weekly, identical runs drifted 30% apart after a few hundred GB of copies were written and deleted. Run `sudo fstrim /` before each run; after one full trim, six alternating runs of three builds landed within 2% of each other.
 - On machines where RocksDB's write path collapses with many loading threads, `--load-threads` loads it with fewer, in the same process as the read phases.

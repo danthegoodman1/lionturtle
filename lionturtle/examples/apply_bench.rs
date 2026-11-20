@@ -6,7 +6,6 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use lionturtle::page::{EntryRef, PageBuilder};
-use lionturtle::pagestore::PageStore;
 use lionturtle::storage::FsStorage;
 use lionturtle::tree::io::{DataPage, PageIo};
 use lionturtle::tree::{self, Ctx, TreeConfig};
@@ -24,7 +23,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(dir);
     let storage = Arc::new(FsStorage::new(dir).unwrap());
     let cfg = TreeConfig { leaf_size: leaf_kb << 10, parallel, ..Default::default() };
-    let io = PageIo::new(PageStore::open(storage, &[]).unwrap(), 1 << 30, cfg.leaf_size * 3, lionturtle::Compression::None);
+    let io = PageIo::open(storage, 1 << 30, cfg.leaf_size * 3, lionturtle::Compression::None).unwrap();
     let ids = AtomicU64::new(1);
     let ctx = Ctx { cfg: &cfg, io: &io, next_page_id: &ids };
     let mut root = None;
@@ -47,7 +46,7 @@ fn main() {
         keys.dedup();
         let mut pb = PageBuilder::with_capacity(ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed), cfg.leaf_size as usize + 65536);
         for k in keys {
-            pb.push(EntryRef { key: &k.to_be_bytes(), value: Some(&value) });
+            pb.push(EntryRef::new(&k.to_be_bytes(), Some(&value)));
         }
         let batch = Arc::new(DataPage::unwritten(pb.finish(cfg.filter_bits)));
         t_build += t.elapsed().as_secs_f64();

@@ -46,6 +46,9 @@ fn small_options(memtable: MemTableKind) -> Options {
         pace_checkpoints: true,
         preallocate_log: false,
         compression: lionturtle::Compression::None,
+        // About half of the values are at least this long, so readers and
+        // scanners resolve blobs while checkpoints write and free them.
+        blob_threshold: 64,
     }
 }
 
@@ -190,6 +193,7 @@ fn atomic_batches(memtable: MemTableKind) {
         pace_checkpoints: true,
         preallocate_log: false,
         compression: lionturtle::Compression::None,
+        blob_threshold: usize::MAX,
     };
     let db = Arc::new(Db::open(Arc::new(SimStorage::new(7, FaultConfig::default())), opts).unwrap());
     // Pair `p` is keys 2p and 2p + 1; writer `w` owns the pairs with p % WRITERS == w,
@@ -329,6 +333,7 @@ fn atomic_range_deletes(memtable: MemTableKind) {
         pace_checkpoints: true,
         preallocate_log: false,
         compression: lionturtle::Compression::None,
+        blob_threshold: usize::MAX,
     };
     let db = Arc::new(Db::open(Arc::new(SimStorage::new(13, FaultConfig::default())), opts).unwrap());
     let prefix = |g: u64| format!("g{g}/").into_bytes();
