@@ -431,7 +431,7 @@ impl PageMeta {
 
 /// The encoded pointers of a blob list.
 fn raw_blobs(list: &[u8]) -> impl Iterator<Item = &[u8]> {
-    list.chunks_exact(BlobPtr::ENCODED_LEN)
+    list.as_chunks::<{ BlobPtr::ENCODED_LEN }>().0.iter().map(|ptr| ptr.as_slice())
 }
 
 /// Where an entry's parts lie in its block; see [`Block::entry_span`].
