@@ -5,6 +5,9 @@
 //! Everything runs on one thread against [`SimStorage`], with checkpoints
 //! driven explicitly, so a seed replays the same run exactly.
 //!
+//! Writes include range deletes: narrow and wide ranges, prefixes, and
+//! ranges inside batches with the puts and deletes they cover.
+//!
 //! What the model checks:
 //! - every `get` and `scan` matches the model, unless it returns an error;
 //! - after a crash, the store recovers exactly the state after some write
@@ -33,6 +36,7 @@ use std::sync::Arc;
 pub struct Report {
     pub steps: u64,
     pub writes: u64,
+    pub range_deletes: u64,
     pub reads: u64,
     pub scans: u64,
     pub snapshots: u64,
@@ -44,12 +48,36 @@ pub struct Report {
     pub write_failures: u64,
     pub max_height: u32,
     pub final_keys: usize,
+    /// Blobs written and read, and the most the tree referenced at once.
+    pub blobs_written: u64,
+    pub blob_reads: u64,
+    pub max_blobs: u64,
 }
 
 struct Undo {
     seq: u64,
     key: Vec<u8>,
     prev: Option<Vec<u8>>,
+}
+
+/// One write as the model applies it.
+#[derive(Clone, Debug)]
+enum ModelOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+    DeleteRange(Vec<u8>, Option<Vec<u8>>),
+}
+
+impl ModelOp {
+    fn write_op(&self) -> WriteOp {
+        match self {
+            ModelOp::Put(k, v) => WriteOp::put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)),
+            ModelOp::Delete(k) => WriteOp::delete(Bytes::copy_from_slice(k)),
+            ModelOp::DeleteRange(start, end) => {
+                WriteOp::DeleteRange { start: Bytes::copy_from_slice(start), end: end.as_deref().map(Bytes::copy_from_slice) }
+            }
+        }
+    }
 }
 
 /// The expected contents of the store and enough history to rewind it.
@@ -62,14 +90,30 @@ struct Model {
 }
 
 impl Model {
-    fn apply(&mut self, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
-        for (key, value) in ops {
+    fn apply(&mut self, ops: &[ModelOp]) {
+        for op in ops {
             self.last_seq += 1;
-            let prev = match value {
-                Some(v) => self.state.insert(key.clone(), v.clone()),
-                None => self.state.remove(key),
-            };
-            self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+            match op {
+                ModelOp::Put(key, value) => {
+                    let prev = self.state.insert(key.clone(), value.clone());
+                    self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+                }
+                ModelOp::Delete(key) => {
+                    let prev = self.state.remove(key);
+                    self.undo.push(Undo { seq: self.last_seq, key: key.clone(), prev });
+                }
+                ModelOp::DeleteRange(start, end) => {
+                    if end.as_ref().is_some_and(|e| e <= start) {
+                        continue;
+                    }
+                    let hi = end.clone().map_or(Bound::Unbounded, Bound::Excluded);
+                    let doomed: Vec<Vec<u8>> = self.state.range((Bound::Included(start.clone()), hi)).map(|(k, _)| k.clone()).collect();
+                    for key in doomed {
+                        let prev = self.state.remove(&key);
+                        self.undo.push(Undo { seq: self.last_seq, key, prev });
+                    }
+                }
+            }
         }
     }
 
@@ -154,11 +198,18 @@ fn random_options(rng: &mut Rng) -> Options {
         pace_checkpoints: false,
         preallocate_log: rng.chance(0.5),
         compression: *rng.pick(&[Compression::None, Compression::Lz4]),
+        // Leaves here hold a few kilobytes, so thresholds from every value
+        // to none put a seed's values on either side of the line.
+        blob_threshold: *rng.pick(&[usize::MAX, usize::MAX, 0, 24, 100, 400, 1500]),
     }
 }
 
 fn random_faults(rng: &mut Rng) -> FaultConfig {
-    let mut f = FaultConfig { crash_keep_sector: *rng.pick(&[0.0, 0.5, 0.9, 1.0]), ..Default::default() };
+    let mut f = FaultConfig {
+        crash_keep_sector: *rng.pick(&[0.0, 0.5, 0.9, 1.0]),
+        corrupt_classes: vec!["pages".to_string(), "blobs".to_string()],
+        ..Default::default()
+    };
     if rng.chance(0.5) {
         f.read_error = *rng.pick(&[0.001, 0.01]);
     }
@@ -225,6 +276,16 @@ impl Sim {
         self.db.as_ref().expect("db open")
     }
 
+    /// Closes the store, adding its blob counters to the report.
+    fn close(&mut self) {
+        if let Some(db) = self.db.take() {
+            let s = db.stats();
+            self.report.blobs_written += s.blobs_written;
+            self.report.blob_reads += s.blob_reads;
+            self.report.max_blobs = self.report.max_blobs.max(s.blobs);
+        }
+    }
+
     /// Opens the store, retrying through transient read faults. Some opens
     /// switch compression, so stores mix pages stored both ways.
     fn open(&mut self) -> Result<(), String> {
@@ -239,16 +300,19 @@ impl Sim {
         }
         let mut last_err = String::new();
         let faults = self.disk.faults();
+        // Recovery tells a logged put's torn blob from a whole one by its
+        // checksum, as it tells a torn log record, so corrupting a blob
+        // read there would fabricate data loss no real device produces.
+        let recovering = FaultConfig { corrupt_classes: vec!["pages".to_string()], ..faults.clone() };
         for attempt in 0..100 {
             // Recovery reads the whole tree's metadata, so at high fault rates
             // it rarely gets through; after some attempts under faults, let it.
-            if attempt >= 20 {
-                self.disk.set_faults(FaultConfig { read_error: 0.0, read_corruption: 0.0, ..faults.clone() });
-            }
+            self.disk.set_faults(match attempt >= 20 {
+                true => FaultConfig { read_error: 0.0, read_corruption: 0.0, ..recovering.clone() },
+                false => recovering.clone(),
+            });
             let opened = Db::open(Arc::new(self.disk.clone()), self.opts.clone());
-            if attempt >= 20 {
-                self.disk.set_faults(faults.clone());
-            }
+            self.disk.set_faults(faults.clone());
             match opened {
                 Ok(db) => {
                     self.db = Some(db);
@@ -288,19 +352,40 @@ impl Sim {
         v
     }
 
-    fn write(&mut self, ops: Vec<(Vec<u8>, Option<Vec<u8>>)>, sync: bool) -> Result<(), String> {
-        let wops: Vec<WriteOp> = ops
-            .iter()
-            .map(|(k, v)| match v {
-                Some(v) => WriteOp::put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v)),
-                None => WriteOp::delete(Bytes::copy_from_slice(k)),
-            })
-            .collect();
+    /// A range to delete: usually a narrow one between two keys, sometimes
+    /// a prefix, an unbounded range, or an empty or inverted one.
+    fn range(&mut self) -> (Vec<u8>, Option<Vec<u8>>) {
+        let start = self.key();
+        match self.rng.below(20) {
+            0 => (start, None),
+            1..4 => {
+                let mut p = start;
+                p.truncate(self.rng.range(0, p.len() as u64 + 1) as usize);
+                let end = crate::types::prefix_end(&p).map(|e| e.to_vec());
+                (p, end)
+            }
+            _ => {
+                // Keys sort by their random head, so a neighbour in the key
+                // list is close by, and an arbitrary key is far.
+                let end = if self.rng.chance(0.8) {
+                    let i = self.keys.partition_point(|k| *k < start);
+                    self.keys[(i + self.rng.below(4) as usize).min(self.keys.len() - 1)].clone()
+                } else {
+                    self.key()
+                };
+                (start, Some(end))
+            }
+        }
+    }
+
+    fn write(&mut self, ops: Vec<ModelOp>, sync: bool) -> Result<(), String> {
+        let wops: Vec<WriteOp> = ops.iter().map(ModelOp::write_op).collect();
         let before = self.db().last_seq();
         let result = self.db().write(&wops, sync);
         let after = self.db().last_seq();
         match result {
             Ok(()) => {
+                self.report.range_deletes += ops.iter().filter(|op| matches!(op, ModelOp::DeleteRange(..))).count() as u64;
                 self.model.apply(&ops);
                 if after != self.model.last_seq {
                     return Err(format!("sequence mismatch: db {after}, model {}", self.model.last_seq));
@@ -326,7 +411,7 @@ impl Sim {
     fn crash_and_recover(&mut self) -> Result<(), String> {
         self.iters.clear();
         self.snaps.clear();
-        self.db = None;
+        self.close();
         self.disk.crash();
         self.report.crashes += 1;
         self.open()?;
@@ -348,7 +433,7 @@ impl Sim {
         self.iters.clear();
         self.snaps.clear();
         let poisoned = self.db().is_poisoned();
-        self.db = None;
+        self.close();
         if poisoned {
             return self.crash_and_recover();
         }
@@ -386,8 +471,9 @@ impl Sim {
                     return Err(format!("invariant violated: {}", msg.unwrap_or_default()));
                 }
             }
-            let h = self.db().stats().tree.height;
-            self.report.max_height = self.report.max_height.max(h);
+            let s = self.db().stats();
+            self.report.max_height = self.report.max_height.max(s.tree.height);
+            self.report.max_blobs = self.report.max_blobs.max(s.blobs);
         }
         Ok(())
     }
@@ -475,8 +561,9 @@ impl Sim {
                         && got.iter().zip(&self.model.state).all(|((gk, gv), (ek, ev))| gk[..] == ek[..] && gv[..] == ev[..]);
                     if !ok {
                         let missing = self.model.state.keys().filter(|k| !got.iter().any(|(g, _)| g[..] == k[..])).count();
+                        let differs = got.iter().zip(&self.model.state).find(|((gk, gv), (ek, ev))| gk[..] != ek[..] || gv[..] != ev[..]);
                         return Err(format!(
-                            "full scan has {} entries, model has {} ({missing} model keys missing)",
+                            "full scan has {} entries, model has {} ({missing} model keys missing); first difference: {differs:?}",
                             got.len(),
                             self.model.state.len()
                         ));
@@ -605,23 +692,35 @@ impl Sim {
             0..300 => {
                 let (k, v) = (self.key(), self.value());
                 let sync = self.rng.chance(0.05);
-                self.write(vec![(k, Some(v))], sync)
+                self.write(vec![ModelOp::Put(k, v)], sync)
             }
-            300..380 => {
+            300..360 => {
                 let k = self.key();
                 let sync = self.rng.chance(0.05);
-                self.write(vec![(k, None)], sync)
+                self.write(vec![ModelOp::Delete(k)], sync)
+            }
+            360..380 => {
+                let (start, end) = self.range();
+                let sync = self.rng.chance(0.05);
+                self.write(vec![ModelOp::DeleteRange(start, end)], sync)
             }
             380..430 => {
+                // Ops apply in order, so a batch may write a key and then
+                // range-delete it, or the reverse.
                 let n = self.rng.range(2, 10);
-                let mut ops = BTreeMap::new();
+                let mut ops = Vec::new();
                 for _ in 0..n {
-                    let k = self.key();
-                    let v = self.rng.chance(0.8).then(|| self.value());
-                    ops.insert(k, v);
+                    ops.push(match self.rng.below(10) {
+                        0 => {
+                            let (start, end) = self.range();
+                            ModelOp::DeleteRange(start, end)
+                        }
+                        1 | 2 => ModelOp::Delete(self.key()),
+                        _ => ModelOp::Put(self.key(), self.value()),
+                    });
                 }
                 let sync = self.rng.chance(0.2);
-                self.write(ops.into_iter().collect(), sync)
+                self.write(ops, sync)
             }
             430..650 => {
                 let k = if self.rng.chance(0.9) { self.key() } else { b"missing-key".to_vec() };
@@ -701,5 +800,6 @@ fn run_inner(seed: u64, steps: u64, verbose: bool) -> Result<Report, String> {
     sim.check_invariants().map_err(|e| format!("seed {seed} final: {e}"))?;
     sim.verify_all().map_err(|e| format!("seed {seed} final: {e}"))?;
     sim.report.final_keys = sim.model.state.len();
+    sim.close();
     Ok(sim.report)
 }

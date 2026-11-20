@@ -129,6 +129,33 @@ int main(int argc, char **argv) {
   expect(db, NULL, "ca", "4");
   OK(lt_iter_new(db, "", 0, NULL, 0, false, &it));
   expect_keys(it, "bccaempty");
+
+  /* Range deletes: [b, cb) takes b, c and ca; a batch's writes apply in
+     order, so cz, put after its range delete, survives it. */
+  OK(lt_put(db, "d", 1, "5", 1, false));
+  OK(lt_put(db, "dd", 2, "6", 1, false));
+  OK(lt_delete_range(db, "b", 1, "cb", 2, false));
+  OK(lt_iter_new(db, "", 0, NULL, 0, false, &it));
+  expect_keys(it, "dddempty");
+  batch = lt_batch_new();
+  OK(lt_batch_put(batch, "ex", 2, "7", 1));
+  OK(lt_batch_delete_prefix(batch, "e", 1));
+  OK(lt_batch_put(batch, "cz", 2, "8", 1));
+  OK(lt_batch_delete_range(batch, "z", 1, NULL, 0));
+  OK(lt_write(db, batch, true));
+  lt_batch_free(batch);
+  expect(db, NULL, "ex", NULL);
+  expect(db, NULL, "empty", NULL);
+  expect(db, NULL, "cz", "8");
+  OK(lt_delete_prefix(db, "d", 1, true));
+  OK(lt_iter_new(db, "", 0, NULL, 0, true, &it));
+  expect_keys(it, "cz");
+  CHECK(lt_delete_range(db, NULL, 1, NULL, 0, false) == LT_INVALID_ARGUMENT);
+  OK(lt_checkpoint(db));
+  lt_close(db);
+  OK(lt_open(argv[1], NULL, &db));
+  OK(lt_iter_new(db, "", 0, NULL, 0, false, &it));
+  expect_keys(it, "cz");
   lt_close(db);
 
   puts("c_api: ok");

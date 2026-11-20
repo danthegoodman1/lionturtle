@@ -61,6 +61,7 @@ impl Turtle {
             pace_checkpoints: args.pace,
             preallocate_log: args.preallocate_log,
             compression: args.compression,
+            blob_threshold: if args.blob_kb > 0 { (args.blob_kb as usize) << 10 } else { usize::MAX },
         };
         let storage = Arc::new(lionturtle::storage::FsStorage::new(&args.dir).unwrap());
         Self { db: lionturtle::Db::open(storage, opts).unwrap() }
@@ -99,7 +100,7 @@ impl Engine for Turtle {
     fn stats_json(&self) -> String {
         let s = self.db.stats();
         format!(
-            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_mb":{:.1},"image_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"stage_secs":{:?}}}"#,
+            r#"{{"checkpoints":{},"page_mb_written":{:.1},"pages_written":{},"block_reads":{},"span_reads":{},"span_read_mb":{:.1},"cache_mb":{:.1},"image_mb":{:.1},"memtable_mb":{:.1},"frozen":{},"height":{},"nodes":{},"leaves":{},"segments":{},"leaf_mb":{:.1},"buffer_mb":{:.1},"filter_mb":{:.1},"index_mb":{:.1},"blobs":{},"blob_mb":{:.1},"blob_mb_written":{:.1},"blob_reads":{},"stage_secs":{:?}}}"#,
             s.checkpoints,
             s.page_bytes_written as f64 / 1e6,
             s.pages_written,
@@ -118,6 +119,10 @@ impl Engine for Turtle {
             s.tree.buffer_bytes as f64 / 1e6,
             s.tree.filter_bytes as f64 / 1e6,
             s.tree.index_bytes as f64 / 1e6,
+            s.blobs,
+            s.blob_bytes as f64 / 1e6,
+            s.blob_bytes_written as f64 / 1e6,
+            s.blob_reads,
             s.stage_secs.map(|x| (x * 100.0).round() / 100.0),
         )
     }
@@ -213,6 +218,17 @@ impl Rocks {
         }
         if args.rocksdb_rate_mb > 0 {
             opts.set_auto_tuned_ratelimiter((args.rocksdb_rate_mb << 20) as i64, 100_000, 10);
+        }
+        if args.blob_kb > 0 {
+            // BlobDB with its garbage collection on, compressing blobs as
+            // the tree's blocks are compressed.
+            opts.set_enable_blob_files(true);
+            opts.set_min_blob_size(args.blob_kb << 10);
+            opts.set_enable_blob_gc(true);
+            opts.set_blob_compression_type(match args.compression {
+                lionturtle::Compression::None => rocksdb::DBCompressionType::None,
+                lionturtle::Compression::Lz4 => rocksdb::DBCompressionType::Lz4,
+            });
         }
         Self { db: rocksdb::DB::open(&opts, &args.dir).unwrap() }
     }

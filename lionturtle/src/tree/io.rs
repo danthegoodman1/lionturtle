@@ -4,6 +4,7 @@
 //! it, and written at the next checkpoint. Writing moves its image into the
 //! cache; after that its blocks come from the cache or from disk.
 
+use crate::blob::{self, BlobPtr};
 use crate::error::Result;
 use crate::page::{self, BLOCK_SIZE, Block, Compression, PageBuilder, PageId, PageImage, PageMeta};
 use crate::pagestore::{PagePtr, PageStore};
@@ -119,6 +120,8 @@ impl DataPage {
 enum Cached {
     Image(Bytes),
     Block(Block),
+    /// The value of a blob, verified and decompressed.
+    Blob(Bytes),
 }
 
 #[derive(Clone)]
@@ -127,13 +130,25 @@ struct Weigh;
 impl quick_cache::Weighter<(PageId, u32), Cached> for Weigh {
     fn weight(&self, _key: &(PageId, u32), val: &Cached) -> u64 {
         match val {
-            Cached::Image(b) => b.len() as u64,
+            Cached::Image(b) | Cached::Blob(b) => b.len() as u64,
             Cached::Block(b) => b.raw().len() as u64,
         }
     }
 }
 
 const IMAGE: u32 = u32::MAX;
+/// The cache key of a blob's value pairs this with the blob's id. Blob ids
+/// and page ids overlap, and no page has this many blocks.
+const BLOB: u32 = u32::MAX - 1;
+/// The largest value the cache holds. A cached value is read without a
+/// copy, a checksum or decompression, and takes its full length of the
+/// cache; left to the page cache, it takes its stored length there. Under a
+/// 4 GB memory cap, caching 64 KiB values raised a read-only workload's
+/// throughput by 30%, and caching 1 MiB values left it level while read
+/// p99.9 rose from 3.5 to 21 ms: a hit saves less of what a miss costs as
+/// values grow, and the cache's share of memory comes out of the page
+/// cache's.
+const MAX_CACHED_BLOB: u64 = 256 << 10;
 
 /// Hashes a cache key, a page id and a block number, by folding the words
 /// together and finishing with splitmix64's avalanche. It has no random
@@ -199,6 +214,15 @@ pub struct IoCounters {
     pub span_read_bytes: AtomicU64,
     pub pages_written: AtomicU64,
     pub page_bytes_written: AtomicU64,
+    pub blobs_written: AtomicU64,
+    /// Bytes of blobs written, as stored, and those of them that
+    /// checkpoints wrote.
+    pub blob_bytes_written: AtomicU64,
+    pub checkpoint_blob_bytes: AtomicU64,
+    pub blob_reads: AtomicU64,
+    /// Blobs the durable tree references, and their bytes as stored.
+    pub blobs_live: AtomicU64,
+    pub blob_bytes_live: AtomicU64,
 }
 
 /// A checkpoint's I/O schedule: `expected` bytes of merge reads and page
@@ -296,10 +320,42 @@ impl Pacer {
     }
 }
 
+thread_local! {
+    /// The buffer this thread's blob writes are composed in.
+    static BLOB_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The largest blob buffer a thread keeps between writes. Each writer
+/// thread has one, so a larger blob's buffer is freed once it is written.
+const KEEP_BLOB_BUF: usize = 2 << 20;
+
+/// Runs `f` on a buffer of `len` bytes, rounded up to a multiple of
+/// [`DIRECT_ALIGN`], at an aligned address, kept by the calling thread. Its
+/// contents are arbitrary. Writers call this, each on its own thread, so
+/// none waits for another's buffer and each reuses memory it has faulted in.
+fn with_thread_buf<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let len = len.next_multiple_of(DIRECT_ALIGN);
+    BLOB_BUF.with_borrow_mut(|buf| {
+        if buf.len() < len + DIRECT_ALIGN {
+            *buf = vec![0u8; len + DIRECT_ALIGN];
+        }
+        let start = buf.as_ptr().align_offset(DIRECT_ALIGN);
+        let r = f(&mut buf[start..start + len]);
+        if buf.len() > KEEP_BLOB_BUF {
+            *buf = Vec::new();
+        }
+        r
+    })
+}
+
 /// Reads and writes data pages through a byte-weighted cache. The cache
 /// hashes deterministically, so simulated runs replay exactly.
 pub struct PageIo {
     pub store: PageStore,
+    /// The arenas that hold blobs. They are files of their own, so that
+    /// releasing a blob's space, which locks its file against reads on some
+    /// file systems, leaves reads of the tree alone.
+    pub blobs: PageStore,
     cache: Cache<(PageId, u32), Cached, Weigh, BuildKeyHasher>,
     pub counters: IoCounters,
     pub pacer: Pacer,
@@ -313,6 +369,10 @@ pub struct PageIo {
     /// Bytes each block of a page built for compression holds: about what
     /// compresses into one page, judged from recent pages.
     block_target: AtomicUsize,
+    /// Values up to this many bytes are cached once read from their blobs:
+    /// at most [`MAX_CACHED_BLOB`], and an eighth of a cache shard, so one
+    /// value displaces little of what its shard holds.
+    cached_blob: u64,
 }
 
 /// Share of a page that a block compressing at the learned ratio fills,
@@ -326,7 +386,20 @@ const COMPRESSED_FILL: f64 = 0.97;
 const MIN_COMPRESSED_BLOCK: usize = BLOCK_SIZE + BLOCK_SIZE / 8;
 
 impl PageIo {
-    pub fn new(store: PageStore, cache_bytes: u64, max_image: u64, compression: Compression) -> Self {
+    /// Opens the page and blob arenas in `storage` with every slot free:
+    /// for a store that holds nothing yet, or to read one whose live slots
+    /// are still unknown.
+    pub fn open(
+        storage: std::sync::Arc<dyn crate::storage::Storage>,
+        cache_bytes: u64,
+        max_image: u64,
+        compression: Compression,
+    ) -> Result<Self> {
+        let store = PageStore::open(storage.clone(), &[])?;
+        Ok(Self::new(store, PageStore::open_blobs(storage, &[], 0)?, cache_bytes, max_image, compression))
+    }
+
+    pub fn new(store: PageStore, blobs: PageStore, cache_bytes: u64, max_image: u64, compression: Compression) -> Self {
         // Every shard must hold a few whole page images.
         let shards = (cache_bytes / (max_image.max(1) * 4)).clamp(1, 64) as usize;
         let options = quick_cache::OptionsBuilder::new()
@@ -337,6 +410,7 @@ impl PageIo {
             .expect("valid cache options");
         Self {
             store,
+            blobs,
             cache: Cache::with_options(options, Weigh, BuildKeyHasher::default(), Default::default()),
             counters: IoCounters::default(),
             pacer: Pacer::default(),
@@ -344,6 +418,7 @@ impl PageIo {
             write_bufs: Mutex::new(Vec::new()),
             max_write_buf: (max_image + max_image / 8) as usize + (2 << 20),
             block_target: AtomicUsize::new(BLOCK_SIZE),
+            cached_blob: (cache_bytes / shards as u64 / 8).min(MAX_CACHED_BLOB),
         }
     }
 
@@ -593,6 +668,55 @@ impl PageIo {
         Ok(created)
     }
 
+    /// Writes `value` as blob `id` to a fresh slot and returns its pointer.
+    /// A checkpoint's blob write is `paced` like its page writes; a writer's
+    /// goes out in one write.
+    pub fn write_blob(&self, id: PageId, value: &[u8], paced: bool) -> Result<BlobPtr> {
+        let compress = self.compression == Compression::Lz4;
+        let bound = blob::stored_bound(value.len(), compress);
+        let write = |out: &mut [u8]| {
+            let len = blob::encode(id, value, compress, out);
+            let padded = len.next_multiple_of(DIRECT_ALIGN);
+            out[len..padded].fill(0);
+            let slot = self.blobs.allocate(id, len as u64, 0)?;
+            match paced {
+                true => self.blobs.write_aligned(&slot, &out[..padded], self.write_piece(), &|n| self.pacer.take(n))?,
+                false => self.blobs.write_aligned(&slot, &out[..padded], usize::MAX, &|_| {})?,
+            };
+            self.counters.blobs_written.fetch_add(1, Relaxed);
+            self.counters.blob_bytes_written.fetch_add(len as u64, Relaxed);
+            if paced {
+                self.counters.checkpoint_blob_bytes.fetch_add(len as u64, Relaxed);
+            }
+            Ok(BlobPtr { id, class: slot.class, slot: slot.slot, len: slot.len, raw_len: value.len() as u32 })
+        };
+        if paced { self.with_write_buf(bound, write) } else { with_thread_buf(bound, write) }
+    }
+
+    /// Starts reading the blob at `ptr` into the page cache without waiting.
+    pub fn prefetch_blob(&self, ptr: &BlobPtr) {
+        self.blobs.prefetch_background(&ptr.page_ptr(), 0, ptr.len as u64);
+    }
+
+    /// The value of the blob at `ptr`: from the cache, or read from its
+    /// slot, verified and decompressed. A value of up to `cached_blob` bytes
+    /// then enters the cache, so reads of a hot value share one buffer and
+    /// skip the read, the checksum and the decompression. Longer values are
+    /// left to the page cache.
+    pub fn read_blob(&self, ptr: &BlobPtr) -> Result<Bytes> {
+        let cached = ptr.raw_len as u64 <= self.cached_blob;
+        if cached && let Some(Cached::Blob(value)) = self.cache.get(&(ptr.id, BLOB)) {
+            return Ok(value);
+        }
+        let stored = self.blobs.read(&ptr.page_ptr(), 0, ptr.len as u64)?;
+        self.counters.blob_reads.fetch_add(1, Relaxed);
+        let value = blob::decode(ptr, stored)?;
+        if cached {
+            self.cache.insert((ptr.id, BLOB), Cached::Blob(value.clone()));
+        }
+        Ok(value)
+    }
+
     /// Reads the metadata region of a written page.
     pub fn load_meta(&self, ptr: &PagePtr) -> Result<PageMeta> {
         let raw = self.store.read(ptr, ptr.meta_off as u64, (ptr.len - ptr.meta_off) as u64)?;
@@ -735,8 +859,7 @@ mod tests {
     fn compressed_blocks_learn_to_fill_their_pages() {
         use crate::page::EntryRef;
         use crate::sim::{FaultConfig, SimStorage};
-        let store = PageStore::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), &[]).unwrap();
-        let io = PageIo::new(store, 1 << 20, 4 << 20, Compression::Lz4);
+        let io = PageIo::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), 1 << 20, 4 << 20, Compression::Lz4).unwrap();
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut fill = 0.0;
         for id in 1..=6u64 {
@@ -751,7 +874,7 @@ mod tests {
                     chunk.copy_from_slice(&seed.to_le_bytes());
                 }
                 value.copy_within(..56, 64);
-                b.push(EntryRef { key: &(id << 32 | i).to_be_bytes(), value: Some(&value) });
+                b.push(EntryRef::new(&(id << 32 | i).to_be_bytes(), Some(&value)));
             }
             let image = b.finish(10);
             let (bytes, meta) = (image.bytes.clone(), image.meta.clone());
@@ -777,8 +900,7 @@ mod tests {
     fn pages_store_as_images_while_blocks_compress_too_little() {
         use crate::page::EntryRef;
         use crate::sim::{FaultConfig, SimStorage};
-        let store = PageStore::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), &[]).unwrap();
-        let io = PageIo::new(store, 1 << 20, 4 << 20, Compression::Lz4);
+        let io = PageIo::open(std::sync::Arc::new(SimStorage::new(1, FaultConfig::default())), 1 << 20, 4 << 20, Compression::Lz4).unwrap();
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next_id = 0u64;
         // Writes a page of 120-byte values, random throughout or with their
@@ -798,7 +920,7 @@ mod tests {
                 if compressible {
                     value.copy_within(..56, 64);
                 }
-                b.push(EntryRef { key: &(next_id << 32 | i).to_be_bytes(), value: Some(&value) });
+                b.push(EntryRef::new(&(next_id << 32 | i).to_be_bytes(), Some(&value)));
             }
             let page = DataPage::unwritten(b.finish(10));
             let laid_out = !page.meta.blocks_fill_pages();

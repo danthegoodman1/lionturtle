@@ -77,50 +77,94 @@ impl Value {
 
 /// One mutation in a write batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WriteOp {
-    pub key: Bytes,
-    pub value: Value,
+pub enum WriteOp {
+    Put {
+        key: Bytes,
+        value: Bytes,
+    },
+    Delete {
+        key: Bytes,
+    },
+    /// Deletes every key in `[start, end)`; `None` leaves the range
+    /// unbounded above. An empty or inverted range deletes nothing.
+    DeleteRange {
+        start: Bytes,
+        end: Option<Bytes>,
+    },
 }
 
 impl WriteOp {
     pub fn put(key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
-        Self { key: key.into(), value: Value::Put(value.into()) }
+        Self::Put { key: key.into(), value: value.into() }
     }
 
     pub fn delete(key: impl Into<Bytes>) -> Self {
-        Self { key: key.into(), value: Value::Delete }
+        Self::Delete { key: key.into() }
+    }
+
+    /// Deletes every key in `[start, end)`.
+    pub fn delete_range(start: impl Into<Bytes>, end: impl Into<Bytes>) -> Self {
+        Self::DeleteRange { start: start.into(), end: Some(end.into()) }
+    }
+
+    /// Deletes `start` and every key after it.
+    pub fn delete_from(start: impl Into<Bytes>) -> Self {
+        Self::DeleteRange { start: start.into(), end: None }
+    }
+
+    /// Deletes every key that starts with `prefix`.
+    pub fn delete_prefix(prefix: impl Into<Bytes>) -> Self {
+        let start = prefix.into();
+        let end = prefix_end(&start);
+        Self::DeleteRange { start, end }
     }
 }
 
-/// One mutation as the write path reads it: a key, and a value to put or
-/// `None` to delete the key. The log and the memtable each copy what they
-/// keep, so a batch can borrow its caller's bytes: [`Db::write`] takes a
-/// slice of [`WriteOp`]s, or of `(key, value)` pairs of byte slices.
+/// A mutation over borrowed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpRef<'a> {
+    Put(&'a [u8], &'a [u8]),
+    Delete(&'a [u8]),
+    /// Every key in `[start, end)`, or from `start` on for `None`.
+    DeleteRange(&'a [u8], Option<&'a [u8]>),
+}
+
+/// One mutation as the write path reads it. The log and the memtable each
+/// copy what they keep, so a batch can borrow its caller's bytes:
+/// [`Db::write`] takes a slice of [`WriteOp`]s, of [`OpRef`]s, or of
+/// `(key, value)` pairs of byte slices.
 ///
 /// [`Db::write`]: crate::Db::write
 pub trait Op {
-    fn key(&self) -> &[u8];
-    fn value(&self) -> Option<&[u8]>;
+    fn op(&self) -> OpRef<'_>;
 }
 
 impl Op for WriteOp {
-    fn key(&self) -> &[u8] {
-        &self.key
+    #[inline]
+    fn op(&self) -> OpRef<'_> {
+        match self {
+            WriteOp::Put { key, value } => OpRef::Put(key, value),
+            WriteOp::Delete { key } => OpRef::Delete(key),
+            WriteOp::DeleteRange { start, end } => OpRef::DeleteRange(start, end.as_deref()),
+        }
     }
+}
 
-    fn value(&self) -> Option<&[u8]> {
-        self.value.as_put().map(|v| &v[..])
+impl Op for OpRef<'_> {
+    #[inline]
+    fn op(&self) -> OpRef<'_> {
+        *self
     }
 }
 
 /// A borrowed key and the value to put, or `None` to delete the key.
 impl Op for (&[u8], Option<&[u8]>) {
-    fn key(&self) -> &[u8] {
-        self.0
-    }
-
-    fn value(&self) -> Option<&[u8]> {
-        self.1
+    #[inline]
+    fn op(&self) -> OpRef<'_> {
+        match self.1 {
+            Some(v) => OpRef::Put(self.0, v),
+            None => OpRef::Delete(self.0),
+        }
     }
 }
 

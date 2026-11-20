@@ -35,18 +35,25 @@ impl Rng {
 
     /// Fills a value that compresses to about `ratio` of its size, as
     /// db_bench's --compression_ratio does: random bytes for that share of
-    /// it, repeated to fill the rest.
+    /// it, repeated to fill the rest. A value longer than [`PATTERN`] is
+    /// filled a piece of that length at a time, so each repeat lies within
+    /// the 64 KiB that LZ4 looks back over.
     pub fn fill_value(&mut self, buf: &mut [u8], ratio: f64) {
-        let random = ((buf.len() as f64 * ratio).ceil() as usize).clamp(1, buf.len().max(1)).min(buf.len());
-        self.fill(&mut buf[..random]);
-        let mut filled = random;
-        while filled < buf.len() {
-            let n = random.min(buf.len() - filled);
-            buf.copy_within(..n, filled);
-            filled += n;
+        for piece in buf.chunks_mut(PATTERN) {
+            let random = ((piece.len() as f64 * ratio).ceil() as usize).clamp(1, piece.len());
+            self.fill(&mut piece[..random]);
+            let mut filled = random;
+            while filled < piece.len() {
+                let n = random.min(piece.len() - filled);
+                piece.copy_within(..n, filled);
+                filled += n;
+            }
         }
     }
 }
+
+/// Bytes of a value that [`Rng::fill_value`] fills as one pattern.
+const PATTERN: usize = 32 << 10;
 
 /// splitmix64's finalizer: a bijection on u64, so distinct ids give
 /// distinct keys in a scrambled order.

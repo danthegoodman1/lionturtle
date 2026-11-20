@@ -93,6 +93,10 @@ pub struct Args {
     pub compression_ratio: f64,
     /// Choose keys uniformly instead of by scrambled Zipfian.
     pub uniform: bool,
+    /// Values of at least this many KiB are stored apart from the tree:
+    /// lionturtle's blob threshold and RocksDB's `min_blob_size` with BlobDB
+    /// on. 0 keeps every value inline.
+    pub blob_kb: u64,
     pub timeline: Option<String>,
 }
 
@@ -170,6 +174,7 @@ fn parse_args() -> Args {
         },
         compression_ratio: get("--compression-ratio").map_or(1.0, |v| v.parse().expect("--compression-ratio")),
         uniform: num("--uniform", 0) == 1,
+        blob_kb: num("--blob-kb", 0),
         timeline: get("--timeline"),
     }
 }

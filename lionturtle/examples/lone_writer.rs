@@ -82,7 +82,8 @@ fn main() {
             .collect();
         let began = start.elapsed();
         let (t, faults) = (Instant::now(), minor_faults());
-        db.get(&batch[0].key).unwrap();
+        let WriteOp::Put { key: first, .. } = &batch[0] else { unreachable!("the batch holds puts") };
+        db.get(first).unwrap();
         db.write(&batch, true).unwrap();
         commits.push((t.elapsed().as_nanos() as u64, minor_faults() - faults, began));
     }

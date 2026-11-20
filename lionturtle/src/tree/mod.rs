@@ -23,9 +23,13 @@
 
 pub mod codec;
 pub mod cursor;
+mod delete;
 pub mod io;
 pub mod ranges;
 
+pub use delete::{delete_ranges, live_keys};
+
+use crate::blob::BlobPtr;
 use crate::error::{Result, corruption};
 use crate::page::{EntryRef, PageBuilder, PageId, PageImage};
 use crate::pagestore::PagePtr;
@@ -173,6 +177,14 @@ impl Segment {
             && cmp_keys(self.page.meta.max_key(), lo).is_ge()
             && self.hi.as_ref().is_none_or(|h| cmp_keys(h, lo).is_gt())
             && hi.is_none_or(|hi| cmp_keys(self.min_key(), hi).is_lt())
+    }
+
+    /// Whether the segment may hold a live key in `[lo, hi)`: false when
+    /// its dead keys cover every key of its clipped range there, as after
+    /// a range delete.
+    pub fn may_hold_live(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
+        let Some(start) = live_start(self, lo) else { return false };
+        start <= self.page.meta.max_key() && hi.is_none_or(|h| start < h) && self.hi.as_deref().is_none_or(|h| start < h)
     }
 
     fn range_is_empty(&self) -> bool {
@@ -865,22 +877,33 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
         return Ok(root.cloned());
     }
     let batch = vec![Segment::whole(batch)];
-    let mut pieces: Vec<Piece> = match root {
+    let pieces: Vec<Piece> = match root {
         None => leaf_pieces(leaf_apply(ctx, None, &batch)?, &Bytes::new()),
         Some(Subtree::Leaf(leaf)) => leaf_pieces(leaf_apply(ctx, Some(leaf), &batch)?, &Bytes::new()),
         Some(Subtree::Node(n)) => {
             let mut n = (**n).clone();
             node_apply(ctx, &mut n, batch)?;
-            split_if_needed(ctx, n)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect()
+            node_pieces(split_if_needed(ctx, n)?)
         }
     };
+    settle_root(ctx, pieces)
+}
+
+fn node_pieces(nodes: Vec<Node>) -> Vec<Piece> {
+    nodes.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect()
+}
+
+/// The root over `pieces`, the pieces a change to the root became: a new
+/// root above them if there are several, and a root with a single child
+/// gives way to it.
+fn settle_root(ctx: &Ctx, mut pieces: Vec<Piece>) -> Result<Option<Subtree>> {
     loop {
         match pieces.len() {
             0 => return Ok(None),
             1 => break,
             _ => {
                 let root = new_root(ctx, pieces);
-                pieces = split_if_needed(ctx, root)?.into_iter().map(|n| (n.pivots[0].clone(), Subtree::Node(Arc::new(n)))).collect();
+                pieces = node_pieces(split_if_needed(ctx, root)?);
             }
         }
     }
@@ -915,23 +938,62 @@ pub fn apply_batch(ctx: &Ctx, root: Option<&Subtree>, batch: Arc<DataPage>) -> R
     unreachable!()
 }
 
+/// What the tree holds for a key: its value, a pointer to the blob that
+/// holds its value, or a tombstone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    Value(Bytes),
+    Blob(BlobPtr),
+    Delete,
+}
+
+impl Found {
+    /// What an entry's value bytes mean: a blob pointer when `blob` is set.
+    pub fn from_entry(value: Option<Bytes>, blob: bool) -> Result<Self> {
+        Ok(match value {
+            Some(v) if blob => Found::Blob(BlobPtr::decode(&v)?),
+            Some(v) => Found::Value(v),
+            None => Found::Delete,
+        })
+    }
+
+    /// The value, read from its blob if it lives in one; `None` for a
+    /// tombstone.
+    pub fn resolve(self, io: &PageIo) -> Result<Option<Bytes>> {
+        match self {
+            Found::Value(v) => Ok(Some(v)),
+            Found::Blob(ptr) => io.read_blob(&ptr).map(Some),
+            Found::Delete => Ok(None),
+        }
+    }
+}
+
+impl From<Value> for Found {
+    fn from(v: Value) -> Self {
+        match v {
+            Value::Put(v) => Found::Value(v),
+            Value::Delete => Found::Delete,
+        }
+    }
+}
+
 /// Looks `key` up in one page.
-fn lookup_page(io: &PageIo, page: &DataPage, key: &[u8]) -> Result<Option<Value>> {
+fn lookup_page(io: &PageIo, page: &DataPage, key: &[u8]) -> Result<Option<Found>> {
     let Some(b) = page.meta.find_block(key) else { return Ok(None) };
     let block = io.block(page, b)?;
-    Ok(match block.search(key) {
-        Ok(i) => Some(match block.value_bytes(i) {
-            Some(v) => Value::Put(v),
-            None => Value::Delete,
-        }),
-        Err(_) => None,
-    })
+    match block.search(key) {
+        Ok(i) => {
+            let (value, blob) = block.value_bytes(i);
+            Found::from_entry(value, blob).map(Some)
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// The newest state of `key`, whose [`crate::bloom::hash_key`] is `hash`, in the
-/// tree: `Some(Value::Delete)` if a buffered tombstone hides it, `None` if
+/// tree: `Some(Found::Delete)` if a buffered tombstone hides it, `None` if
 /// the tree has no entry for it.
-pub fn get(io: &PageIo, root: &Subtree, key: &[u8], hash: u64) -> Result<Option<Value>> {
+pub fn get(io: &PageIo, root: &Subtree, key: &[u8], hash: u64) -> Result<Option<Found>> {
     let prefix = key_prefix(key);
     let mut cur = root;
     loop {
@@ -1109,11 +1171,19 @@ impl TreeScan {
         }
     }
 
-    /// The current live entry, after [`TreeScan::settle`].
+    /// The current live entry, after [`TreeScan::settle`]: its key, and its
+    /// value or, where [`TreeScan::is_blob`] says so, its encoded blob
+    /// pointer.
     #[inline]
     pub fn peek(&self) -> Option<(&[u8], &[u8])> {
         let e = self.merger.as_ref()?.peek()?;
         Some((e.key, e.value?))
+    }
+
+    /// Whether the current entry's value lives in a blob.
+    #[inline]
+    pub fn is_blob(&self) -> bool {
+        self.merger.as_ref().and_then(Merger::peek).is_some_and(|e| e.blob)
     }
 
     /// The current entry as slices sharing its block's buffer.
@@ -1121,6 +1191,15 @@ impl TreeScan {
         match self.merger.as_ref()?.peek_owned()? {
             (k, Some(v)) => Some((k, v)),
             (_, None) => None,
+        }
+    }
+
+    /// The current entry's key and what the tree holds for it.
+    pub fn peek_found(&self) -> Result<Option<(Bytes, Found)>> {
+        let blob = self.is_blob();
+        match self.peek_owned() {
+            Some((k, v)) => Ok(Some((k, Found::from_entry(Some(v), blob)?))),
+            None => Ok(None),
         }
     }
 
@@ -1133,12 +1212,34 @@ impl TreeScan {
         }
     }
 
-    /// The next live entry.
+    /// Moves to the first live entry at or after `key`, or past the end for
+    /// `None`. Steps over a few entries in place, and reopens the scan at
+    /// `key` past those.
+    pub fn skip_to(&mut self, io: &PageIo, key: Option<&[u8]>) -> Result<()> {
+        const STEPS: usize = 16;
+        let Some(key) = key else {
+            self.merger = None;
+            self.next_start = None;
+            return Ok(());
+        };
+        for _ in 0..STEPS {
+            self.settle(io)?;
+            match self.peek() {
+                Some((k, _)) if cmp_keys(k, key).is_lt() => self.advance(io)?,
+                _ => return Ok(()),
+            }
+        }
+        self.merger = None;
+        self.next_start = self.end.as_ref().is_none_or(|e| key < &e[..]).then(|| Bytes::copy_from_slice(key));
+        Ok(())
+    }
+
+    /// The next live entry, its value read from its blob if it lives in one.
     pub fn next(&mut self, io: &PageIo) -> Result<Option<(Bytes, Bytes)>> {
         self.settle(io)?;
-        let out = self.peek_owned();
+        let Some((key, found)) = self.peek_found()? else { return Ok(None) };
         self.advance(io)?;
-        Ok(out)
+        Ok(found.resolve(io)?.map(|value| (key, value)))
     }
 }
 
@@ -1574,21 +1675,25 @@ fn load_subtree(io: &PageIo, ptr: PagePtr, height: u32, pages: &mut HashMap<Page
     Ok(Subtree::Node(Arc::new(node)))
 }
 
-/// Every page location the tree references.
-pub fn reachable(t: &Subtree, out: &mut std::collections::HashSet<PagePtr>) {
-    match t {
-        Subtree::Leaf(p) => {
-            out.insert(p.ptr().expect("reachable pages are written"));
+/// Every page location the tree references, added to `out`, and each data
+/// page among those new to `out` that lists blobs, added to `blob_pages`.
+pub fn reachable(t: &Subtree, out: &mut std::collections::HashSet<PagePtr>, blob_pages: &mut Vec<Arc<DataPage>>) {
+    fn data_page(p: &Arc<DataPage>, out: &mut std::collections::HashSet<PagePtr>, blob_pages: &mut Vec<Arc<DataPage>>) {
+        if out.insert(p.ptr().expect("reachable pages are written")) && p.meta.n_blobs() > 0 {
+            blob_pages.push(p.clone());
         }
+    }
+    match t {
+        Subtree::Leaf(p) => data_page(p, out, blob_pages),
         Subtree::Node(n) => {
             if !out.insert(n.ptr().expect("reachable nodes are written")) {
                 return;
             }
             for seg in n.levels.iter().flatten() {
-                out.insert(seg.page.ptr().expect("reachable pages are written"));
+                data_page(&seg.page, out, blob_pages);
             }
             for c in &n.children {
-                reachable(c, out);
+                reachable(c, out, blob_pages);
             }
         }
     }

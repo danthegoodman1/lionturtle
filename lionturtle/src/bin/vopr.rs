@@ -29,12 +29,16 @@ fn main() {
                 total.steps += r.steps;
                 total.crashes += r.crashes;
                 total.writes += r.writes;
+                total.range_deletes += r.range_deletes;
                 total.reads += r.reads;
                 total.scans += r.scans;
                 total.snapshots += r.snapshots;
                 total.iterators += r.iterators;
                 total.read_errors += r.read_errors;
                 total.max_height = total.max_height.max(r.max_height);
+                total.blobs_written += r.blobs_written;
+                total.blob_reads += r.blob_reads;
+                total.max_blobs = total.max_blobs.max(r.max_blobs);
             }
             Err(e) => {
                 println!("FAILED: {e}");
@@ -44,16 +48,20 @@ fn main() {
         }
     }
     println!(
-        "{count} seeds ok in {:.1}s: {} steps, {} writes, {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}",
+        "{count} seeds ok in {:.1}s: {} steps, {} writes ({} range deletes), {} reads, {} scans, {} snapshots, {} iterators, {} crashes, {} read faults, max height {}, {} blobs written, {} blob reads, up to {} blobs live",
         started.elapsed().as_secs_f64(),
         total.steps,
         total.writes,
+        total.range_deletes,
         total.reads,
         total.scans,
         total.snapshots,
         total.iterators,
         total.crashes,
         total.read_errors,
-        total.max_height
+        total.max_height,
+        total.blobs_written,
+        total.blob_reads,
+        total.max_blobs
     );
 }

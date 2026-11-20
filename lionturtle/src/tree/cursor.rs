@@ -8,7 +8,7 @@ use super::Segment;
 use super::io::{DataPage, PageIo};
 use super::ranges::KeyRanges;
 use crate::error::Result;
-use crate::page::{Block, EntryRef, PageMeta};
+use crate::page::{Block, EntryRef, EntrySpan, PageMeta};
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ pub struct PageCursor {
     block: Option<Block>,
     entry: usize,
     /// The current entry's offsets in the block, decoded once.
-    cur: Option<(usize, usize, Option<(usize, usize)>)>,
+    cur: Option<EntrySpan>,
 }
 
 impl PageCursor {
@@ -111,8 +111,21 @@ impl PageCursor {
 
     /// Positions at the first live entry at or after `key`, moving forward only.
     fn seek(&mut self, io: &PageIo, key: &[u8]) -> Result<()> {
+        // A key in a dead range moves to its end before any block loads.
+        let skipped;
+        let key = match self.dead.skip(key) {
+            Ok(None) => key,
+            Ok(Some(end)) => {
+                skipped = end.clone();
+                &skipped[..]
+            }
+            Err(()) => {
+                self.cur = None;
+                return Ok(());
+            }
+        };
         let meta = &self.page.meta;
-        if meta.n_items == 0 || key > meta.max_key() {
+        if meta.n_items == 0 || key > meta.max_key() || self.hi.as_ref().is_some_and(|hi| cmp_keys(key, hi) != Ordering::Less) {
             self.cur = None;
             return Ok(());
         }
@@ -182,14 +195,15 @@ impl PageCursor {
 
     #[inline]
     pub fn peek(&self) -> Option<EntryRef<'_>> {
-        let (k, kl, v) = self.cur?;
+        let (k, kl, v, blob) = self.cur?;
         let raw = self.block.as_ref()?.raw();
-        Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]) })
+        Some(EntryRef { key: &raw[k..k + kl], value: v.map(|(vs, vl)| &raw[vs..vs + vl]), blob })
     }
 
-    /// The current entry as slices sharing the block's buffer.
+    /// The current entry as slices sharing the block's buffer. The value is
+    /// an encoded blob pointer where [`PageCursor::peek`] says so.
     pub fn peek_owned(&self) -> Option<(Bytes, Option<Bytes>)> {
-        let (k, kl, v) = self.cur?;
+        let (k, kl, v, _) = self.cur?;
         let raw = self.block.as_ref()?.raw();
         Some((raw.slice(k..k + kl), v.map(|(vs, vl)| raw.slice(vs..vs + vl))))
     }
@@ -216,7 +230,7 @@ pub struct LevelCursor {
 
 impl LevelCursor {
     pub fn new(io: &PageIo, level: &[Segment], lo: &[u8], hi: Option<&[u8]>, mode: ReadMode) -> Result<Self> {
-        let segments: Vec<Segment> = level.iter().filter(|s| s.overlaps(lo, hi)).cloned().collect();
+        let segments: Vec<Segment> = level.iter().filter(|s| s.overlaps(lo, hi) && s.may_hold_live(lo, hi)).cloned().collect();
         let mut c = Self { segments, next: 0, lo: Bytes::copy_from_slice(lo), hi: hi.map(Bytes::copy_from_slice), mode, current: None };
         c.open_next(io)?;
         Ok(c)

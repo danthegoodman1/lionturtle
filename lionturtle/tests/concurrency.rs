@@ -46,6 +46,9 @@ fn small_options(memtable: MemTableKind) -> Options {
         pace_checkpoints: true,
         preallocate_log: false,
         compression: lionturtle::Compression::None,
+        // About half of the values are at least this long, so readers and
+        // scanners resolve blobs while checkpoints write and free them.
+        blob_threshold: 64,
     }
 }
 
@@ -190,6 +193,7 @@ fn atomic_batches(memtable: MemTableKind) {
         pace_checkpoints: true,
         preallocate_log: false,
         compression: lionturtle::Compression::None,
+        blob_threshold: usize::MAX,
     };
     let db = Arc::new(Db::open(Arc::new(SimStorage::new(7, FaultConfig::default())), opts).unwrap());
     // Pair `p` is keys 2p and 2p + 1; writer `w` owns the pairs with p % WRITERS == w,
@@ -305,6 +309,156 @@ fn atomic_batches_skiplist() {
 #[test]
 fn atomic_batches_btree() {
     atomic_batches(MemTableKind::BTree);
+}
+
+/// Writers rewrite groups of keys in one batch each: a put of a doomed key,
+/// a range delete of the group's prefix that covers it, then puts of the
+/// group's live key, of one of its filler keys, and of a marker outside the
+/// prefix. Readers check that no read ever sees the doomed key, that a read
+/// seeing one put of a batch then sees the others, and that a snapshot holds
+/// exactly the keys of one batch per group. Small memtables send the range
+/// deletes through checkpoints while readers run.
+fn atomic_range_deletes(memtable: MemTableKind) {
+    const GROUPS: u64 = 8;
+    const WRITERS: u64 = 4;
+    let opts = Options {
+        tree: TreeConfig { leaf_size: 4 << 10, max_pivots: 8, min_pivots: 2, max_levels: 3, ..TreeConfig::default() },
+        checkpoint_distance: 2,
+        cache_bytes: 64 << 10,
+        memtable,
+        wal_buffer_bytes: 4096,
+        max_frozen: 2,
+        background: true,
+        merge_threads: 2,
+        pace_checkpoints: true,
+        preallocate_log: false,
+        compression: lionturtle::Compression::None,
+        blob_threshold: usize::MAX,
+    };
+    let db = Arc::new(Db::open(Arc::new(SimStorage::new(13, FaultConfig::default())), opts).unwrap());
+    let prefix = |g: u64| format!("g{g}/").into_bytes();
+    let k = |g: u64, name: &str| format!("g{g}/{name}").into_bytes();
+    let mark = |g: u64| format!("m{g}").into_bytes();
+    let version = |v: Option<bytes::Bytes>| v.map_or(0, |v| u64::from_be_bytes(v[..8].try_into().unwrap()));
+    let fill = |n: u64| format!("fill{}", n % 5);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for w in 0..WRITERS {
+        let (db, stop) = (db.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let g = w + WRITERS * (n % (GROUPS / WRITERS));
+                let v = n.to_be_bytes().to_vec();
+                // Fillers between the halves widen the window for a torn read.
+                let mut ops =
+                    vec![WriteOp::put(k(g, "doomed"), v.clone()), WriteOp::delete_prefix(prefix(g)), WriteOp::put(k(g, "live"), v.clone())];
+                ops.extend((0..6).map(|i| WriteOp::put(format!("x{w}-{i}").into_bytes(), v.clone())));
+                ops.push(WriteOp::put(k(g, &fill(n)), v.clone()));
+                ops.push(WriteOp::put(mark(g), v));
+                db.write(&ops, false).unwrap();
+            }
+        }));
+    }
+    let mut checks = Vec::new();
+    for r in 0..4u64 {
+        let (db, stop) = (db.clone(), stop.clone());
+        checks.push(std::thread::spawn(move || {
+            let mut i = r;
+            let mut done = 0u64;
+            let group_rows = |rows: &[(bytes::Bytes, bytes::Bytes)], g: u64, marked: u64| {
+                let names: Vec<String> =
+                    rows.iter().map(|(key, _)| String::from_utf8_lossy(&key[prefix(g).len()..]).into_owned()).collect();
+                if marked == 0 {
+                    assert!(rows.is_empty(), "group {g} has rows before its first batch: {names:?}");
+                    return;
+                }
+                let mut want = vec![fill(marked), "live".to_string()];
+                want.sort();
+                assert_eq!(names, want, "group {g} at version {marked}");
+                for (_, v) in rows {
+                    assert_eq!(version(Some(v.clone())), marked, "group {g} mixes versions");
+                }
+            };
+            while !stop.load(Ordering::Relaxed) {
+                i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let g = (i >> 33) % GROUPS;
+                assert_eq!(db.get(&k(g, "doomed")).unwrap(), None, "group {g}: a key deleted in its own batch is visible");
+                match r {
+                    0 => {
+                        let live = version(db.get(&k(g, "live")).unwrap());
+                        let marked = version(db.get(&mark(g)).unwrap());
+                        assert!(marked >= live, "group {g}: live key at {live}, then its marker at {marked}");
+                    }
+                    1 => {
+                        let marked = version(db.get(&mark(g)).unwrap());
+                        let live = version(db.get(&k(g, "live")).unwrap());
+                        assert!(live >= marked, "group {g}: marker at {marked}, then its live key at {live}");
+                        if marked > 0 {
+                            // The batch's filler, or a later batch's.
+                            let filler = version(db.get(&k(g, &fill(marked))).unwrap());
+                            assert!(filler == 0 || filler >= marked);
+                        }
+                    }
+                    2 => {
+                        let snap = db.snapshot();
+                        let marked = version(snap.get(&mark(g)).unwrap());
+                        let mut it = snap.prefix(&prefix(g));
+                        let mut rows = Vec::new();
+                        while let Some(row) = it.next().unwrap() {
+                            rows.push(row);
+                        }
+                        group_rows(&rows, g, marked);
+                        let mut rev = snap.prefix_rev(&prefix(g));
+                        let mut back = Vec::new();
+                        while let Some(row) = rev.next().unwrap() {
+                            back.push(row);
+                        }
+                        back.reverse();
+                        assert_eq!(back, rows, "group {g}: forward and reverse reads of one snapshot disagree");
+                    }
+                    _ => {
+                        let snap = db.snapshot();
+                        let all = snap.scan(b"", None, usize::MAX).unwrap();
+                        for g in 0..GROUPS {
+                            let marked = version(snap.get(&mark(g)).unwrap());
+                            let rows: Vec<_> = all.iter().filter(|(key, _)| key.starts_with(&prefix(g))).cloned().collect();
+                            group_rows(&rows, g, marked);
+                        }
+                    }
+                }
+                done += 1;
+            }
+            done
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().unwrap();
+    }
+    let reads: u64 = checks.into_iter().map(|t| t.join().unwrap()).sum();
+    let stats = db.stats();
+    eprintln!("{memtable:?}: {reads} range delete atomicity checks, {} checkpoints", stats.checkpoints);
+    assert!(stats.checkpoints > 3, "background checkpoints ran");
+    db.checkpoint().unwrap();
+    db.check_invariants().unwrap();
+}
+
+#[test]
+fn atomic_range_deletes_bbtree() {
+    atomic_range_deletes(MemTableKind::BBTree);
+}
+
+#[test]
+fn atomic_range_deletes_skiplist() {
+    atomic_range_deletes(MemTableKind::SkipList);
+}
+
+#[test]
+fn atomic_range_deletes_btree() {
+    atomic_range_deletes(MemTableKind::BTree);
 }
 
 /// Many writers queue for the writer lock at once, so each turn serves many

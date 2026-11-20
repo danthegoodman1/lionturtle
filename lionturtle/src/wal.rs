@@ -1,14 +1,33 @@
 //! The write-ahead log.
 //!
 //! Each memtable owns one log segment, `wal-<id>.log`, which is retired as
-//! soon as the checkpoint that absorbs its memtable is durable. A retired
+//! soon as the checkpoint that absorbs its memtable is durable. A segment's
+//! file takes its first record only once the segment before it is durable
+//! (see [`Log::settle`]), so the segments on disk always hold a prefix of
+//! history, without a sync when the memtable rotates. A retired
 //! segment is kept for reuse (see [`Recycler`]) or deleted. A segment is a
 //! sequence of records, one per write batch:
 //!
 //! ```text
 //! crc32c: u32 | len: u32 | count: u32 | op* | first_seq: u64
 //! op = kind: u8 | key_len: u32 | key | (value_len: u32 | value)?   (value only for puts)
+//!    | kind: u8 | start_len: u32 | start | has_end: u8 | (end_len: u32 | end)?   (range deletes)
+//!    | kind: u8 | key_len: u32 | key | blob pointer   (puts of values written to blobs)
 //! ```
+//!
+//! lionturtle 0.6 and earlier read a range delete as a torn record, so a
+//! store marks its superblock before it logs one; see
+//! [`crate::pagestore::Superblock::range_deletes`]. The same holds for a
+//! put that carries a blob pointer and [`crate::pagestore::Superblock::blobs`].
+//!
+//! A writer writes a large value to a blob before it logs the put, and the
+//! record carries the blob's pointer in the value's place. A sync makes the
+//! blobs durable before the records that point to them, so every synced
+//! record's blobs are whole. An unsynced record can outlive its blob in a
+//! crash; replay reads each blob a record points to, and a record whose blob
+//! fails its checksum ends replay as a torn record does. A blob's checksum
+//! covers its id, and no id is used twice, so such a record fails in every
+//! later recovery too, whatever its blob's slot holds by then.
 //!
 //! The checksum covers everything after itself. The sequence number comes
 //! last so that writers can encode and checksum the rest of a record before
@@ -22,9 +41,10 @@
 //! new ones; their sequence numbers are all covered by a checkpoint, so
 //! replay skips them.
 
+use crate::blob::BlobPtr;
 use crate::error::Result;
 use crate::storage::{DIRECT_ALIGN, File, Storage};
-use crate::types::{Op, Value, WriteOp};
+use crate::types::{Op, OpRef, WriteOp};
 use bytes::Bytes;
 use parking_lot::{Mutex, lock_api::ArcMutexGuard};
 use std::sync::Arc;
@@ -33,6 +53,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const HEADER_LEN: usize = 8;
 const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
+const KIND_DELETE_RANGE: u8 = 2;
+const KIND_PUT_BLOB: u8 = 3;
+
+/// Makes durable whatever the log's records point to, before a sync makes
+/// the records durable.
+pub type PreSync = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// What a segment's first write to its file waits for; see
+/// [`WalWriter::create_deferred`].
+pub type Settle = Box<dyn FnOnce() -> Result<()> + Send>;
 
 pub fn segment_name(id: u64) -> String {
     format!("wal-{id:016x}.log")
@@ -230,7 +260,12 @@ pub fn list_segments(storage: &dyn Storage) -> Result<Vec<u64>> {
 
 /// Bytes a batch occupies in the log.
 pub fn encoded_len(ops: &[WriteOp]) -> usize {
-    HEADER_LEN + 12 + ops.iter().map(|op| 1 + 4 + op.key.len() + op.value.as_put().map_or(0, |v| 4 + v.len())).sum::<usize>()
+    let op_len = |op: &WriteOp| match op.op() {
+        OpRef::Put(key, value) => 1 + 4 + key.len() + 4 + value.len(),
+        OpRef::Delete(key) => 1 + 4 + key.len(),
+        OpRef::DeleteRange(start, end) => 1 + 4 + start.len() + 1 + end.map_or(0, |e| 4 + e.len()),
+    };
+    HEADER_LEN + 12 + ops.iter().map(op_len).sum::<usize>()
 }
 
 /// A record without its sequence number: the bytes between the header and
@@ -243,12 +278,14 @@ pub struct Body {
 }
 
 impl Body {
-    /// Encodes `ops`, reusing this body's buffer.
-    pub fn encode<O: Op>(&mut self, ops: &[O]) {
+    /// Encodes `ops`, reusing this body's buffer. Where `blobs` holds a
+    /// pointer at an op's position, the op is a put whose value is in that
+    /// blob, and the record carries the pointer; `blobs` may be empty.
+    pub fn encode<O: Op>(&mut self, ops: &[O], blobs: &[Option<BlobPtr>]) {
         let buf = &mut self.bytes;
         buf.clear();
         buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-        encode_ops(buf, ops);
+        encode_ops(buf, ops, blobs);
         let len = (buf.len() + 8) as u32;
         self.crc = crc32c::crc32c_append(crc32c::crc32c(&len.to_le_bytes()), buf);
     }
@@ -270,25 +307,41 @@ impl Body {
 
 pub fn encode(buf: &mut Vec<u8>, first_seq: u64, ops: &[WriteOp]) {
     let mut body = Body::default();
-    body.encode(ops);
+    body.encode(ops, &[]);
     body.append_to(buf, first_seq);
 }
 
-fn encode_ops<O: Op>(buf: &mut Vec<u8>, ops: &[O]) {
-    for op in ops {
-        let key = op.key();
-        match op.value() {
-            Some(v) => {
-                buf.push(KIND_PUT);
-                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(key);
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                buf.extend_from_slice(v);
+fn encode_ops<O: Op>(buf: &mut Vec<u8>, ops: &[O], blobs: &[Option<BlobPtr>]) {
+    let put_bytes = |buf: &mut Vec<u8>, b: &[u8]| {
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+    };
+    for (i, op) in ops.iter().enumerate() {
+        match op.op() {
+            OpRef::Put(key, _) if blobs.get(i).is_some_and(Option::is_some) => {
+                buf.push(KIND_PUT_BLOB);
+                put_bytes(buf, key);
+                buf.extend_from_slice(&blobs[i].expect("checked").encode());
             }
-            None => {
+            OpRef::Put(key, value) => {
+                buf.push(KIND_PUT);
+                put_bytes(buf, key);
+                put_bytes(buf, value);
+            }
+            OpRef::Delete(key) => {
                 buf.push(KIND_DELETE);
-                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(key);
+                put_bytes(buf, key);
+            }
+            OpRef::DeleteRange(start, end) => {
+                buf.push(KIND_DELETE_RANGE);
+                put_bytes(buf, start);
+                match end {
+                    Some(end) => {
+                        buf.push(1);
+                        put_bytes(buf, end);
+                    }
+                    None => buf.push(0),
+                }
             }
         }
     }
@@ -330,6 +383,13 @@ pub struct Log {
     /// fsync, a later one can succeed without the data being durable, so
     /// after either, no sync of this segment succeeds.
     failed: AtomicBool,
+    /// Run by each sync before it writes; see [`PreSync`].
+    pre_sync: Option<PreSync>,
+    /// What the segment's first write to its file waits for, until it has
+    /// run; see [`Log::settle`].
+    unsettled: Mutex<Option<Settle>>,
+    /// Whether the file may take writes: nothing is left to settle.
+    settled: AtomicBool,
 }
 
 struct Pending {
@@ -414,9 +474,59 @@ impl Log {
         p.offset + p.buf.len() as u64
     }
 
+    /// Runs what the segment's first write waits for, if it has yet to run:
+    /// the sync of the segment before this one, and of this one's directory
+    /// entry. Every write to the file comes after it, so the file holds a
+    /// record only once the segment before it is durable, and recovery
+    /// replays a prefix of history.
+    ///
+    /// Appends go to memory and wait for nothing, so the memtable rotation
+    /// that starts a segment syncs nothing under the writer lock: the first
+    /// writer to flush or sync the new segment does, outside that lock.
+    /// Callers take turns, and after a failure the segment takes no write.
+    pub fn settle(&self) -> Result<()> {
+        if self.settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut unsettled = self.unsettled.lock();
+        if let Some(settle) = unsettled.take()
+            && let Err(e) = settle()
+        {
+            self.failed.store(true, Ordering::Release);
+            self.io.lock().failed = true;
+            return Err(e);
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("the log segment before this one failed to sync").into());
+        }
+        self.settled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Writes the buffered records to the file.
+    pub fn flush(self: &Arc<Self>) -> Result<()> {
+        self.settle()?;
+        self.start_flush().write()
+    }
+
+    /// Takes the segment's buffers for a later segment. Call once every
+    /// record is durable: the segment takes no more.
+    pub fn take_buffers(&self) -> Buffers {
+        let mut p = self.pending.lock();
+        let mut io = self.io.lock();
+        debug_assert!(p.buf.is_empty(), "records await a write");
+        io.tail.clear();
+        Buffers {
+            pending: std::mem::take(&mut p.buf),
+            spare: std::mem::take(&mut p.spare),
+            tail: std::mem::take(&mut io.tail),
+            blocks: std::mem::take(&mut io.blocks),
+        }
+    }
+
     /// Takes the buffered records for the caller to write after releasing
-    /// its locks. Call [`Flush::write`] promptly: later writes of this
-    /// segment wait for it.
+    /// its locks, once the segment is settled (see [`Log::settle`]). Call
+    /// [`Flush::write`] promptly: later writes of this segment wait for it.
     pub fn start_flush(self: &Arc<Self>) -> Flush {
         let mut p = self.pending.lock();
         let io = self.io.lock_arc();
@@ -440,6 +550,10 @@ impl Log {
     /// Returns once the first `end` bytes of the segment are durable, leading
     /// a write and fsync if none is running that covers them.
     pub fn sync_to(self: &Arc<Self>, end: u64) -> Result<()> {
+        // A segment is durable only with the segments before it, whatever
+        // it holds itself: a sync of one that has taken no record yet still
+        // makes the one before it durable.
+        self.settle()?;
         // Waiters park on the log's address.
         let key = Arc::as_ptr(self) as usize;
         loop {
@@ -485,7 +599,20 @@ impl Log {
     /// saves a system call and, on RAID, a flush sent to every member drive.
     /// Otherwise a plain write and an fsync cover the earlier writes too.
     fn write_and_sync(self: &Arc<Self>) -> Result<u64> {
-        let flush = self.start_flush();
+        let mut flush = self.start_flush();
+        // The flush holds every record this sync can cover, and a writer
+        // finishes whatever its record points to before appending it. So
+        // syncing those things now, with the records taken and before any
+        // is written, makes them durable ahead of every record this sync
+        // makes durable.
+        if let Some(pre_sync) = &self.pre_sync
+            && let Err(e) = pre_sync()
+        {
+            // The records in the flush never reach the file, so no later
+            // write may follow them.
+            flush.io.failed = true;
+            return Err(e);
+        }
         // The flush holds the I/O lock, so no write is in flight and
         // `completed` counts every write so far.
         let completed = self.completed.load(Ordering::Acquire);
@@ -555,6 +682,47 @@ impl WalWriter {
     /// makes its directory entry durable. Its records pass through
     /// `buffers`: the last segment's, or `Buffers::default()` for new ones.
     pub fn create(storage: &dyn Storage, id: u64, reuse: Option<String>, buffers: Buffers) -> Result<Self> {
+        Self::create_after(storage, id, reuse, buffers, None)
+    }
+
+    /// [`WalWriter::create`], for a segment whose syncs each run `pre_sync`
+    /// first.
+    pub fn create_after(
+        storage: &dyn Storage,
+        id: u64,
+        reuse: Option<String>,
+        buffers: Buffers,
+        pre_sync: Option<PreSync>,
+    ) -> Result<Self> {
+        let writer = Self::open(storage, id, reuse, buffers, pre_sync, None)?;
+        storage.sync_dir()?;
+        writer.log.settled.store(true, Ordering::Release);
+        Ok(writer)
+    }
+
+    /// Creates segment `id` as [`WalWriter::create_after`] does, but leaves
+    /// its directory entry to `settle`, which the segment's first write to
+    /// its file runs and waits for; see [`Log::settle`]. `settle` must make
+    /// the directory entry durable, and the segment before this one.
+    pub fn create_deferred(
+        storage: &dyn Storage,
+        id: u64,
+        reuse: Option<String>,
+        buffers: Buffers,
+        pre_sync: Option<PreSync>,
+        settle: Settle,
+    ) -> Result<Self> {
+        Self::open(storage, id, reuse, buffers, pre_sync, Some(settle))
+    }
+
+    fn open(
+        storage: &dyn Storage,
+        id: u64,
+        reuse: Option<String>,
+        buffers: Buffers,
+        pre_sync: Option<PreSync>,
+        settle: Option<Settle>,
+    ) -> Result<Self> {
         let file = match reuse {
             Some(old) => {
                 storage.rename(&old, &segment_name(id))?;
@@ -562,7 +730,6 @@ impl WalWriter {
             }
             None => storage.open_direct(&segment_name(id), true)?,
         };
-        storage.sync_dir()?;
         let Buffers { mut pending, spare, mut tail, blocks } = buffers;
         pending.reserve(1 << 20);
         tail.reserve(DIRECT_ALIGN);
@@ -574,6 +741,9 @@ impl WalWriter {
             synced: AtomicU64::new(0),
             syncing: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            pre_sync,
+            unsettled: Mutex::new(settle),
+            settled: AtomicBool::new(false),
         });
         Ok(Self { id, log })
     }
@@ -582,19 +752,10 @@ impl WalWriter {
         self.id
     }
 
-    /// Takes the segment's buffers for the next segment. Call once every
-    /// record is durable: the segment takes no more.
+    /// Takes the segment's buffers for a later segment; see
+    /// [`Log::take_buffers`].
     pub fn take_buffers(&mut self) -> Buffers {
-        let mut p = self.log.pending.lock();
-        let mut io = self.log.io.lock();
-        debug_assert!(p.buf.is_empty(), "records await a write");
-        io.tail.clear();
-        Buffers {
-            pending: std::mem::take(&mut p.buf),
-            spare: std::mem::take(&mut p.spare),
-            tail: std::mem::take(&mut io.tail),
-            blocks: std::mem::take(&mut io.blocks),
-        }
+        self.log.take_buffers()
     }
 
     pub fn append(&mut self, first_seq: u64, ops: &[WriteOp]) {
@@ -625,7 +786,7 @@ impl WalWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.log.start_flush().write()
+        self.log.flush()
     }
 
     /// Makes every appended record durable.
@@ -663,6 +824,23 @@ pub struct Replay {
 /// segments: recovery leaves such a segment in place and logs new writes to
 /// the next one, whose sequence numbers continue from the last valid record.
 pub fn replay(storage: &dyn Storage, id: u64, after_seq: u64, mut apply: impl FnMut(u64, WriteOp)) -> Result<Replay> {
+    replay_blobs(storage, id, after_seq, |_| Ok(None), |seq, op, _| apply(seq, op))
+}
+
+/// [`replay`] for a log whose puts may point to blobs. `read` returns the
+/// value of a blob, or `None` if the blob is not whole. `apply` gets each
+/// such put with its value and its pointer. A record that points to a blob
+/// that is not whole ends replay as a torn record does: the record was not
+/// synced, since a sync makes blobs durable first. It ends replay the same
+/// way every time, as a torn record does, since no later blob takes its
+/// blob's id.
+pub fn replay_blobs(
+    storage: &dyn Storage,
+    id: u64,
+    after_seq: u64,
+    mut read: impl FnMut(&BlobPtr) -> Result<Option<Bytes>>,
+    mut apply: impl FnMut(u64, WriteOp, Option<BlobPtr>),
+) -> Result<Replay> {
     let file = storage.open(&segment_name(id), false)?;
     let len = file.len()? as usize;
     let mut data = vec![0u8; len];
@@ -684,8 +862,19 @@ pub fn replay(storage: &dyn Storage, id: u64, after_seq: u64, mut apply: impl Fn
         if first_seq != last_seq + 1 {
             return Ok(Replay { last_seq, end: End::Gap });
         }
-        for (i, op) in ops.into_iter().enumerate() {
-            apply(first_seq + i as u64, op);
+        // A batch applies whole, so every blob is read before any op applies.
+        let mut resolved = Vec::with_capacity(ops.len());
+        for op in ops {
+            resolved.push(match op {
+                LogOp::Op(op) => (op, None),
+                LogOp::PutBlob { key, ptr } => match read(&ptr)? {
+                    Some(value) => (WriteOp::Put { key, value }, Some(ptr)),
+                    None => return Ok(Replay { last_seq, end: End::Torn }),
+                },
+            });
+        }
+        for (i, (op, ptr)) in resolved.into_iter().enumerate() {
+            apply(first_seq + i as u64, op, ptr);
         }
         last_seq = first_seq + count - 1;
         pos = next;
@@ -693,7 +882,17 @@ pub fn replay(storage: &dyn Storage, id: u64, after_seq: u64, mut apply: impl Fn
     Ok(Replay { last_seq, end: End::Clean })
 }
 
-fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)> {
+/// An op as its record holds it.
+enum LogOp {
+    Op(WriteOp),
+    /// A put whose value is in a blob.
+    PutBlob {
+        key: Bytes,
+        ptr: BlobPtr,
+    },
+}
+
+fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<LogOp>, usize)> {
     let header = data.get(pos..pos + HEADER_LEN)?;
     let crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -724,15 +923,26 @@ fn decode_record(data: &Bytes, pos: usize) -> Option<(u64, Vec<WriteOp>, usize)>
         let kind = take(&mut p, 1)?[0];
         let klen = take_u32(&mut p)?;
         let key = take(&mut p, klen)?;
-        let value = match kind {
+        ops.push(match kind {
             KIND_PUT => {
                 let vlen = take_u32(&mut p)?;
-                Value::Put(take(&mut p, vlen)?)
+                LogOp::Op(WriteOp::Put { key, value: take(&mut p, vlen)? })
             }
-            KIND_DELETE => Value::Delete,
+            KIND_PUT_BLOB => LogOp::PutBlob { key, ptr: BlobPtr::decode(&take(&mut p, BlobPtr::ENCODED_LEN)?).ok()? },
+            KIND_DELETE => LogOp::Op(WriteOp::Delete { key }),
+            KIND_DELETE_RANGE => {
+                let end = match take(&mut p, 1)?[0] {
+                    0 => None,
+                    1 => {
+                        let len = take_u32(&mut p)?;
+                        Some(take(&mut p, len)?)
+                    }
+                    _ => return None,
+                };
+                LogOp::Op(WriteOp::DeleteRange { start: key, end })
+            }
             _ => return None,
-        };
-        ops.push(WriteOp { key, value });
+        });
     }
     if p != end || first_seq == 0 {
         return None;
@@ -804,6 +1014,27 @@ mod tests {
         w.sync().unwrap();
         let r = replay(&disk, 2, 5, |_, _| {}).unwrap();
         assert_eq!((r.last_seq, r.end), (5, End::Gap));
+    }
+
+    #[test]
+    fn range_deletes_roundtrip() {
+        let disk = SimStorage::new(7, FaultConfig::default());
+        let mut w = WalWriter::create(&disk, 1, None, Buffers::default()).unwrap();
+        let ops = [
+            WriteOp::put("a", "1"),
+            WriteOp::delete_range("b", "d"),
+            WriteOp::delete_from("x"),
+            WriteOp::delete_prefix(&b"\xff\xff"[..]),
+            WriteOp::delete_range("", ""),
+            WriteOp::delete("c"),
+        ];
+        w.append(1, &ops);
+        assert_eq!(w.len() as usize, encoded_len(&ops));
+        w.sync().unwrap();
+        let mut seen = Vec::new();
+        let r = replay(&disk, 1, 0, |seq, op| seen.push((seq, op))).unwrap();
+        assert_eq!(r.last_seq, 6);
+        assert_eq!(seen.into_iter().map(|(_, op)| op).collect::<Vec<_>>(), ops);
     }
 
     #[test]

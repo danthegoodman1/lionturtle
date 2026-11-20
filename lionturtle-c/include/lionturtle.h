@@ -164,6 +164,14 @@ typedef struct lt_options {
    * Pivots per node before it splits.
    */
   size_t max_pivots;
+  /**
+   * Values of at least this many bytes are stored apart from the tree,
+   * each in a blob of its own, and the tree holds a pointer in the
+   * value's place. SIZE_MAX keeps every value in the tree. A store that
+   * has written a blob opens only with a version of lionturtle that has
+   * blobs.
+   */
+  size_t blob_threshold;
 } lt_options;
 
 /**
@@ -219,6 +227,24 @@ enum lt_status lt_put(struct lt_db *db,
  * Deletes `key`. With `sync`, returns once the delete is durable.
  */
 enum lt_status lt_delete(struct lt_db *db, const char *key, size_t key_len, bool sync);
+
+/**
+ * Deletes every key in [start, end). A null `end` leaves the range
+ * unbounded above. The cost does not depend on how many keys the range
+ * holds. With `sync`, returns once the delete is durable. A store that has
+ * taken a range delete opens only with lionturtle 0.7.0 or later.
+ */
+enum lt_status lt_delete_range(struct lt_db *db,
+                               const char *start,
+                               size_t start_len,
+                               const char *end,
+                               size_t end_len,
+                               bool sync);
+
+/**
+ * Deletes every key that starts with `prefix`; see lt_delete_range().
+ */
+enum lt_status lt_delete_prefix(struct lt_db *db, const char *prefix, size_t prefix_len, bool sync);
 
 /**
  * Applies every write in `batch` as one: a crash keeps all of them or
@@ -352,6 +378,25 @@ enum lt_status lt_batch_put(struct lt_batch *batch,
  * Adds a delete of `key`, copying it.
  */
 enum lt_status lt_batch_delete(struct lt_batch *batch, const char *key, size_t key_len);
+
+/**
+ * Adds a delete of every key in [start, end), copying both bounds. A null
+ * `end` leaves the range unbounded above. The batch's writes apply in
+ * order, so a range delete removes the keys the batch put before it and
+ * keeps those it puts after.
+ */
+enum lt_status lt_batch_delete_range(struct lt_batch *batch,
+                                     const char *start,
+                                     size_t start_len,
+                                     const char *end,
+                                     size_t end_len);
+
+/**
+ * Adds a delete of every key that starts with `prefix`, copying it.
+ */
+enum lt_status lt_batch_delete_prefix(struct lt_batch *batch,
+                                      const char *prefix,
+                                      size_t prefix_len);
 
 /**
  * Removes every write from `batch`.

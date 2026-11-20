@@ -27,6 +27,10 @@ The TurtleTree is a Bε-tree that merges each full memtable into the tree as one
 
 **Snapshots.** `Db::snapshot` returns a handle that any number of reads and iterators can share, and every read through it sees the same batches. Each iterator is a snapshot too.
 
+**Range deletes.** `delete_range` and `delete_prefix` remove every key in a range, at a cost that does not depend on how many keys it holds. Reads honor the range at once. The next checkpoint drops the subtrees inside it without reading them and leaves no range tombstone behind, so reads then pay nothing for it. On 4M records, dropping 100 of 1,000 tenants by prefix took that checkpoint 21 ms, wrote 0.8 MB and removed 22 of 230 leaves; deleting as many keys one by one took 44 ms, wrote 8.3 MB and removed none (`cargo run --release -p lionturtle --example range_deletes`).
+
+**Large values written once.** A value of 32 KiB or more goes to a blob: a slot of its own that its writer compresses and writes before it logs a 21-byte pointer. Writers write their blobs side by side, the tree moves pointers, and an overwritten blob frees its slot at the next checkpoint while live values stay in place. On 16 GB of 1 MiB values with LZ4, lionturtle loaded 3.9 times as fast as RocksDB with BlobDB and wrote 0.51 bytes per user byte against 1.77 ([results](BENCHMARKS.md#large-values)).
+
 **One knob trades memory for write cost.** Checkpoint distance χ sets the memtable size. A larger memtable absorbs more overwrites per checkpoint and writes fewer pages.
 
 **Compression that reads one page per miss.** By default, each block holds about as many entries as compress into one 4 KiB page with LZ4, so a read that misses the cache still reads one aligned page, and data that compresses too little to save pages is stored as it is. On values that compress by half, LZ4 cut a 50M-record load's page writes by 41% and raised throughput on every YCSB workload after the load by 18–37% ([results](BENCHMARKS.md#ycsb-at-50m-records)).
@@ -76,11 +80,27 @@ Durable writes: workload A on 20M records of 1 KB, with 128 client threads under
 
 ScyllaDB peaked at 130k–152k ops/s, so it has no 150k row. In closed loop over 9 minutes or more, sustained throughput was 257k ops/s for lionturtle, 207k for RocksDB and 88k for ScyllaDB.
 
+Large values: 16 GB of values that LZ4 halves, stored as blobs by lionturtle and by RocksDB's BlobDB, with LZ4 on both and 16 client threads under a 4 GB memory cap. These ran twice each on a workstation with a consumer NVMe drive:
+
+| | 1 MiB values: lionturtle | RocksDB BlobDB | 64 KiB values: lionturtle | RocksDB BlobDB |
+|---|--:|--:|--:|--:|
+| Load (inserts/s) | 3,849 | 993 | 26,520 | 11,079 |
+| A: 50% read, 50% update (ops/s) | 6,421 | 2,060 | 56,172 | 19,014 |
+| C: 100% read (ops/s) | 66,039 | 39,653 | 1,205,362 | 514,337 |
+| E: 95% scan, 5% insert (ops/s) | 342 | 276 | 6,305 | 4,847 |
+| Load: insert p99.9 (ms) | 30 | 127 | 17 | 4.2 |
+| Load: bytes written per user byte | 0.51 | 1.77 | 0.58 | 1.89 |
+| Disk after A (GB) | 8.8 | 17.9 | 11.0 | 15.4 |
+
+lionturtle ran 1.2–3.9× RocksDB's rate on every workload. With A at a fixed rate, about half of what RocksDB reached in closed loop, update p99 was 3–5 ms against 63 ms–1 s at 1 MiB, and 9–10 ms against 15–325 ms at 64 KiB ([results](BENCHMARKS.md#large-values)).
+
 ### Trade-offs
 
 - **Memory.** RSS runs about twice RocksDB's: 2.5 GB against 1.3 GB under 128 durable writers.
 - **Writes at full load.** When merging falls behind, writers wait. In closed loop, the slowest durable update took 0.78 s against RocksDB's 116 ms, though update p99.9 was 4.7 ms against 15 ms.
 - **Scans.** A scan merges every buffer level on its path, so its median runs above RocksDB's. At 50M records with LZ4 it was 37 µs against 27, and RocksDB ran workload E 8% faster. At 400M it was 58 µs against 49, though lionturtle ran E 11% faster with a p99.9 of 514 µs against 755.
+- **Many narrow range deletes.** Until its checkpoint, each range delete adds to the reads that cross it. With 100,000 one-key range deletes waiting in memtables, a 50-entry scan took 13 µs on average against 4 µs, with p99 at 83 µs against 5, and a get 1.6 µs against 0.8. Point deletes of as many keys cost reads nothing extra and went 25 times faster, so a range delete pays off when it covers many keys.
+- **Blob write tails in closed loop.** A writer writes its blob to the drive, and waits when a checkpoint's syncs have the drive flush its cache. Loading 64 KiB values flat out, insert p99.9 was 17 ms against 4 ms for RocksDB with BlobDB, whose writers copy into memory, though lionturtle loaded 2.4 times as fast with a lower median and maximum. At equal load its tails were the lower ones. On 1 MiB values under the memory cap, one run of A in two paused for 0.7 s, which put its update p99.9 at 246 ms against 112.
 - **Read p99 under writes.** At 50M records with LZ4, read p99 on workload A was 120 µs against RocksDB's 111, though p99.9 was 232 µs against 276.
 
 ## Quick start
@@ -103,6 +123,10 @@ while let Some((key, value)) = it.next()? { /* ... */ }
 let snap = db.snapshot();
 let fruit = snap.prefix(b"b"); // keys starting with "b", ascending
 let newest = snap.iter_rev(b"a", Some(b"c")); // [a, c), descending
+
+// Every key in [a, c), at a cost that does not depend on how many there are.
+db.delete_range(b"a", Some(b"c"))?;
+db.delete_prefix(b"ch")?;
 db.sync()?;
 ```
 
@@ -110,7 +134,7 @@ db.sync()?;
 cargo run --release -p lionturtle --example quickstart
 ```
 
-The API is `put`, `delete`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. Keys run to 65,535 bytes and values to 16 MiB.
+The API is `put`, `delete`, `delete_range`, `delete_prefix`, `write` for batches, `get`, `scan`, `iter`, `iter_rev`, `prefix`, `prefix_rev`, `snapshot`, `sync`, `checkpoint` and `stats`. A `Snapshot` offers the same reads. A batch can hold range deletes among its puts and deletes, and its ops apply in order. Keys and range bounds run to 65,535 bytes and values to 16 MiB. A store that has taken a range delete opens only with lionturtle 0.7.0 or later, and one that has written a value of `blob_threshold` bytes or more only with 0.8.0 or later.
 
 ## C and C++
 
@@ -155,6 +179,7 @@ C functions return an `lt_status`, and the C++ wrapper throws `lionturtle::Error
 | `pace_checkpoints` | true | Spread each background checkpoint's I/O over three quarters of the time its memtable took to fill |
 | `preallocate_log` | false | Write whole log segments of zeros ahead of the memtables that use them, so durable writes overwrite allocated space. Reused segments already do; this covers a new store's first three segments and writes them twice. Opening a new store writes the first before it returns. |
 | `compression` | `Lz4` | `Lz4` sizes each data block to compress into one 4 KiB page and compresses it as its page is written, so a point read still reads one page. Cached blocks stay uncompressed, so only reads from disk decompress. While blocks would hold under an eighth more entries per page, pages are stored as with `None`, and one block in eight is compressed to tell when that changes. A store may switch either way between opens. lionturtle 0.4.0 and later read compressed pages; earlier versions report them as corrupt. |
+| `blob_threshold` | 32 KiB | Values of at least this many bytes are stored apart from the tree, each in a blob of its own that its writer writes before logging, and the tree and the log hold a 21-byte pointer. Such a value reaches the drive once and its writers do not share the log, and a read of it reads its tree entry, then its blob. Each blob takes about 60 bytes of memory while the tree references it, and its slot is padded to 4 KiB. With `Lz4`, a blob is compressed whole when that saves an eighth. `usize::MAX` keeps every value in the tree. A store may change the threshold between opens. |
 | `tree.leaf_size` | 4 MiB | Leaf and flush batch size |
 | `tree.max_levels` | 4 | Buffer levels per node. More levels cut write amplification and slow reads. |
 | `tree.filter_bits` | 12 | Bloom filter bits per key |
@@ -175,7 +200,7 @@ Under a memory cap that counts page cache, such as a container's, transparent hu
 | Namespaces | One keyspace | Column families | Keyspaces |
 | Iteration | Forward, reverse, prefix | Forward, reverse, prefix | Forward, reverse, prefix |
 | Compression | LZ4 per block, on by default | Several codecs | LZ4 |
-| Large values | Inline, up to 16 MiB | Inline or BlobDB | Inline or key-value separation |
+| Large values | Up to 16 MiB; from 32 KiB, one blob each, written once and freed without garbage collection | Inline or BlobDB | Inline or key-value separation |
 | Backpressure | Writers wait while two frozen memtables await checkpoints | Slows and stops writes on L0 files and pending compaction | Delays writes as L0 runs pile up |
 
 ## Documentation

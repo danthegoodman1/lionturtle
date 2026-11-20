@@ -1,5 +1,5 @@
-//! Opens a store, writes a key and an atomic batch, then reads them back
-//! through iterators and a snapshot.
+//! Opens a store, writes a key and an atomic batch, reads them back through
+//! iterators and a snapshot, then deletes them by range.
 //!
 //! `cargo run --release -p lionturtle --example quickstart`
 
@@ -39,6 +39,14 @@ fn main() -> lionturtle::Result<()> {
     let mut newest = snap.iter_rev(b"", None); // every key, descending
     assert_eq!(newest.next()?.map(|(k, _)| k), Some("cherry".into()));
     assert_eq!(snap.get(b"blueberry")?, None);
+
+    // Deletes every key in [a, c), at a cost that does not depend on how
+    // many there are, and every key starting with "ch". The snapshot still
+    // holds them.
+    db.delete_range(b"a", Some(b"c"))?;
+    db.delete_prefix(b"ch")?;
+    assert!(db.iter(b"", None).next()?.is_none());
+    assert_eq!(snap.get(b"banana")?.as_deref(), Some(&b"yellow"[..]));
 
     db.sync()?;
     drop(db);

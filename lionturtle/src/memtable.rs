@@ -123,8 +123,9 @@ pub trait MemTable: Send + Sync {
     /// no such version are skipped.
     fn range_rev(&self, start: &[u8], end: Option<&[u8]>, view: View, limit: usize, out: &mut Vec<(Bytes, Value)>);
     /// Visits every key in key order with its newest value, `None` for a
-    /// tombstone. Called once writers are gone.
-    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>));
+    /// tombstone, and that value's sequence number. Called once writers are
+    /// gone.
+    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>, u64));
     /// Number of keys. May visit every key to count them.
     fn len(&self) -> usize;
     /// Whether the table holds no key.
@@ -218,9 +219,10 @@ impl MemTable for SkipListTable {
         out.extend(visible.take(limit));
     }
 
-    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>)) {
+    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>, u64)) {
         for e in self.map.iter() {
-            f(e.key(), e.value().load().value.as_put().map(|v| &v[..]));
+            let v = e.value().load();
+            f(e.key(), v.value.as_put().map(|v| &v[..]), v.seq);
         }
     }
 
@@ -560,10 +562,10 @@ impl MemTable for BBTreeTable {
         });
     }
 
-    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>)) {
+    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>, u64)) {
         self.map.scan::<[u8], ()>(.., |k, newest| {
             // SAFETY: the table outlives the call.
-            f(k, unsafe { newest.value() });
+            f(k, unsafe { newest.value() }, newest.header().seq);
             ControlFlow::Continue(())
         });
     }
@@ -622,9 +624,9 @@ impl MemTable for BTreeTable {
         out.extend(visible.take(limit));
     }
 
-    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>)) {
+    fn for_each(&self, f: &mut dyn FnMut(&[u8], Option<&[u8]>, u64)) {
         for (k, v) in self.map.read().iter() {
-            f(k, v.value.as_put().map(|v| &v[..]));
+            f(k, v.value.as_put().map(|v| &v[..]), v.seq);
         }
     }
 
@@ -685,7 +687,7 @@ mod tests {
                 assert_eq!(t.get(&key(i), ALL), Some(Value::Put(value(len).into())), "{kind:?}, {len} bytes");
             }
             let mut seen = Vec::new();
-            t.for_each(&mut |k, v| seen.push((k.to_vec(), v.map(<[u8]>::to_vec))));
+            t.for_each(&mut |k, v, _| seen.push((k.to_vec(), v.map(<[u8]>::to_vec))));
             let want: Vec<_> = lens.iter().enumerate().map(|(i, &len)| (key(i), Some(value(len)))).collect();
             assert_eq!(seen, want, "{kind:?}");
             let mut out = Vec::new();
@@ -818,7 +820,7 @@ mod tests {
             t.range(Bound::Excluded(a), None, ALL, 10, &mut out);
             assert_eq!(out.len(), 2, "{kind:?}");
             let mut keys = Vec::new();
-            t.for_each(&mut |k, v| keys.push((k.to_vec(), owned(v))));
+            t.for_each(&mut |k, v, _| keys.push((k.to_vec(), owned(v))));
             assert_eq!(keys, vec![(a.to_vec(), put(b"2")), (b.to_vec(), Value::Delete), (c.to_vec(), put(b"3"))], "{kind:?}");
             assert_eq!(t.len(), 3);
         }
